@@ -1,0 +1,123 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  background: #0f1115;
+  color: #f6f7f9;
+}
+
+.app {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 32px 24px 48px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.header-actions {
+  display: flex;
+  gap: 12px;
+}
+
+button {
+  background: #20232b;
+  color: #f6f7f9;
+  border: 1px solid #2d313d;
+  border-radius: 6px;
+  padding: 8px 14px;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+input {
+  background: #0f1115;
+  color: #f6f7f9;
+  border: 1px solid #2d313d;
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+
+input:disabled {
+  opacity: 0.6;
+}
+
+.api-config {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.api-config label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.api-config input {
+  width: min(420px, 60vw);
+}
+
+.error {
+  padding: 12px 16px;
+  border-radius: 6px;
+  background: #3d1b1f;
+  border: 1px solid #5a232b;
+}
+
+.panel {
+  display: grid;
+  grid-template-columns: minmax(240px, 1fr) minmax(320px, 2fr);
+  gap: 24px;
+  background: #171a21;
+  border-radius: 12px;
+  padding: 20px;
+}
+
+.panel-details dl {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.panel-details dt {
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.panel-details dd {
+  margin: 4px 0 0;
+  color: #c5c9d3;
+}
+
+.panel-board pre {
+  background: #0f1115;
+  border-radius: 8px;
+  padding: 16px;
+  margin: 0;
+  font-family: "Cascadia Mono", "SFMono-Regular", ui-monospace, monospace;
+  line-height: 1.4;
+  overflow: auto;
+}
+
+.actions-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}

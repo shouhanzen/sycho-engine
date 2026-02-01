@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "engine",
+    "game",
+    "editor/frontend/src-tauri",
+]
+resolver = "2"

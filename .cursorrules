@@ -1,0 +1,18 @@
+Signature Techniques (Process)
+
+Plan
+- Feature First: for any change, implement the feature/fix first, then write or update tests to lock the behavior in.
+- When debugging, start from a clear reproduction (manual steps, logs, or a minimal script); add tests after the fix to prevent regressions.
+
+Act
+- Implement only the smallest change needed to satisfy the desired behavior.
+- Keep the diff tight and incremental; refactor only as needed to support the change.
+
+Verify
+- After the feature/fix works, write or update tests that capture the behavior.
+- When adding or updating tests, run them automatically after writing them.
+
+Control Surface
+- Use the `go.sh` script to control program execution.
+- Prefer flags like `--start` and `--stop` (and related flags) to manage lifecycle.
+- This is the standard agent control surface; use it instead of ad-hoc commands.

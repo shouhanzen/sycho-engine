@@ -1,0 +1,38 @@
+# === Rust / Cargo ===
+/target/
+**/target/
+**/*.rs.bk
+
+# === Node / frontend tooling ===
+**/node_modules/
+**/dist/
+**/.vite/
+**/.turbo/
+**/.cache/
+**/coverage/
+**/*.tsbuildinfo
+
+# Tauri
+**/src-tauri/target/
+**/src-tauri/gen/
+**/src-tauri/icons/icon.ico
+
+# === Logs / runtime artifacts (go.sh control surface) ===
+.go*.log
+.go*.pid
+
+# === Editor / OS cruft ===
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*.tmp
+*.log
+.idea/
+.vscode/
+.cursor/
+
+# === Env / secrets ===
+.env
+.env.*
