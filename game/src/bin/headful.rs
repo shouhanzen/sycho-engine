@@ -1,4 +1,5 @@
 use std::{
+    f32::consts::TAU,
     io::Cursor,
     time::{Duration, Instant},
 };
@@ -6,7 +7,7 @@ use std::{
 use engine::HeadlessRunner;
 use engine::surface::{Surface, SurfaceSize};
 use pixels::{Pixels, SurfaceTexture};
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
+use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use winit::{
     dpi::PhysicalSize,
     event::{ElementState, Event, KeyboardInput, MouseButton, VirtualKeyCode, WindowEvent},
@@ -183,6 +184,158 @@ impl InputController {
 }
 
 
+const BGM_VOLUME: f32 = 0.08;
+const BGM_SAMPLE_RATE: u32 = 44_100;
+const BGM_CHANNELS: u16 = 2;
+const BGM_AMPLITUDE: f32 = 0.25;
+
+// (frequency_hz, duration_ms). freq=0.0 means "rest".
+const DEFAULT_BGM_NOTES: &[(f32, u32)] = &[
+    (220.0, 250), // A3
+    (262.0, 250), // C4
+    (330.0, 250), // E4
+    (440.0, 400), // A4
+    (392.0, 250), // G4
+    (330.0, 250), // E4
+    (262.0, 250), // C4
+    (0.0, 150),   // rest
+];
+
+/// A tiny looping "default tune" background music source (no asset files).
+///
+/// This is intentionally very simple (a sine-ish beep melody) so we can ship BGM
+/// without introducing new dependencies or binary assets.
+#[derive(Debug, Clone)]
+struct LoopingBgm {
+    note_idx: usize,
+    frame_in_note: u32,
+    channel_in_frame: u16,
+
+    note_freq_hz: f32,
+    note_total_frames: u32,
+
+    phase: f32,
+    phase_step: f32,
+    frame_sample: f32,
+}
+
+impl LoopingBgm {
+    fn new() -> Self {
+        let (freq_hz, total_frames) = Self::note_at(0);
+        let phase_step = Self::phase_step(freq_hz);
+        Self {
+            note_idx: 0,
+            frame_in_note: 0,
+            channel_in_frame: 0,
+            note_freq_hz: freq_hz,
+            note_total_frames: total_frames,
+            phase: 0.0,
+            phase_step,
+            frame_sample: 0.0,
+        }
+    }
+
+    fn note_at(idx: usize) -> (f32, u32) {
+        let (freq, ms) = DEFAULT_BGM_NOTES[idx % DEFAULT_BGM_NOTES.len()];
+        let frames = ((ms as u64 * BGM_SAMPLE_RATE as u64) / 1000).max(1) as u32;
+        (freq, frames)
+    }
+
+    fn phase_step(freq_hz: f32) -> f32 {
+        if freq_hz <= 0.0 {
+            0.0
+        } else {
+            TAU * freq_hz / BGM_SAMPLE_RATE as f32
+        }
+    }
+
+    fn advance_note(&mut self) {
+        self.note_idx = (self.note_idx + 1) % DEFAULT_BGM_NOTES.len();
+        let (freq_hz, total_frames) = Self::note_at(self.note_idx);
+
+        self.note_freq_hz = freq_hz;
+        self.note_total_frames = total_frames;
+        self.frame_in_note = 0;
+        self.phase = 0.0;
+        self.phase_step = Self::phase_step(freq_hz);
+    }
+
+    fn compute_frame_sample(&mut self) -> f32 {
+        if self.note_freq_hz <= 0.0 {
+            return 0.0;
+        }
+
+        // Gentle envelope to avoid clicks when switching notes or looping.
+        let fade_frames = 200u32.min(self.note_total_frames / 4).max(1);
+        let frames_left = self.note_total_frames.saturating_sub(self.frame_in_note);
+
+        let env = if self.frame_in_note < fade_frames {
+            self.frame_in_note as f32 / fade_frames as f32
+        } else if frames_left <= fade_frames {
+            frames_left as f32 / fade_frames as f32
+        } else {
+            1.0
+        };
+
+        // Slightly richer than a pure sine (still very cheap).
+        let s1 = self.phase.sin();
+        let s2 = (self.phase * 2.0).sin() * 0.30;
+        let sample = (s1 + s2) * BGM_AMPLITUDE * env;
+
+        self.phase += self.phase_step;
+        if self.phase >= TAU {
+            self.phase -= TAU;
+        }
+
+        sample
+    }
+
+    fn advance_frame(&mut self) {
+        self.frame_in_note += 1;
+        if self.frame_in_note >= self.note_total_frames {
+            self.advance_note();
+        }
+    }
+}
+
+impl Iterator for LoopingBgm {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.channel_in_frame == 0 {
+            self.frame_sample = self.compute_frame_sample();
+        }
+
+        let out = self.frame_sample;
+        self.channel_in_frame += 1;
+        if self.channel_in_frame >= BGM_CHANNELS {
+            self.channel_in_frame = 0;
+            self.advance_frame();
+        }
+
+        Some(out)
+    }
+}
+
+impl Source for LoopingBgm {
+    fn current_frame_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn channels(&self) -> u16 {
+        BGM_CHANNELS
+    }
+
+    fn sample_rate(&self) -> u32 {
+        BGM_SAMPLE_RATE
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        None
+    }
+}
+
+
 struct PixelsSurface {
     pixels: Pixels,
     size: SurfaceSize,
@@ -220,15 +373,25 @@ impl Surface for PixelsSurface {
 struct Sfx {
     _stream: OutputStream,
     handle: OutputStreamHandle,
+    _bgm: Option<Sink>,
     click_wav: &'static [u8],
 }
 
 impl Sfx {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let (stream, handle) = OutputStream::try_default()?;
+
+        // Best-effort background music; if it fails we still want click SFX.
+        let bgm = Sink::try_new(&handle).ok().map(|sink| {
+            sink.set_volume(BGM_VOLUME);
+            sink.append(LoopingBgm::new());
+            sink
+        });
+
         Ok(Self {
             _stream: stream,
             handle,
+            _bgm: bgm,
             click_wav: include_bytes!("../../assets/sfx/click.wav"),
         })
     }
@@ -498,7 +661,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn holding_left_repeats_even_if_rotate_is_pressed() {
         let mut c = InputController::new();
@@ -545,5 +707,18 @@ mod tests {
 
         // We still get the first repeat at exactly DAS.
         assert_eq!(c.tick(HorizontalAutoShift::DAS), vec![InputAction::MoveLeft]);
+    }
+
+    #[test]
+    fn bgm_source_is_infinite_and_produces_finite_samples() {
+        let mut bgm = LoopingBgm::new();
+
+        assert_eq!(bgm.channels(), BGM_CHANNELS);
+        assert_eq!(bgm.sample_rate(), BGM_SAMPLE_RATE);
+        assert!(bgm.total_duration().is_none());
+
+        let samples: Vec<f32> = bgm.by_ref().take(10_000).collect();
+        assert!(samples.iter().all(|s| s.is_finite()));
+        assert!(samples.iter().any(|s| s.abs() > 1e-4));
     }
 }
