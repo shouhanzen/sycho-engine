@@ -4,6 +4,7 @@ pub mod render;
 pub mod surface;
 pub mod recording;
 pub mod profiling;
+pub mod ui;
 
 #[derive(Debug)]
 pub struct TimeMachine<State> {

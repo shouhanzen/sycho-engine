@@ -154,18 +154,18 @@ impl TetrisCore {
             None => return board,
         };
 
-        let grid = get_rotated_piece(piece, self.current_piece_rotation);
-        let offset = get_board_offset(piece) as i32;
+        let grid = piece_grid(piece, self.current_piece_rotation);
+        let offset = piece_board_offset(piece);
         let piece_type = piece_type(piece);
 
-        for (y, row) in grid.iter().enumerate() {
-            for (x, &cell) in row.iter().enumerate() {
-                if cell != 1 {
+        for gy in 0..grid.size() {
+            for gx in 0..grid.size() {
+                if grid.cell(gx, gy) != 1 {
                     continue;
                 }
 
-                let board_x = self.current_piece_pos.x + x as i32 - offset;
-                let board_y = self.current_piece_pos.y - y as i32 + offset;
+                let board_x = self.current_piece_pos.x + gx as i32 - offset;
+                let board_y = self.current_piece_pos.y - gy as i32 + offset;
 
                 if board_x >= 0
                     && board_x < BOARD_WIDTH as i32
@@ -337,17 +337,17 @@ impl TetrisCore {
             Some(piece) => piece,
             None => return false,
         };
-        let grid = get_rotated_piece(piece, rotation);
-        let offset = get_board_offset(piece) as i32;
+        let grid = piece_grid(piece, rotation);
+        let offset = piece_board_offset(piece);
 
-        for (y, row) in grid.iter().enumerate() {
-            for (x, &cell) in row.iter().enumerate() {
-                if cell != 1 {
+        for gy in 0..grid.size() {
+            for gx in 0..grid.size() {
+                if grid.cell(gx, gy) != 1 {
                     continue;
                 }
 
-                let board_x = pos.x + x as i32 - offset;
-                let board_y = pos.y - y as i32 + offset;
+                let board_x = pos.x + gx as i32 - offset;
+                let board_y = pos.y - gy as i32 + offset;
 
                 if board_x < 0 || board_x >= BOARD_WIDTH as i32 {
                     return false;
@@ -427,18 +427,18 @@ impl TetrisCore {
             Some(piece) => piece,
             None => return,
         };
-        let grid = get_rotated_piece(piece, self.current_piece_rotation);
-        let offset = get_board_offset(piece) as i32;
+        let grid = piece_grid(piece, self.current_piece_rotation);
+        let offset = piece_board_offset(piece);
         let piece_type = piece_type(piece);
 
-        for (y, row) in grid.iter().enumerate() {
-            for (x, &cell) in row.iter().enumerate() {
-                if cell != 1 {
+        for gy in 0..grid.size() {
+            for gx in 0..grid.size() {
+                if grid.cell(gx, gy) != 1 {
                     continue;
                 }
 
-                let board_x = self.current_piece_pos.x + x as i32 - offset;
-                let board_y = self.current_piece_pos.y - y as i32 + offset;
+                let board_x = self.current_piece_pos.x + gx as i32 - offset;
+                let board_y = self.current_piece_pos.y - gy as i32 + offset;
 
                 if board_x >= 0
                     && board_x < BOARD_WIDTH as i32
@@ -570,7 +570,135 @@ fn srs_i_kicks(from: u8, to: u8) -> Option<&'static [(i32, i32); 5]> {
     }
 }
 
-fn piece_type(piece: Piece) -> u8 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PieceGrid {
+    size: usize,
+    cells: [u8; 16],
+}
+
+impl PieceGrid {
+    pub(crate) fn size(&self) -> usize {
+        self.size
+    }
+
+    pub(crate) fn cell(&self, x: usize, y: usize) -> u8 {
+        debug_assert!(x < self.size && y < self.size);
+        self.cells[y * self.size + x]
+    }
+}
+
+pub(crate) const fn piece_board_offset(piece: Piece) -> i32 {
+    match piece {
+        Piece::O => 0,
+        Piece::I | Piece::T | Piece::S | Piece::Z | Piece::J | Piece::L => 1,
+    }
+}
+
+fn piece_grid_size(piece: Piece) -> usize {
+    match piece {
+        Piece::I => 4,
+        Piece::O => 2,
+        Piece::T | Piece::S | Piece::Z | Piece::J | Piece::L => 3,
+    }
+}
+
+pub(crate) fn piece_grid(piece: Piece, rotation: u8) -> PieceGrid {
+    let mut grid = base_piece_grid(piece);
+    for _ in 0..(rotation % 4) {
+        grid = rotate_grid_90(&grid);
+    }
+    grid
+}
+
+fn rotate_grid_90(grid: &PieceGrid) -> PieceGrid {
+    let size = grid.size;
+    let mut rotated = PieceGrid {
+        size,
+        cells: [0u8; 16],
+    };
+
+    for y in 0..size {
+        for x in 0..size {
+            // Rotate clockwise: rotated[x][size-1-y] = grid[y][x]
+            let src = grid.cells[y * size + x];
+            let dst_row = x;
+            let dst_col = size - 1 - y;
+            rotated.cells[dst_row * size + dst_col] = src;
+        }
+    }
+
+    rotated
+}
+
+fn base_piece_grid(piece: Piece) -> PieceGrid {
+    let size = piece_grid_size(piece);
+    match piece {
+        Piece::I => PieceGrid {
+            size,
+            cells: [
+                0, 0, 0, 0, //
+                1, 1, 1, 1, //
+                0, 0, 0, 0, //
+                0, 0, 0, 0, //
+            ],
+        },
+        Piece::O => PieceGrid {
+            size,
+            cells: [
+                1, 1, //
+                1, 1, //
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+        },
+        Piece::T => PieceGrid {
+            size,
+            cells: [
+                0, 1, 0, //
+                1, 1, 1, //
+                0, 0, 0, //
+                0, 0, 0, 0, 0, 0, 0,
+            ],
+        },
+        Piece::S => PieceGrid {
+            size,
+            cells: [
+                0, 1, 1, //
+                1, 1, 0, //
+                0, 0, 0, //
+                0, 0, 0, 0, 0, 0, 0,
+            ],
+        },
+        Piece::Z => PieceGrid {
+            size,
+            cells: [
+                1, 1, 0, //
+                0, 1, 1, //
+                0, 0, 0, //
+                0, 0, 0, 0, 0, 0, 0,
+            ],
+        },
+        Piece::J => PieceGrid {
+            size,
+            cells: [
+                1, 0, 0, //
+                1, 1, 1, //
+                0, 0, 0, //
+                0, 0, 0, 0, 0, 0, 0,
+            ],
+        },
+        Piece::L => PieceGrid {
+            size,
+            cells: [
+                0, 0, 1, //
+                1, 1, 1, //
+                0, 0, 0, //
+                0, 0, 0, 0, 0, 0, 0,
+            ],
+        },
+    }
+}
+
+pub(crate) const fn piece_type(piece: Piece) -> u8 {
     match piece {
         Piece::I => 1,
         Piece::O => 2,
@@ -582,49 +710,45 @@ fn piece_type(piece: Piece) -> u8 {
     }
 }
 
-fn get_rotated_piece(piece: Piece, rotation: u8) -> Vec<Vec<u8>> {
-    let mut grid = base_piece_grid(piece);
-    for _ in 0..(rotation % 4) {
-        grid = rotate_grid_90(&grid);
-    }
-    grid
-}
+#[cfg(test)]
+mod piece_grid_tests {
+    use super::*;
 
-fn rotate_grid_90(grid: &[Vec<u8>]) -> Vec<Vec<u8>> {
-    let size = grid.len();
-    let mut rotated = vec![vec![0; size]; size];
-
-    for y in 0..size {
-        for x in 0..size {
-            rotated[x][size - 1 - y] = grid[y][x];
+    #[test]
+    fn o_piece_grid_is_invariant_under_rotation() {
+        for rot in 0..4 {
+            let g = piece_grid(Piece::O, rot);
+            assert_eq!(g.size(), 2);
+            for y in 0..g.size() {
+                for x in 0..g.size() {
+                    assert_eq!(g.cell(x, y), 1);
+                }
+            }
         }
     }
 
-    rotated
-}
+    #[test]
+    fn i_piece_rotation_1_is_vertical_in_column_2() {
+        let g = piece_grid(Piece::I, 1);
+        assert_eq!(g.size(), 4);
 
-fn get_board_offset(piece: Piece) -> usize {
-    let size = base_piece_grid(piece).len();
-    if size == 2 {
-        0
-    } else {
-        1
+        for y in 0..g.size() {
+            for x in 0..g.size() {
+                let expected = if x == 2 { 1 } else { 0 };
+                assert_eq!(
+                    g.cell(x, y),
+                    expected,
+                    "unexpected cell at x={x} y={y}"
+                );
+            }
+        }
     }
-}
 
-fn base_piece_grid(piece: Piece) -> Vec<Vec<u8>> {
-    match piece {
-        Piece::I => vec![
-            vec![0, 0, 0, 0],
-            vec![1, 1, 1, 1],
-            vec![0, 0, 0, 0],
-            vec![0, 0, 0, 0],
-        ],
-        Piece::O => vec![vec![1, 1], vec![1, 1]],
-        Piece::T => vec![vec![0, 1, 0], vec![1, 1, 1], vec![0, 0, 0]],
-        Piece::S => vec![vec![0, 1, 1], vec![1, 1, 0], vec![0, 0, 0]],
-        Piece::Z => vec![vec![1, 1, 0], vec![0, 1, 1], vec![0, 0, 0]],
-        Piece::J => vec![vec![1, 0, 0], vec![1, 1, 1], vec![0, 0, 0]],
-        Piece::L => vec![vec![0, 0, 1], vec![1, 1, 1], vec![0, 0, 0]],
+    #[test]
+    fn piece_board_offset_matches_tetris_piece_sizes() {
+        assert_eq!(piece_board_offset(Piece::O), 0);
+        for p in [Piece::I, Piece::T, Piece::S, Piece::Z, Piece::J, Piece::L] {
+            assert_eq!(piece_board_offset(p), 1);
+        }
     }
 }

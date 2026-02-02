@@ -18,7 +18,170 @@ use game::debug::DebugHud;
 use game::playtest::{InputAction, TetrisLogic};
 use game::sfx::{ACTION_SFX_VOLUME, LINE_CLEAR_SFX_VOLUME, MOVE_PIECE_SFX_VOLUME};
 use game::tetris_core::Piece;
-use game::tetris_ui::{draw_pause_menu, draw_tetris, PauseMenuLayout, UiLayout};
+use game::tetris_ui::{draw_tetris, UiLayout};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LrDir {
+    Left,
+    Right,
+}
+
+// Horizontal auto-shift (DAS/ARR) so holding left/right keeps moving even if you
+// press other keys (e.g. rotate). Avoids relying on OS key-repeat.
+#[derive(Debug, Clone)]
+struct HorizontalAutoShift {
+    left_held: bool,
+    right_held: bool,
+    last_pressed: Option<LrDir>,
+    active: Option<LrDir>,
+    next_repeat_at: Option<Duration>,
+}
+
+impl HorizontalAutoShift {
+    const DAS: Duration = Duration::from_millis(170);
+    const ARR: Duration = Duration::from_millis(50);
+
+    fn new() -> Self {
+        Self {
+            left_held: false,
+            right_held: false,
+            last_pressed: None,
+            active: None,
+            next_repeat_at: None,
+        }
+    }
+
+    fn active_dir(&self) -> Option<LrDir> {
+        match (self.left_held, self.right_held) {
+            (true, false) => Some(LrDir::Left),
+            (false, true) => Some(LrDir::Right),
+            (true, true) => self.last_pressed,
+            (false, false) => None,
+        }
+    }
+
+    fn on_key_down(&mut self, dir: LrDir, now: Duration) -> Option<InputAction> {
+        // Ignore repeats (winit may emit Pressed repeatedly due to OS repeat).
+        match dir {
+            LrDir::Left if self.left_held => return None,
+            LrDir::Right if self.right_held => return None,
+            _ => {}
+        }
+
+        match dir {
+            LrDir::Left => self.left_held = true,
+            LrDir::Right => self.right_held = true,
+        }
+        self.last_pressed = Some(dir);
+
+        let prev_active = self.active;
+        let active = self.active_dir();
+        self.active = active;
+
+        if active != prev_active {
+            self.next_repeat_at = active.map(|_| now + Self::DAS);
+        }
+
+        if active == Some(dir) {
+            Some(match dir {
+                LrDir::Left => InputAction::MoveLeft,
+                LrDir::Right => InputAction::MoveRight,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn on_key_up(&mut self, dir: LrDir, now: Duration) {
+        match dir {
+            LrDir::Left => self.left_held = false,
+            LrDir::Right => self.right_held = false,
+        }
+
+        let prev_active = self.active;
+        let active = self.active_dir();
+        self.active = active;
+
+        if active != prev_active {
+            self.next_repeat_at = active.map(|_| now + Self::DAS);
+        }
+        if active.is_none() {
+            self.next_repeat_at = None;
+        }
+    }
+
+    fn tick(&mut self, now: Duration) -> Vec<InputAction> {
+        let mut out = Vec::new();
+
+        let Some(active) = self.active else {
+            self.next_repeat_at = None;
+            return out;
+        };
+
+        let Some(mut next_at) = self.next_repeat_at else {
+            self.next_repeat_at = Some(now + Self::DAS);
+            return out;
+        };
+
+        while now >= next_at {
+            out.push(match active {
+                LrDir::Left => InputAction::MoveLeft,
+                LrDir::Right => InputAction::MoveRight,
+            });
+            next_at += Self::ARR;
+        }
+        self.next_repeat_at = Some(next_at);
+        out
+    }
+}
+
+#[derive(Debug, Clone)]
+struct InputController {
+    auto_shift: HorizontalAutoShift,
+}
+
+impl InputController {
+    fn new() -> Self {
+        Self {
+            auto_shift: HorizontalAutoShift::new(),
+        }
+    }
+
+    fn on_key(&mut self, key: VirtualKeyCode, state: ElementState, now: Duration) -> Vec<InputAction> {
+        let Some(action) = map_key_to_action(key) else {
+            return Vec::new();
+        };
+
+        match state {
+            ElementState::Pressed => match action {
+                InputAction::MoveLeft => self
+                    .auto_shift
+                    .on_key_down(LrDir::Left, now)
+                    .into_iter()
+                    .collect(),
+                InputAction::MoveRight => self
+                    .auto_shift
+                    .on_key_down(LrDir::Right, now)
+                    .into_iter()
+                    .collect(),
+                _ => vec![action],
+            },
+            ElementState::Released => {
+                match action {
+                    InputAction::MoveLeft => self.auto_shift.on_key_up(LrDir::Left, now),
+                    InputAction::MoveRight => self.auto_shift.on_key_up(LrDir::Right, now),
+                    _ => {}
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    fn tick(&mut self, now: Duration) -> Vec<InputAction> {
+        self.auto_shift.tick(now)
+    }
+}
+
 
 struct PixelsSurface {
     pixels: Pixels,
@@ -123,10 +286,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sfx = Sfx::new().ok();
     let mut debug_hud = DebugHud::new();
     let mut last_layout = UiLayout::default();
-    let mut last_pause_menu = PauseMenuLayout::default();
-    let mut paused = false;
     let mut mouse_x: u32 = 0;
     let mut mouse_y: u32 = 0;
+
+    let start_time = Instant::now();
+    let mut input_controller = InputController::new();
 
     let mut last_gravity = Instant::now();
     let gravity_interval = Duration::from_millis(500);
@@ -149,21 +313,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     button: MouseButton::Left,
                     ..
                 } => {
-                    if last_layout.pause_button.contains(mouse_x, mouse_y) {
-                        paused = !paused;
-                        last_gravity = Instant::now();
-                        if let Some(sfx) = sfx.as_ref() {
-                            sfx.play_click(ACTION_SFX_VOLUME);
-                        }
-                    } else if paused {
-                        if last_pause_menu.resume_button.contains(mouse_x, mouse_y) {
-                            paused = false;
-                            last_gravity = Instant::now();
-                            if let Some(sfx) = sfx.as_ref() {
-                                sfx.play_click(ACTION_SFX_VOLUME);
-                            }
-                        }
-                    } else if last_layout.hold_panel.contains(mouse_x, mouse_y) {
+                    if last_layout.hold_panel.contains(mouse_x, mouse_y) {
                         apply_action(&mut runner, sfx.as_ref(), &mut debug_hud, InputAction::Hold);
                     }
                 }
@@ -180,32 +330,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 WindowEvent::KeyboardInput {
                     input:
                         KeyboardInput {
-                            state: ElementState::Pressed,
+                            state,
                             virtual_keycode: Some(key),
                             ..
                         },
                     ..
                 } => {
-                    if key == VirtualKeyCode::F3 {
+                    let now = start_time.elapsed();
+
+                    if key == VirtualKeyCode::F3 && state == ElementState::Pressed {
                         debug_hud.toggle();
                     }
 
-                    if key == VirtualKeyCode::Escape {
-                        paused = !paused;
-                        last_gravity = Instant::now();
-                        if let Some(sfx) = sfx.as_ref() {
-                            sfx.play_click(ACTION_SFX_VOLUME);
-                        }
-                    } else if !paused {
-                        if let Some(action) = map_key_to_action(key) {
-                            apply_action(&mut runner, sfx.as_ref(), &mut debug_hud, action);
-                        }
+                    for action in input_controller.on_key(key, state, now) {
+                        apply_action(&mut runner, sfx.as_ref(), &mut debug_hud, action);
                     }
                 }
                 _ => {}
             },
             Event::MainEventsCleared => {
-                if !paused && last_gravity.elapsed() >= gravity_interval {
+                let now = start_time.elapsed();
+                for action in input_controller.tick(now) {
+                    apply_action(&mut runner, sfx.as_ref(), &mut debug_hud, action);
+                }
+
+                if last_gravity.elapsed() >= gravity_interval {
                     let gravity_start = Instant::now();
                     runner.step_profiled(InputAction::SoftDrop, &mut debug_hud);
                     debug_hud.record_gravity(gravity_start.elapsed());
@@ -231,11 +380,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let overlay_start = Instant::now();
                 let size = surface.size();
-                if paused {
-                    last_pause_menu = draw_pause_menu(surface.frame_mut(), size.width, size.height);
-                } else {
-                    last_pause_menu = PauseMenuLayout::default();
-                }
                 debug_hud.draw_overlay(surface.frame_mut(), size.width, size.height);
                 let overlay_dt = overlay_start.elapsed();
 
@@ -334,6 +478,10 @@ fn apply_action(
 mod tests {
     use super::*;
 
+    fn ms(v: u64) -> Duration {
+        Duration::from_millis(v)
+    }
+
     #[test]
     fn key_a_maps_to_rotate_180() {
         assert_eq!(
@@ -348,5 +496,54 @@ mod tests {
             map_key_to_action(VirtualKeyCode::Left),
             Some(InputAction::MoveLeft)
         );
+    }
+
+
+    #[test]
+    fn holding_left_repeats_even_if_rotate_is_pressed() {
+        let mut c = InputController::new();
+
+        // Initial press should move immediately.
+        assert_eq!(
+            c.on_key(VirtualKeyCode::Left, ElementState::Pressed, ms(0)),
+            vec![InputAction::MoveLeft]
+        );
+
+        // Rotate should not affect the held-left repeat.
+        assert_eq!(
+            c.on_key(VirtualKeyCode::Up, ElementState::Pressed, ms(10)),
+            vec![InputAction::RotateCw]
+        );
+
+        // Before DAS: no auto shift yet.
+        assert_eq!(c.tick(HorizontalAutoShift::DAS - ms(1)), Vec::<InputAction>::new());
+
+        // At DAS: first repeat.
+        assert_eq!(c.tick(HorizontalAutoShift::DAS), vec![InputAction::MoveLeft]);
+
+        // Next repeat at DAS + ARR.
+        assert_eq!(
+            c.tick(HorizontalAutoShift::DAS + HorizontalAutoShift::ARR),
+            vec![InputAction::MoveLeft]
+        );
+    }
+
+    #[test]
+    fn repeated_left_keydown_is_ignored_for_immediate_move_and_timers() {
+        let mut c = InputController::new();
+
+        assert_eq!(
+            c.on_key(VirtualKeyCode::Left, ElementState::Pressed, ms(0)),
+            vec![InputAction::MoveLeft]
+        );
+
+        // Simulate OS key-repeat emitting another Pressed without a Released.
+        assert_eq!(
+            c.on_key(VirtualKeyCode::Left, ElementState::Pressed, ms(30)),
+            Vec::<InputAction>::new()
+        );
+
+        // We still get the first repeat at exactly DAS.
+        assert_eq!(c.tick(HorizontalAutoShift::DAS), vec![InputAction::MoveLeft]);
     }
 }

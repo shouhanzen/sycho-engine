@@ -1,7 +1,8 @@
 use engine::render::{color_for_cell, draw_board, CELL_SIZE};
+use engine::ui as ui;
 
 use crate::debug::draw_text;
-use crate::tetris_core::{Piece, TetrisCore, Vec2i};
+use crate::tetris_core::{piece_board_offset, piece_grid, piece_type, Piece, TetrisCore, Vec2i};
 
 const COLOR_PANEL_BG: [u8; 4] = [16, 16, 22, 255];
 const COLOR_PANEL_BORDER: [u8; 4] = [40, 40, 55, 255];
@@ -215,17 +216,25 @@ pub fn draw_pause_menu(frame: &mut [u8], width: u32, height: u32) -> PauseMenuLa
     let margin = 32u32;
     let pad = 18u32;
 
-    let panel_w = 360u32.min(width.saturating_sub(margin.saturating_mul(2)));
-    let panel_h = 200u32.min(height.saturating_sub(margin.saturating_mul(2)));
-    if panel_w == 0 || panel_h == 0 {
+    // Layout is expressed via the engine UI layout helpers, then converted to our local `Rect`
+    // for hit-testing and drawing.
+    let screen = ui::Rect::from_size(width, height);
+    let safe = screen.inset(ui::Insets::all(margin));
+    if safe.w == 0 || safe.h == 0 {
         return PauseMenuLayout::default();
     }
 
+    let panel_size = ui::Size::new(360, 200).clamp_max(safe.size());
+    if panel_size.w == 0 || panel_size.h == 0 {
+        return PauseMenuLayout::default();
+    }
+
+    let panel_ui = safe.place(panel_size, ui::Anchor::Center);
     let panel = Rect {
-        x: width.saturating_sub(panel_w) / 2,
-        y: height.saturating_sub(panel_h) / 2,
-        w: panel_w,
-        h: panel_h,
+        x: panel_ui.x,
+        y: panel_ui.y,
+        w: panel_ui.w,
+        h: panel_ui.h,
     };
 
     fill_rect(
@@ -268,13 +277,14 @@ pub fn draw_pause_menu(frame: &mut [u8], width: u32, height: u32) -> PauseMenuLa
         COLOR_PAUSE_MENU_TEXT,
     );
 
-    let button_h = 44u32.min(panel.h.saturating_sub(pad.saturating_mul(2)));
-    let button_w = 240u32.min(panel.w.saturating_sub(pad.saturating_mul(2)));
+    let content = panel_ui.inset(ui::Insets::all(pad));
+    let button_size = ui::Size::new(240, 44).clamp_max(content.size());
+    let resume_ui = content.place(button_size, ui::Anchor::BottomCenter);
     let resume_button = Rect {
-        x: panel.x.saturating_add(panel.w.saturating_sub(button_w) / 2),
-        y: panel.y.saturating_add(panel.h.saturating_sub(pad.saturating_add(button_h))),
-        w: button_w,
-        h: button_h,
+        x: resume_ui.x,
+        y: resume_ui.y,
+        w: resume_ui.w,
+        h: resume_ui.h,
     };
 
     fill_rect(
@@ -380,13 +390,13 @@ fn draw_piece_on_board(
         return;
     }
 
-    let grid = rotated_piece_grid(piece, rotation);
-    let offset = board_offset_for_piece(piece) as i32;
-    let color = color_for_cell(cell_for_piece(piece));
+    let grid = piece_grid(piece, rotation);
+    let offset = piece_board_offset(piece);
+    let color = color_for_cell(piece_type(piece));
 
-    for (gy, row) in grid.iter().enumerate() {
-        for (gx, &cell) in row.iter().enumerate() {
-            if cell != 1 {
+    for gy in 0..grid.size() {
+        for gx in 0..grid.size() {
+            if grid.cell(gx, gy) != 1 {
                 continue;
             }
 
@@ -414,32 +424,6 @@ fn draw_piece_on_board(
             }
         }
     }
-}
-
-fn rotated_piece_grid(piece: Piece, rotation: u8) -> Vec<Vec<u8>> {
-    let mut grid = base_piece_grid(piece);
-    for _ in 0..(rotation % 4) {
-        grid = rotate_grid_90(&grid);
-    }
-    grid
-}
-
-fn rotate_grid_90(grid: &[Vec<u8>]) -> Vec<Vec<u8>> {
-    let size = grid.len();
-    let mut rotated = vec![vec![0; size]; size];
-
-    for y in 0..size {
-        for x in 0..size {
-            rotated[x][size - 1 - y] = grid[y][x];
-        }
-    }
-
-    rotated
-}
-
-fn board_offset_for_piece(piece: Piece) -> usize {
-    let size = base_piece_grid(piece).len();
-    if size == 2 { 0 } else { 1 }
 }
 
 fn draw_hold_panel(
@@ -516,21 +500,21 @@ fn draw_piece_preview(
         return;
     };
 
-    let grid = base_piece_grid(piece);
-    let grid_h = grid.len() as u32;
-    let grid_w = grid.first().map(|r| r.len()).unwrap_or(0) as u32;
+    let grid = piece_grid(piece, 0);
+    let grid_h = grid.size() as u32;
+    let grid_w = grid.size() as u32;
 
     let offset_x = (PREVIEW_GRID.saturating_sub(grid_w)) / 2;
     let offset_y = (PREVIEW_GRID.saturating_sub(grid_h)) / 2;
 
-    let mut color = color_for_cell(cell_for_piece(piece));
+    let mut color = color_for_cell(piece_type(piece));
     if !enabled {
         color = dim_color(color, 0.55);
     }
 
-    for (gy, row) in grid.iter().enumerate() {
-        for (gx, &cell) in row.iter().enumerate() {
-            if cell != 1 {
+    for gy in 0..grid.size() {
+        for gx in 0..grid.size() {
+            if grid.cell(gx, gy) != 1 {
                 continue;
             }
 
@@ -549,35 +533,6 @@ fn dim_color(mut c: [u8; 4], factor: f32) -> [u8; 4] {
     c
 }
 
-fn cell_for_piece(piece: Piece) -> u8 {
-    match piece {
-        Piece::I => 1,
-        Piece::O => 2,
-        Piece::T => 3,
-        Piece::S => 4,
-        Piece::Z => 5,
-        Piece::J => 6,
-        Piece::L => 7,
-    }
-}
-
-fn base_piece_grid(piece: Piece) -> Vec<Vec<u8>> {
-    match piece {
-        Piece::I => vec![
-            vec![0, 0, 0, 0],
-            vec![1, 1, 1, 1],
-            vec![0, 0, 0, 0],
-            vec![0, 0, 0, 0],
-        ],
-        Piece::O => vec![vec![1, 1], vec![1, 1]],
-        Piece::T => vec![vec![0, 1, 0], vec![1, 1, 1], vec![0, 0, 0]],
-        Piece::S => vec![vec![0, 1, 1], vec![1, 1, 0], vec![0, 0, 0]],
-        Piece::Z => vec![vec![1, 1, 0], vec![0, 1, 1], vec![0, 0, 0]],
-        Piece::J => vec![vec![1, 0, 0], vec![1, 1, 1], vec![0, 0, 0]],
-        Piece::L => vec![vec![0, 0, 1], vec![1, 1, 1], vec![0, 0, 0]],
-    }
-}
-
 fn fill_rect(
     frame: &mut [u8],
     width: u32,
@@ -591,13 +546,43 @@ fn fill_rect(
     let max_x = (x + w).min(width);
     let max_y = (y + h).min(height);
 
-    for py in y..max_y {
-        for px in x..max_x {
-            let idx = ((py * width + px) * 4) as usize;
-            if idx + 4 <= frame.len() {
-                frame[idx..idx + 4].copy_from_slice(&color);
-            }
+    if x >= max_x || y >= max_y {
+        return;
+    }
+
+    let width = width as usize;
+    let height = height as usize;
+    let expected_len = width
+        .checked_mul(height)
+        .and_then(|v| v.checked_mul(4))
+        .unwrap_or(0);
+    if expected_len == 0 || frame.len() < expected_len {
+        return;
+    }
+
+    let row_pixels = (max_x - x) as usize;
+    let row_bytes = row_pixels.checked_mul(4).unwrap_or(0);
+    if row_bytes == 0 {
+        return;
+    }
+
+    let stride = width.checked_mul(4).unwrap_or(0);
+    let mut row_start = (y as usize)
+        .checked_mul(stride)
+        .and_then(|v| v.checked_add((x as usize).checked_mul(4)?))
+        .unwrap_or(0);
+
+    let [r, g, b, a] = color;
+    for _ in y..max_y {
+        let row_end = row_start + row_bytes;
+        let row = &mut frame[row_start..row_end];
+        for px in row.chunks_exact_mut(4) {
+            px[0] = r;
+            px[1] = g;
+            px[2] = b;
+            px[3] = a;
         }
+        row_start += stride;
     }
 }
 
@@ -622,23 +607,48 @@ fn blend_rect(
 
     let max_x = (x + w).min(width);
     let max_y = (y + h).min(height);
+    if x >= max_x || y >= max_y {
+        return;
+    }
+
+    let width = width as usize;
+    let height = height as usize;
+    let expected_len = width
+        .checked_mul(height)
+        .and_then(|v| v.checked_mul(4))
+        .unwrap_or(0);
+    if expected_len == 0 || frame.len() < expected_len {
+        return;
+    }
+
+    let row_pixels = (max_x - x) as usize;
+    let row_bytes = row_pixels.checked_mul(4).unwrap_or(0);
+    if row_bytes == 0 {
+        return;
+    }
+
     let a = alpha as u32;
     let inv = 255u32 - a;
+    let stride = width.checked_mul(4).unwrap_or(0);
+    let mut row_start = (y as usize)
+        .checked_mul(stride)
+        .and_then(|v| v.checked_add((x as usize).checked_mul(4)?))
+        .unwrap_or(0);
 
-    for py in y..max_y {
-        for px in x..max_x {
-            let idx = ((py * width + px) * 4) as usize;
-            if idx + 4 <= frame.len() {
-                let r0 = frame[idx] as u32;
-                let g0 = frame[idx + 1] as u32;
-                let b0 = frame[idx + 2] as u32;
+    for _ in y..max_y {
+        let row_end = row_start + row_bytes;
+        let row = &mut frame[row_start..row_end];
+        for px in row.chunks_exact_mut(4) {
+            let r0 = px[0] as u32;
+            let g0 = px[1] as u32;
+            let b0 = px[2] as u32;
 
-                frame[idx] = ((r0 * inv + (color[0] as u32) * a + 127) / 255) as u8;
-                frame[idx + 1] = ((g0 * inv + (color[1] as u32) * a + 127) / 255) as u8;
-                frame[idx + 2] = ((b0 * inv + (color[2] as u32) * a + 127) / 255) as u8;
-                frame[idx + 3] = 255;
-            }
+            px[0] = ((r0 * inv + (color[0] as u32) * a + 127) / 255) as u8;
+            px[1] = ((g0 * inv + (color[1] as u32) * a + 127) / 255) as u8;
+            px[2] = ((b0 * inv + (color[2] as u32) * a + 127) / 255) as u8;
+            px[3] = 255;
         }
+        row_start += stride;
     }
 }
 
@@ -662,26 +672,19 @@ fn draw_rect_outline(
         return;
     }
 
-    // Top / bottom
-    for px in x..x1 {
-        set_pixel(frame, width, height, px, y, color);
-        set_pixel(frame, width, height, px, y1.saturating_sub(1), color);
+    let w = x1 - x;
+    let h = y1 - y;
+
+    // Top / bottom edges.
+    fill_rect(frame, width, height, x, y, w, 1, color);
+    if h > 1 {
+        fill_rect(frame, width, height, x, y1.saturating_sub(1), w, 1, color);
     }
 
-    // Left / right
-    for py in y..y1 {
-        set_pixel(frame, width, height, x, py, color);
-        set_pixel(frame, width, height, x1.saturating_sub(1), py, color);
-    }
-}
-
-fn set_pixel(frame: &mut [u8], width: u32, height: u32, x: u32, y: u32, color: [u8; 4]) {
-    if x >= width || y >= height {
-        return;
-    }
-    let idx = ((y * width + x) * 4) as usize;
-    if idx + 4 <= frame.len() {
-        frame[idx..idx + 4].copy_from_slice(&color);
+    // Left / right edges.
+    fill_rect(frame, width, height, x, y, 1, h, color);
+    if w > 1 {
+        fill_rect(frame, width, height, x1.saturating_sub(1), y, 1, h, color);
     }
 }
 
