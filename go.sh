@@ -38,9 +38,16 @@ Build:
   --release      Use release profile for cargo commands (faster runtime, slower compile).
 
 Editor:
-  API:  cargo run -p game --bin editor_api   (http://127.0.0.1:4000)
+  API:  cargo run -p game --bin editor_api   (default http://127.0.0.1:4000; override via ROLLOUT_EDITOR_API_ADDR / ROLLOUT_EDITOR_API_PORT)
   App:  cd editor/frontend && npm run tauri dev
   Note: the app may require a one-time: cd editor/frontend && npm install
+
+Ports (multi-worktree safe defaults):
+  go.sh derives a stable per-worktree port offset from the worktree path.
+  Override any of these to force a specific port assignment:
+    ROLLOUT_EDITOR_PORT_OFFSET  (integer; used to derive both ports)
+    ROLLOUT_EDITOR_API_PORT     (default: 4000 + offset)
+    ROLLOUT_EDITOR_DEV_PORT     (default: 5173 + offset)
 
 Lifecycle:
   --start        Starts the selected target/mode. Default is background (writes pid/log files).
@@ -155,6 +162,63 @@ ensure_pid_alive_or_dump_logs() {
     rm -f "$pid_file"
     return 1
   fi
+
+  return 0
+}
+
+is_uint() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+worktree_port_offset() {
+  # Stable per-worktree offset derived from the worktree root directory path.
+  # Use a wide enough range to make collisions very unlikely across a handful of worktrees.
+  local crc
+  crc="$(printf "%s" "$ROOT_DIR" | cksum | awk '{print $1}')"
+  echo $((crc % 10000))
+}
+
+compute_editor_ports() {
+  local offset
+  offset="${ROLLOUT_EDITOR_PORT_OFFSET:-$(worktree_port_offset)}"
+  if ! is_uint "$offset"; then
+    echo "invalid ROLLOUT_EDITOR_PORT_OFFSET: $offset" >&2
+    exit 2
+  fi
+
+  EDITOR_API_PORT="${ROLLOUT_EDITOR_API_PORT:-$((4000 + offset))}"
+  EDITOR_DEV_PORT="${ROLLOUT_EDITOR_DEV_PORT:-$((5173 + offset))}"
+
+  if ! is_uint "$EDITOR_API_PORT" || ((EDITOR_API_PORT < 1 || EDITOR_API_PORT > 65535)); then
+    echo "invalid editor api port: $EDITOR_API_PORT" >&2
+    exit 2
+  fi
+  if ! is_uint "$EDITOR_DEV_PORT" || ((EDITOR_DEV_PORT < 1 || EDITOR_DEV_PORT > 65535)); then
+    echo "invalid editor dev port: $EDITOR_DEV_PORT" >&2
+    exit 2
+  fi
+
+  EDITOR_API_URL="http://127.0.0.1:${EDITOR_API_PORT}"
+  EDITOR_DEV_URL="http://localhost:${EDITOR_DEV_PORT}"
+}
+
+generate_tauri_worktree_config() {
+  local api_port="$1"
+  local dev_port="$2"
+
+  local base_conf="$ROOT_DIR/editor/frontend/src-tauri/tauri.conf.json"
+  local gen_conf="$ROOT_DIR/editor/frontend/src-tauri/gen/tauri.conf.worktree.json"
+
+  mkdir -p "$(dirname "$gen_conf")"
+
+  # Replace the dev server URL + CSP API endpoints so multiple worktrees can run side-by-side.
+  sed \
+    -e "s|http://localhost:5173|http://localhost:${dev_port}|g" \
+    -e "s|http://127.0.0.1:4000|http://127.0.0.1:${api_port}|g" \
+    -e "s|http://localhost:4000|http://localhost:${api_port}|g" \
+    "$base_conf" >"$gen_conf"
+
+  echo "$gen_conf"
 }
 
 TARGET="game"
@@ -164,6 +228,10 @@ ACTION=""
 RECORD="false"
 FFMPEG_BIN=""
 RELEASE="false"
+EDITOR_API_PORT=""
+EDITOR_DEV_PORT=""
+EDITOR_API_URL=""
+EDITOR_DEV_URL=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -311,14 +379,20 @@ case "$ACTION" in
         exit 2
       fi
 
+      compute_editor_ports
+      tauri_conf="$(generate_tauri_worktree_config "$EDITOR_API_PORT" "$EDITOR_DEV_PORT")"
+
       if [[ "$FOREGROUND" == "true" ]]; then
-        echo "starting editor api (http://127.0.0.1:4000) + tauri app in foreground"
-        cargo run -p game --bin editor_api "${CARGO_PROFILE_ARGS[@]}" &
+        echo "starting editor api ($EDITOR_API_URL) + tauri app ($EDITOR_DEV_URL) in foreground"
+        env ROLLOUT_EDITOR_API_ADDR="127.0.0.1:$EDITOR_API_PORT" cargo run -p game --bin editor_api "${CARGO_PROFILE_ARGS[@]}" &
         api_pid=$!
 
         (
           cd "$ROOT_DIR/editor/frontend"
-          npm run tauri dev
+          export ROLLOUT_EDITOR_DEV_PORT="$EDITOR_DEV_PORT"
+          export ROLLOUT_EDITOR_API_URL="$EDITOR_API_URL"
+          export VITE_EDITOR_API="$EDITOR_API_URL"
+          npm run tauri -- dev --config "$tauri_conf"
         ) &
         app_pid=$!
 
@@ -351,7 +425,7 @@ case "$ACTION" in
       fi
 
       if [[ "$api_running" == "false" ]]; then
-        nohup cargo run -p game --bin editor_api "${CARGO_PROFILE_ARGS[@]}" >"$EDITOR_API_LOG_FILE" 2>&1 &
+        nohup env ROLLOUT_EDITOR_API_ADDR="127.0.0.1:$EDITOR_API_PORT" cargo run -p game --bin editor_api "${CARGO_PROFILE_ARGS[@]}" >"$EDITOR_API_LOG_FILE" 2>&1 &
         echo $! >"$EDITOR_API_PID_FILE"
         ensure_pid_alive_or_dump_logs "$EDITOR_API_PID_FILE" "$EDITOR_API_LOG_FILE" "editor api"
       fi
@@ -359,7 +433,10 @@ case "$ACTION" in
       if [[ "$app_running" == "false" ]]; then
         (
           cd "$ROOT_DIR/editor/frontend"
-          nohup npm run tauri dev >"$EDITOR_APP_LOG_FILE" 2>&1 &
+          export ROLLOUT_EDITOR_DEV_PORT="$EDITOR_DEV_PORT"
+          export ROLLOUT_EDITOR_API_URL="$EDITOR_API_URL"
+          export VITE_EDITOR_API="$EDITOR_API_URL"
+          nohup npm run tauri -- dev --config "$tauri_conf" >"$EDITOR_APP_LOG_FILE" 2>&1 &
           echo $! >"$EDITOR_APP_PID_FILE"
           ensure_pid_alive_or_dump_logs "$EDITOR_APP_PID_FILE" "$EDITOR_APP_LOG_FILE" "editor app"
         )
@@ -367,6 +444,8 @@ case "$ACTION" in
 
       echo "started editor api (pid $(cat "$EDITOR_API_PID_FILE" 2>/dev/null || echo "?"))"
       echo "started editor app (pid $(cat "$EDITOR_APP_PID_FILE" 2>/dev/null || echo "?"))"
+      echo "api: $EDITOR_API_URL"
+      echo "ui:  $EDITOR_DEV_URL"
       echo "api logs: $EDITOR_API_LOG_FILE"
       echo "app logs: $EDITOR_APP_LOG_FILE"
       exit 0

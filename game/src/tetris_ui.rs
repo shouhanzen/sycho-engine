@@ -56,6 +56,13 @@ pub struct PauseMenuLayout {
     pub resume_button: Rect,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MainMenuLayout {
+    pub panel: Rect,
+    pub start_button: Rect,
+    pub quit_button: Rect,
+}
+
 pub fn compute_layout(width: u32, height: u32, board_w: u32, board_h: u32, next_len: usize) -> UiLayout {
     let board_pixel_width = board_w.saturating_mul(CELL_SIZE);
     let board_pixel_height = board_h.saturating_mul(CELL_SIZE);
@@ -127,18 +134,49 @@ pub fn compute_layout(width: u32, height: u32, board_w: u32, board_h: u32, next_
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct HardDropPulseFx {
+    /// Normalized progress in `[0, 1]` where `0` is the initial flare and `1` is fully finished.
+    pub progress: f32,
+    /// Normalized intensity in `[0, 1]`. Higher means a stronger flare.
+    pub intensity: f32,
+}
+
+pub fn hard_drop_pulse_intensity(lines_cleared: u32) -> f32 {
+    match lines_cleared.min(4) {
+        0 => 0.10,
+        1 => 0.14,
+        2 => 0.18,
+        3 => 0.22,
+        _ => 0.28,
+    }
+}
+
 pub fn draw_tetris(
     frame: &mut [u8],
     width: u32,
     height: u32,
     state: &TetrisCore,
 ) -> UiLayout {
-    let board = state.board();
-    draw_board(frame, width, height, board);
+    draw_tetris_with_fx(frame, width, height, state, None)
+}
 
+pub fn draw_tetris_with_fx(
+    frame: &mut [u8],
+    width: u32,
+    height: u32,
+    state: &TetrisCore,
+    hard_drop_pulse: Option<HardDropPulseFx>,
+) -> UiLayout {
+    let board = state.board();
     let board_h = board.len() as u32;
     let board_w = board.first().map(|r| r.len()).unwrap_or(0) as u32;
     let layout = compute_layout(width, height, board_w, board_h, state.next_queue().len());
+
+    draw_board(frame, width, height, board);
+    if let Some(fx) = hard_drop_pulse {
+        apply_hard_drop_pulse(frame, width, height, layout.board, fx);
+    }
 
     draw_ghost_and_active_piece(frame, width, height, layout.board, board_w, board_h, state);
 
@@ -154,7 +192,118 @@ pub fn draw_tetris(
 
     draw_pause_button(frame, width, height, layout.pause_button);
 
+    // Simple HUD: score + lines, placed near the top-right (left of the pause button).
+    let hud_x = layout.pause_button.x.saturating_sub(180);
+    let hud_y = layout.pause_button.y.saturating_add(6);
+    let score_text = format!("SCORE {}", state.score());
+    let lines_text = format!("LINES {}", state.lines_cleared());
+    draw_text(frame, width, height, hud_x, hud_y, &score_text, COLOR_PAUSE_ICON);
+    draw_text(
+        frame,
+        width,
+        height,
+        hud_x,
+        hud_y.saturating_add(14),
+        &lines_text,
+        COLOR_PAUSE_ICON,
+    );
+
     layout
+}
+
+fn apply_hard_drop_pulse(frame: &mut [u8], width: u32, height: u32, rect: Rect, fx: HardDropPulseFx) {
+    if rect.w == 0 || rect.h == 0 {
+        return;
+    }
+    if rect.x >= width || rect.y >= height {
+        return;
+    }
+
+    let progress = clamp01(fx.progress);
+    let intensity = fx.intensity.max(0.0);
+    if intensity <= 0.0 {
+        return;
+    }
+
+    // A subtle cool flare reads like "board backlight" on the dark background.
+    let color = [120u8, 210u8, 255u8, 255u8];
+
+    // Fade out over time; start visible immediately on hard drop.
+    let envelope = 1.0 - progress;
+    if envelope <= 0.0 {
+        return;
+    }
+
+    // The flare "rises": the gradient front moves upward faster than the fade.
+    // We clamp to a small epsilon so the initial frame still draws a thin glow.
+    let front = clamp01(progress * 1.4).max(0.02);
+
+    let max_x = rect.x.saturating_add(rect.w).min(width);
+    let max_y = rect.y.saturating_add(rect.h).min(height);
+    if rect.x >= max_x || rect.y >= max_y {
+        return;
+    }
+
+    let h = (max_y - rect.y).max(1);
+    let denom = (h - 1).max(1) as f32;
+    let bottom_y = rect.y.saturating_add(h - 1);
+
+    for py in rect.y..max_y {
+        let y_from_bottom = bottom_y.saturating_sub(py) as f32;
+        let y_norm = y_from_bottom / denom; // 0 at bottom, 1 at top
+
+        if y_norm > front {
+            continue;
+        }
+
+        // A rising fill gradient: strongest at the bottom, tapering to 0 at the rising front.
+        let gradient = 1.0 - (y_norm / front);
+        let row_alpha_f = intensity * envelope * gradient;
+        if row_alpha_f <= 0.0 {
+            continue;
+        }
+
+        let row_alpha = (row_alpha_f * 255.0).min(255.0).max(0.0) as u8;
+        if row_alpha == 0 {
+            continue;
+        }
+
+        for px in rect.x..max_x {
+            let idx = ((py * width + px) * 4) as usize;
+            if idx + 4 > frame.len() {
+                continue;
+            }
+
+            let r0 = frame[idx] as u32;
+            let g0 = frame[idx + 1] as u32;
+            let b0 = frame[idx + 2] as u32;
+
+            // Bias the effect toward darker pixels so it reads like a "back of board" glow.
+            let lum = (r0 * 30 + g0 * 59 + b0 * 11 + 50) / 100; // ~[0,255]
+            let darkness = (255u32 - lum).min(255) as f32 / 255.0; // 0 bright, 1 dark
+            let a = ((row_alpha as f32) * (0.25 + 0.75 * darkness)).min(255.0) as u8;
+            if a == 0 {
+                continue;
+            }
+
+            let a32 = a as u32;
+            let inv = 255u32 - a32;
+            frame[idx] = ((r0 * inv + (color[0] as u32) * a32 + 127) / 255) as u8;
+            frame[idx + 1] = ((g0 * inv + (color[1] as u32) * a32 + 127) / 255) as u8;
+            frame[idx + 2] = ((b0 * inv + (color[2] as u32) * a32 + 127) / 255) as u8;
+            frame[idx + 3] = 255;
+        }
+    }
+}
+
+fn clamp01(x: f32) -> f32 {
+    if x <= 0.0 {
+        0.0
+    } else if x >= 1.0 {
+        1.0
+    } else {
+        x
+    }
 }
 
 fn draw_pause_button(frame: &mut [u8], width: u32, height: u32, rect: Rect) {
@@ -321,6 +470,145 @@ pub fn draw_pause_menu(frame: &mut [u8], width: u32, height: u32) -> PauseMenuLa
     );
 
     PauseMenuLayout { panel, resume_button }
+}
+
+pub fn draw_main_menu(frame: &mut [u8], width: u32, height: u32) -> MainMenuLayout {
+    // Dim the entire game view.
+    blend_rect(
+        frame,
+        width,
+        height,
+        0,
+        0,
+        width,
+        height,
+        COLOR_PAUSE_MENU_DIM,
+        PAUSE_MENU_DIM_ALPHA,
+    );
+
+    let margin = 32u32;
+    let pad = 18u32;
+
+    let panel_w = 420u32.min(width.saturating_sub(margin.saturating_mul(2)));
+    let panel_h = 260u32.min(height.saturating_sub(margin.saturating_mul(2)));
+    if panel_w == 0 || panel_h == 0 {
+        return MainMenuLayout::default();
+    }
+
+    let panel = Rect {
+        x: width.saturating_sub(panel_w) / 2,
+        y: height.saturating_sub(panel_h) / 2,
+        w: panel_w,
+        h: panel_h,
+    };
+
+    fill_rect(
+        frame,
+        width,
+        height,
+        panel.x,
+        panel.y,
+        panel.w,
+        panel.h,
+        COLOR_PAUSE_MENU_BG,
+    );
+    draw_rect_outline(
+        frame,
+        width,
+        height,
+        panel.x,
+        panel.y,
+        panel.w,
+        panel.h,
+        COLOR_PAUSE_MENU_BORDER,
+    );
+
+    draw_text(
+        frame,
+        width,
+        height,
+        panel.x.saturating_add(pad),
+        panel.y.saturating_add(pad),
+        "TETREE",
+        COLOR_PAUSE_MENU_TEXT,
+    );
+    draw_text(
+        frame,
+        width,
+        height,
+        panel.x.saturating_add(pad),
+        panel.y.saturating_add(pad + 24),
+        "ENTER TO START",
+        COLOR_PAUSE_MENU_TEXT,
+    );
+    draw_text(
+        frame,
+        width,
+        height,
+        panel.x.saturating_add(pad),
+        panel.y.saturating_add(pad + 48),
+        "ESC TO QUIT",
+        COLOR_PAUSE_MENU_TEXT,
+    );
+
+    let button_h = 44u32.min(panel.h.saturating_sub(pad.saturating_mul(2)));
+    let button_w = 240u32.min(panel.w.saturating_sub(pad.saturating_mul(2)));
+    let gap = 12u32;
+    let buttons_total_h = button_h.saturating_mul(2).saturating_add(gap);
+    let top_y = panel
+        .y
+        .saturating_add(panel.h.saturating_sub(pad.saturating_add(buttons_total_h)));
+
+    let start_button = Rect {
+        x: panel.x.saturating_add(panel.w.saturating_sub(button_w) / 2),
+        y: top_y,
+        w: button_w,
+        h: button_h,
+    };
+    let quit_button = Rect {
+        x: start_button.x,
+        y: start_button.y.saturating_add(button_h + gap),
+        w: button_w,
+        h: button_h,
+    };
+
+    for (rect, label) in [(start_button, "START"), (quit_button, "QUIT")] {
+        fill_rect(
+            frame,
+            width,
+            height,
+            rect.x,
+            rect.y,
+            rect.w,
+            rect.h,
+            COLOR_PANEL_BG,
+        );
+        draw_rect_outline(
+            frame,
+            width,
+            height,
+            rect.x,
+            rect.y,
+            rect.w,
+            rect.h,
+            COLOR_PANEL_BORDER,
+        );
+        draw_text(
+            frame,
+            width,
+            height,
+            rect.x.saturating_add(16),
+            rect.y.saturating_add(rect.h / 2).saturating_sub(6),
+            label,
+            COLOR_PAUSE_MENU_TEXT,
+        );
+    }
+
+    MainMenuLayout {
+        panel,
+        start_button,
+        quit_button,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

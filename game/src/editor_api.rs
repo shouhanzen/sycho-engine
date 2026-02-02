@@ -132,6 +132,7 @@ fn snapshot_from_state(frame: usize, state: &TetrisCore) -> EditorSnapshot {
     let pos = state.current_piece_pos();
 
     let stats = vec![
+        stat("score", state.score()),
         stat("linesCleared", state.lines_cleared()),
         stat_opt("currentPiece", state.current_piece().map(piece_label)),
         stat_opt("nextPiece", state.next_piece().map(piece_label)),

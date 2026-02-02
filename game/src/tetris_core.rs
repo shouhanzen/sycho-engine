@@ -4,6 +4,8 @@ pub const BOARD_WIDTH: usize = 10;
 pub const BOARD_HEIGHT: usize = 20;
 pub const NEXT_QUEUE_LEN: usize = 5;
 
+const HARD_DROP_POINTS_PER_ROW: u32 = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Piece {
     I,
@@ -81,6 +83,7 @@ pub struct TetrisSnapshot {
     pub current_piece_pos: Vec2i,
     pub current_piece_rotation: u8,
     pub lines_cleared: u32,
+    pub score: u32,
     pub game_over: bool,
 }
 
@@ -97,6 +100,7 @@ pub struct TetrisCore {
     piece_bag: Vec<Piece>,
     rng: Rng,
     lines_cleared: u32,
+    score: u32,
     game_over: bool,
     last_srs_kick_offset: Vec2i,
 }
@@ -115,6 +119,7 @@ impl TetrisCore {
             piece_bag: Vec::new(),
             rng: Rng::new(seed),
             lines_cleared: 0,
+            score: 0,
             game_over: false,
             last_srs_kick_offset: Vec2i::ZERO,
         }
@@ -138,6 +143,7 @@ impl TetrisCore {
         self.current_piece_rotation = 0;
         self.piece_bag.clear();
         self.lines_cleared = 0;
+        self.score = 0;
         self.game_over = false;
         self.last_srs_kick_offset = Vec2i::ZERO;
         self.spawn_new_piece();
@@ -235,6 +241,10 @@ impl TetrisCore {
         self.lines_cleared
     }
 
+    pub fn score(&self) -> u32 {
+        self.score
+    }
+
     pub fn snapshot(&self) -> TetrisSnapshot {
         TetrisSnapshot {
             board: self.board.clone(),
@@ -246,6 +256,7 @@ impl TetrisCore {
             current_piece_pos: self.current_piece_pos,
             current_piece_rotation: self.current_piece_rotation,
             lines_cleared: self.lines_cleared,
+            score: self.score,
             game_over: self.game_over,
         }
     }
@@ -390,15 +401,19 @@ impl TetrisCore {
     }
 
     pub fn hard_drop(&mut self) -> i32 {
-        let mut drop_distance = 0;
+        let mut drop_distance = 0u32;
         while self.move_piece_down() {
-            drop_distance += 1;
+            drop_distance = drop_distance.saturating_add(1);
         }
+
+        self.score = self
+            .score
+            .saturating_add(drop_distance.saturating_mul(HARD_DROP_POINTS_PER_ROW));
 
         self.place_piece();
         self.clear_lines();
         self.spawn_new_piece();
-        drop_distance
+        drop_distance as i32
     }
 
     pub fn clear_lines(&mut self) -> usize {
@@ -416,7 +431,10 @@ impl TetrisCore {
                 self.board.remove(*line_y);
                 self.board.push(vec![0; BOARD_WIDTH]);
             }
-            self.lines_cleared += lines_to_clear.len() as u32;
+
+            let cleared = lines_to_clear.len() as u32;
+            self.lines_cleared = self.lines_cleared.saturating_add(cleared);
+            self.score = self.score.saturating_add(line_clear_points(cleared));
         }
 
         lines_to_clear.len()
@@ -494,6 +512,25 @@ impl TetrisCore {
             self.piece_bag.swap(i, j);
         }
     }
+}
+
+fn line_clear_points(lines: u32) -> u32 {
+    // Minimal, deterministic scoring:
+    // - 1/2/3/4 line clears: 100/300/500/800
+    // - For >4 (only possible via tests / manual board edits), treat as multiple tetrises + remainder.
+    let tetrises = lines / 4;
+    let rem = lines % 4;
+
+    let base = tetrises.saturating_mul(800);
+    let rem_points = match rem {
+        0 => 0,
+        1 => 100,
+        2 => 300,
+        3 => 500,
+        _ => 0,
+    };
+
+    base.saturating_add(rem_points)
 }
 
 #[derive(Debug, Clone)]

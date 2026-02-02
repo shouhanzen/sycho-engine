@@ -1,7 +1,7 @@
 use engine::render::{color_for_cell, CELL_SIZE};
 
 use game::tetris_core::{Piece, TetrisCore, Vec2i, BOARD_HEIGHT};
-use game::tetris_ui::{draw_pause_menu, draw_tetris};
+use game::tetris_ui::{draw_main_menu, draw_pause_menu, draw_tetris, draw_tetris_with_fx, HardDropPulseFx};
 
 #[test]
 fn draw_tetris_renders_hold_panel_outside_board_area() {
@@ -99,6 +99,60 @@ fn draw_tetris_renders_pause_button_in_bounds() {
 }
 
 #[test]
+fn hard_drop_pulse_fx_tints_board_background_and_scales_with_intensity() {
+    let width = 800u32;
+    let height = 600u32;
+
+    let mut core = TetrisCore::new(0);
+    core.set_available_pieces(Piece::all());
+    core.initialize_game();
+
+    let mut frame_base = vec![0u8; (width * height * 4) as usize];
+    let layout = draw_tetris(&mut frame_base, width, height, &core);
+
+    // Sample a pixel inside the bottom-left of the board area.
+    let px = layout.board.x + 1;
+    let py = layout.board.y + layout.board.h.saturating_sub(2);
+    let idx = ((py * width + px) * 4) as usize;
+    let base = &frame_base[idx..idx + 4];
+
+    let mut frame_low = vec![0u8; (width * height * 4) as usize];
+    draw_tetris_with_fx(
+        &mut frame_low,
+        width,
+        height,
+        &core,
+        Some(HardDropPulseFx {
+            progress: 0.20,
+            intensity: 0.10,
+        }),
+    );
+    let low = &frame_low[idx..idx + 4];
+
+    let mut frame_high = vec![0u8; (width * height * 4) as usize];
+    draw_tetris_with_fx(
+        &mut frame_high,
+        width,
+        height,
+        &core,
+        Some(HardDropPulseFx {
+            progress: 0.20,
+            intensity: 0.28,
+        }),
+    );
+    let high = &frame_high[idx..idx + 4];
+
+    assert_ne!(low, base, "expected pulse FX to tint the board background");
+
+    let lum_low = low[0] as u32 + low[1] as u32 + low[2] as u32;
+    let lum_high = high[0] as u32 + high[1] as u32 + high[2] as u32;
+    assert!(
+        lum_high > lum_low,
+        "expected higher intensity to produce a brighter pulse (low={lum_low} high={lum_high})"
+    );
+}
+
+#[test]
 fn draw_pause_menu_draws_a_panel_and_resume_button() {
     let width = 800u32;
     let height = 600u32;
@@ -118,5 +172,29 @@ fn draw_pause_menu_draws_a_panel_and_resume_button() {
         &frame[idx..idx + 4],
         &bg,
         "expected pause menu panel border to differ from background"
+    );
+}
+
+#[test]
+fn draw_main_menu_draws_a_panel_and_buttons() {
+    let width = 800u32;
+    let height = 600u32;
+
+    let bg = color_for_cell(0);
+    let mut frame = vec![0u8; (width * height * 4) as usize];
+    for px in frame.chunks_exact_mut(4) {
+        px.copy_from_slice(&bg);
+    }
+
+    let layout = draw_main_menu(&mut frame, width, height);
+    assert!(layout.panel.w > 0 && layout.panel.h > 0);
+    assert!(layout.start_button.w > 0 && layout.start_button.h > 0);
+    assert!(layout.quit_button.w > 0 && layout.quit_button.h > 0);
+
+    let idx = ((layout.panel.y * width + layout.panel.x) * 4) as usize;
+    assert_ne!(
+        &frame[idx..idx + 4],
+        &bg,
+        "expected main menu panel border to differ from background"
     );
 }

@@ -20,6 +20,7 @@ fn initializes_board_and_spawns_piece() {
     assert!(core.held_piece().is_none());
     assert!(core.can_hold());
     assert_eq!(core.lines_cleared(), 0);
+    assert_eq!(core.score(), 0);
     assert!(!core.snapshot().game_over);
     assert_eq!(core.current_piece_pos(), Vec2i::new(4, BOARD_HEIGHT as i32));
     assert_eq!(core.current_piece_rotation(), 0);
@@ -135,7 +136,22 @@ fn clear_lines_removes_full_rows() {
     let cleared = core.clear_lines();
     assert_eq!(cleared, 1);
     assert_eq!(core.lines_cleared(), 1);
+    assert_eq!(core.score(), 100);
 
     let top_row = &core.board()[BOARD_HEIGHT - 1];
     assert!(top_row.iter().all(|&cell| cell == 0));
+}
+
+#[test]
+fn hard_drop_awards_score_for_drop_distance() {
+    let mut core = TetrisCore::new(0);
+    core.set_available_pieces(vec![Piece::O]);
+    core.initialize_game();
+
+    // From y=10, an O piece can hard-drop to y=1 on an empty board (distance = 9).
+    core.set_current_piece_for_test(Piece::O, Vec2i::new(4, 10), 0);
+    let drop_distance = core.hard_drop();
+
+    assert_eq!(drop_distance, 9);
+    assert_eq!(core.score(), 18);
 }
