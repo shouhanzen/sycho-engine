@@ -44,6 +44,7 @@ Editor:
 
 Lifecycle:
   --start        Starts the selected target/mode. Default is background (writes pid/log files).
+                If a background process exits immediately, go.sh will print recent logs to the terminal.
   --foreground   Runs attached to the current terminal (no pid/log management).
   --stop         Stops the background process started by --start.
   --restart      Equivalent to --stop then --start.
@@ -105,6 +106,55 @@ stop_pidfile() {
   fi
 
   rm -f "$pid_file"
+}
+
+print_log_tail() {
+  local log_file="$1"
+  local lines="${2:-200}"
+
+  if [[ -z "$log_file" ]]; then
+    return 0
+  fi
+
+  if ! [[ -f "$log_file" ]]; then
+    echo "(no log file at $log_file)" >&2
+    return 0
+  fi
+
+  echo "" >&2
+  echo "---- last ${lines} lines of $log_file ----" >&2
+  if command -v tail >/dev/null 2>&1; then
+    tail -n "$lines" "$log_file" >&2 || true
+  else
+    cat "$log_file" >&2 || true
+  fi
+  echo "---- end log ----" >&2
+}
+
+ensure_pid_alive_or_dump_logs() {
+  local pid_file="$1"
+  local log_file="$2"
+  local label="$3"
+
+  local pid
+  pid="$(cat "$pid_file" 2>/dev/null || true)"
+  if [[ -z "$pid" ]]; then
+    echo "failed to start $label (empty pid file: $pid_file)" >&2
+    echo "logs: $log_file" >&2
+    print_log_tail "$log_file" 200
+    rm -f "$pid_file"
+    return 1
+  fi
+
+  # Give the process a moment to crash early so we can surface useful logs.
+  sleep 0.2
+  if ! kill -0 "$pid" 2>/dev/null; then
+    echo "failed to start $label (pid $pid exited immediately)" >&2
+    echo "logs: $log_file" >&2
+    print_log_tail "$log_file" 200
+    rm -f "$pid_file"
+    return 1
+  fi
 }
 
 TARGET="game"
@@ -303,6 +353,7 @@ case "$ACTION" in
       if [[ "$api_running" == "false" ]]; then
         nohup cargo run -p game --bin editor_api "${CARGO_PROFILE_ARGS[@]}" >"$EDITOR_API_LOG_FILE" 2>&1 &
         echo $! >"$EDITOR_API_PID_FILE"
+        ensure_pid_alive_or_dump_logs "$EDITOR_API_PID_FILE" "$EDITOR_API_LOG_FILE" "editor api"
       fi
 
       if [[ "$app_running" == "false" ]]; then
@@ -310,6 +361,7 @@ case "$ACTION" in
           cd "$ROOT_DIR/editor/frontend"
           nohup npm run tauri dev >"$EDITOR_APP_LOG_FILE" 2>&1 &
           echo $! >"$EDITOR_APP_PID_FILE"
+          ensure_pid_alive_or_dump_logs "$EDITOR_APP_PID_FILE" "$EDITOR_APP_LOG_FILE" "editor app"
         )
       fi
 
@@ -347,6 +399,7 @@ case "$ACTION" in
         nohup cargo test -p game --test e2e_playtest_tests "${CARGO_PROFILE_ARGS[@]}" -- --nocapture >"$GAME_LOG_FILE" 2>&1 &
       fi
       echo $! >"$GAME_PID_FILE"
+      ensure_pid_alive_or_dump_logs "$GAME_PID_FILE" "$GAME_LOG_FILE" "headless tests"
       echo "started headless tests (pid $(cat "$GAME_PID_FILE"))"
       echo "logs: $GAME_LOG_FILE"
       exit 0
@@ -359,6 +412,7 @@ case "$ACTION" in
 
     nohup cargo run -p game --bin headful "${CARGO_PROFILE_ARGS[@]}" >"$GAME_LOG_FILE" 2>&1 &
     echo $! >"$GAME_PID_FILE"
+    ensure_pid_alive_or_dump_logs "$GAME_PID_FILE" "$GAME_LOG_FILE" "headful game"
     echo "started headful game (pid $(cat "$GAME_PID_FILE"))"
     echo "logs: $GAME_LOG_FILE"
     ;;
