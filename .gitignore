@@ -5,7 +5,7 @@
 
 # === Node / frontend tooling ===
 **/node_modules/
-**/dist/
+**/dist/*
 !**/dist/.gitkeep
 **/.vite/
 **/.turbo/

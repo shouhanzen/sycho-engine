@@ -232,12 +232,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn map_key_to_action(key: VirtualKeyCode) -> Option<InputAction> {
     match key {
-        VirtualKeyCode::Left | VirtualKeyCode::A => Some(InputAction::MoveLeft),
+        VirtualKeyCode::Left => Some(InputAction::MoveLeft),
         VirtualKeyCode::Right | VirtualKeyCode::D => Some(InputAction::MoveRight),
         VirtualKeyCode::Down | VirtualKeyCode::S => Some(InputAction::SoftDrop),
         VirtualKeyCode::Up | VirtualKeyCode::W => Some(InputAction::RotateCw),
         VirtualKeyCode::Z => Some(InputAction::RotateCcw),
         VirtualKeyCode::X => Some(InputAction::RotateCw),
+        VirtualKeyCode::A => Some(InputAction::Rotate180),
         VirtualKeyCode::Space => Some(InputAction::HardDrop),
         VirtualKeyCode::C => Some(InputAction::Hold),
         _ => None,
@@ -298,4 +299,25 @@ fn apply_action(
     }
 
     debug_hud.record_input(input_start.elapsed());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_a_maps_to_rotate_180() {
+        assert_eq!(
+            map_key_to_action(VirtualKeyCode::A),
+            Some(InputAction::Rotate180)
+        );
+    }
+
+    #[test]
+    fn left_arrow_maps_to_move_left() {
+        assert_eq!(
+            map_key_to_action(VirtualKeyCode::Left),
+            Some(InputAction::MoveLeft)
+        );
+    }
 }
