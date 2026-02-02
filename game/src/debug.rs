@@ -388,7 +388,11 @@ fn set_pixel(frame: &mut [u8], width: u32, height: u32, x: u32, y: u32, color: [
     }
     let idx = ((y * width + x) * 4) as usize;
     if idx + 4 <= frame.len() {
-        frame[idx..idx + 4].copy_from_slice(&color);
+        let [r, g, b, a] = color;
+        frame[idx] = r;
+        frame[idx + 1] = g;
+        frame[idx + 2] = b;
+        frame[idx + 3] = a;
     }
 }
 
@@ -405,10 +409,43 @@ fn fill_rect(
     let max_x = (x + w).min(width);
     let max_y = (y + h).min(height);
 
-    for py in y..max_y {
-        for px in x..max_x {
-            set_pixel(frame, width, height, px, py, color);
+    if x >= max_x || y >= max_y {
+        return;
+    }
+
+    let width = width as usize;
+    let height = height as usize;
+    let expected_len = width
+        .checked_mul(height)
+        .and_then(|v| v.checked_mul(4))
+        .unwrap_or(0);
+    if expected_len == 0 || frame.len() < expected_len {
+        return;
+    }
+
+    let row_pixels = (max_x - x) as usize;
+    let row_bytes = row_pixels.checked_mul(4).unwrap_or(0);
+    if row_bytes == 0 {
+        return;
+    }
+
+    let stride = width.checked_mul(4).unwrap_or(0);
+    let mut row_start = (y as usize)
+        .checked_mul(stride)
+        .and_then(|v| v.checked_add((x as usize).checked_mul(4)?))
+        .unwrap_or(0);
+
+    let [r, g, b, a] = color;
+    for _ in y..max_y {
+        let row_end = row_start + row_bytes;
+        let row = &mut frame[row_start..row_end];
+        for px in row.chunks_exact_mut(4) {
+            px[0] = r;
+            px[1] = g;
+            px[2] = b;
+            px[3] = a;
         }
+        row_start += stride;
     }
 }
 
