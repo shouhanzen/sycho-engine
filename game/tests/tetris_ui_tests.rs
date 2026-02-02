@@ -1,7 +1,7 @@
 use engine::render::{color_for_cell, CELL_SIZE};
 
 use game::tetris_core::{Piece, TetrisCore, Vec2i, BOARD_HEIGHT};
-use game::tetris_ui::draw_tetris;
+use game::tetris_ui::{draw_pause_menu, draw_tetris};
 
 #[test]
 fn draw_tetris_renders_hold_panel_outside_board_area() {
@@ -72,3 +72,51 @@ fn draw_tetris_renders_ghost_piece_at_hard_drop_position() {
     );
 }
 
+
+#[test]
+fn draw_tetris_renders_pause_button_in_bounds() {
+    let width = 800u32;
+    let height = 600u32;
+    let mut frame = vec![0u8; (width * height * 4) as usize];
+
+    let mut core = TetrisCore::new(0);
+    core.set_available_pieces(Piece::all());
+    core.initialize_game();
+
+    let layout = draw_tetris(&mut frame, width, height, &core);
+    assert!(layout.pause_button.w > 0 && layout.pause_button.h > 0);
+    assert!(layout.pause_button.x < width && layout.pause_button.y < height);
+
+    let idx = ((layout.pause_button.y * width + layout.pause_button.x) * 4) as usize;
+    let mut pixel = [0u8; 4];
+    pixel.copy_from_slice(&frame[idx..idx + 4]);
+
+    let bg = color_for_cell(0);
+    assert_ne!(
+        pixel, bg,
+        "expected pause button border to differ from background"
+    );
+}
+
+#[test]
+fn draw_pause_menu_draws_a_panel_and_resume_button() {
+    let width = 800u32;
+    let height = 600u32;
+
+    let bg = color_for_cell(0);
+    let mut frame = vec![0u8; (width * height * 4) as usize];
+    for px in frame.chunks_exact_mut(4) {
+        px.copy_from_slice(&bg);
+    }
+
+    let layout = draw_pause_menu(&mut frame, width, height);
+    assert!(layout.panel.w > 0 && layout.panel.h > 0);
+    assert!(layout.resume_button.w > 0 && layout.resume_button.h > 0);
+
+    let idx = ((layout.panel.y * width + layout.panel.x) * 4) as usize;
+    assert_ne!(
+        &frame[idx..idx + 4],
+        &bg,
+        "expected pause menu panel border to differ from background"
+    );
+}

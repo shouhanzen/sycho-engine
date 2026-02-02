@@ -18,7 +18,7 @@ use game::debug::DebugHud;
 use game::playtest::{InputAction, TetrisLogic};
 use game::sfx::{ACTION_SFX_VOLUME, LINE_CLEAR_SFX_VOLUME, MOVE_PIECE_SFX_VOLUME};
 use game::tetris_core::Piece;
-use game::tetris_ui::{draw_tetris, UiLayout};
+use game::tetris_ui::{draw_pause_menu, draw_tetris, PauseMenuLayout, UiLayout};
 
 struct PixelsSurface {
     pixels: Pixels,
@@ -123,6 +123,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sfx = Sfx::new().ok();
     let mut debug_hud = DebugHud::new();
     let mut last_layout = UiLayout::default();
+    let mut last_pause_menu = PauseMenuLayout::default();
+    let mut paused = false;
     let mut mouse_x: u32 = 0;
     let mut mouse_y: u32 = 0;
 
@@ -147,7 +149,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     button: MouseButton::Left,
                     ..
                 } => {
-                    if last_layout.hold_panel.contains(mouse_x, mouse_y) {
+                    if last_layout.pause_button.contains(mouse_x, mouse_y) {
+                        paused = !paused;
+                        last_gravity = Instant::now();
+                        if let Some(sfx) = sfx.as_ref() {
+                            sfx.play_click(ACTION_SFX_VOLUME);
+                        }
+                    } else if paused {
+                        if last_pause_menu.resume_button.contains(mouse_x, mouse_y) {
+                            paused = false;
+                            last_gravity = Instant::now();
+                            if let Some(sfx) = sfx.as_ref() {
+                                sfx.play_click(ACTION_SFX_VOLUME);
+                            }
+                        }
+                    } else if last_layout.hold_panel.contains(mouse_x, mouse_y) {
                         apply_action(&mut runner, sfx.as_ref(), &mut debug_hud, InputAction::Hold);
                     }
                 }
@@ -174,14 +190,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         debug_hud.toggle();
                     }
 
-                    if let Some(action) = map_key_to_action(key) {
-                        apply_action(&mut runner, sfx.as_ref(), &mut debug_hud, action);
+                    if key == VirtualKeyCode::Escape {
+                        paused = !paused;
+                        last_gravity = Instant::now();
+                        if let Some(sfx) = sfx.as_ref() {
+                            sfx.play_click(ACTION_SFX_VOLUME);
+                        }
+                    } else if !paused {
+                        if let Some(action) = map_key_to_action(key) {
+                            apply_action(&mut runner, sfx.as_ref(), &mut debug_hud, action);
+                        }
                     }
                 }
                 _ => {}
             },
             Event::MainEventsCleared => {
-                if last_gravity.elapsed() >= gravity_interval {
+                if !paused && last_gravity.elapsed() >= gravity_interval {
                     let gravity_start = Instant::now();
                     runner.step_profiled(InputAction::SoftDrop, &mut debug_hud);
                     debug_hud.record_gravity(gravity_start.elapsed());
@@ -207,6 +231,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let overlay_start = Instant::now();
                 let size = surface.size();
+                if paused {
+                    last_pause_menu = draw_pause_menu(surface.frame_mut(), size.width, size.height);
+                } else {
+                    last_pause_menu = PauseMenuLayout::default();
+                }
                 debug_hud.draw_overlay(surface.frame_mut(), size.width, size.height);
                 let overlay_dt = overlay_start.elapsed();
 

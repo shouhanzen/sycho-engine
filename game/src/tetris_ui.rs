@@ -1,10 +1,22 @@
 use engine::render::{color_for_cell, draw_board, CELL_SIZE};
 
+use crate::debug::draw_text;
+
 use crate::tetris_core::{Piece, TetrisCore, Vec2i};
 
 const COLOR_PANEL_BG: [u8; 4] = [16, 16, 22, 255];
 const COLOR_PANEL_BORDER: [u8; 4] = [40, 40, 55, 255];
 const COLOR_PANEL_BORDER_DISABLED: [u8; 4] = [28, 28, 38, 255];
+
+const PAUSE_BUTTON_SIZE: u32 = 44;
+const PAUSE_BUTTON_MARGIN: u32 = 12;
+const COLOR_PAUSE_ICON: [u8; 4] = [235, 235, 245, 255];
+
+const COLOR_PAUSE_MENU_TEXT: [u8; 4] = [235, 235, 245, 255];
+const COLOR_PAUSE_MENU_DIM: [u8; 4] = [0, 0, 0, 255];
+const PAUSE_MENU_DIM_ALPHA: u8 = 170;
+const COLOR_PAUSE_MENU_BG: [u8; 4] = [10, 10, 14, 255];
+const COLOR_PAUSE_MENU_BORDER: [u8; 4] = [40, 40, 55, 255];
 
 const PANEL_MARGIN: u32 = 16;
 const PANEL_PADDING: u32 = 12;
@@ -35,6 +47,13 @@ pub struct UiLayout {
     pub board: Rect,
     pub hold_panel: Rect,
     pub next_panel: Rect,
+    pub pause_button: Rect,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PauseMenuLayout {
+    pub panel: Rect,
+    pub resume_button: Rect,
 }
 
 pub fn compute_layout(width: u32, height: u32, board_w: u32, board_h: u32, next_len: usize) -> UiLayout {
@@ -92,10 +111,19 @@ pub fn compute_layout(width: u32, height: u32, board_w: u32, board_h: u32, next_
         h: next_h.min(board_pixel_height),
     };
 
+    let pause_size = PAUSE_BUTTON_SIZE.min(width).min(height);
+    let pause_button = Rect {
+        x: width.saturating_sub(PAUSE_BUTTON_MARGIN.saturating_add(pause_size)),
+        y: PAUSE_BUTTON_MARGIN.min(height.saturating_sub(pause_size)),
+        w: pause_size,
+        h: pause_size,
+    };
+
     UiLayout {
         board,
         hold_panel,
         next_panel,
+        pause_button,
     }
 }
 
@@ -124,7 +152,163 @@ pub fn draw_tetris(
     );
     draw_next_panel(frame, width, height, layout.next_panel, state.next_queue());
 
+    draw_pause_button(frame, width, height, layout.pause_button);
+
     layout
+}
+
+fn draw_pause_button(frame: &mut [u8], width: u32, height: u32, rect: Rect) {
+    if rect.w == 0 || rect.h == 0 {
+        return;
+    }
+    if rect.x >= width || rect.y >= height {
+        return;
+    }
+
+    fill_rect(frame, width, height, rect.x, rect.y, rect.w, rect.h, COLOR_PANEL_BG);
+    draw_rect_outline(
+        frame,
+        width,
+        height,
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        COLOR_PANEL_BORDER,
+    );
+
+    // Draw a simple pause icon: two vertical bars.
+    let bar_w = (rect.w / 6).max(3).min(rect.w);
+    let bar_h = (rect.h * 2 / 3).max(6).min(rect.h);
+    let gap = (rect.w / 5).max(4);
+
+    let icon_total_w = bar_w.saturating_mul(2).saturating_add(gap);
+    let icon_x0 = rect.x + rect.w.saturating_sub(icon_total_w) / 2;
+    let icon_y0 = rect.y + rect.h.saturating_sub(bar_h) / 2;
+
+    fill_rect(frame, width, height, icon_x0, icon_y0, bar_w, bar_h, COLOR_PAUSE_ICON);
+    fill_rect(
+        frame,
+        width,
+        height,
+        icon_x0.saturating_add(bar_w + gap),
+        icon_y0,
+        bar_w,
+        bar_h,
+        COLOR_PAUSE_ICON,
+    );
+}
+
+pub fn draw_pause_menu(frame: &mut [u8], width: u32, height: u32) -> PauseMenuLayout {
+    // Dim the entire game view.
+    blend_rect(
+        frame,
+        width,
+        height,
+        0,
+        0,
+        width,
+        height,
+        COLOR_PAUSE_MENU_DIM,
+        PAUSE_MENU_DIM_ALPHA,
+    );
+
+    let margin = 32u32;
+    let pad = 18u32;
+
+    let panel_w = 360u32.min(width.saturating_sub(margin.saturating_mul(2)));
+    let panel_h = 200u32.min(height.saturating_sub(margin.saturating_mul(2)));
+    if panel_w == 0 || panel_h == 0 {
+        return PauseMenuLayout::default();
+    }
+
+    let panel = Rect {
+        x: width.saturating_sub(panel_w) / 2,
+        y: height.saturating_sub(panel_h) / 2,
+        w: panel_w,
+        h: panel_h,
+    };
+
+    fill_rect(
+        frame,
+        width,
+        height,
+        panel.x,
+        panel.y,
+        panel.w,
+        panel.h,
+        COLOR_PAUSE_MENU_BG,
+    );
+    draw_rect_outline(
+        frame,
+        width,
+        height,
+        panel.x,
+        panel.y,
+        panel.w,
+        panel.h,
+        COLOR_PAUSE_MENU_BORDER,
+    );
+
+    draw_text(
+        frame,
+        width,
+        height,
+        panel.x.saturating_add(pad),
+        panel.y.saturating_add(pad),
+        "PAUSED",
+        COLOR_PAUSE_MENU_TEXT,
+    );
+    draw_text(
+        frame,
+        width,
+        height,
+        panel.x.saturating_add(pad),
+        panel.y.saturating_add(pad + 24),
+        "ESC TO RESUME",
+        COLOR_PAUSE_MENU_TEXT,
+    );
+
+    let button_h = 44u32.min(panel.h.saturating_sub(pad.saturating_mul(2)));
+    let button_w = 240u32.min(panel.w.saturating_sub(pad.saturating_mul(2)));
+    let resume_button = Rect {
+        x: panel.x.saturating_add(panel.w.saturating_sub(button_w) / 2),
+        y: panel.y.saturating_add(panel.h.saturating_sub(pad.saturating_add(button_h))),
+        w: button_w,
+        h: button_h,
+    };
+
+    fill_rect(
+        frame,
+        width,
+        height,
+        resume_button.x,
+        resume_button.y,
+        resume_button.w,
+        resume_button.h,
+        COLOR_PANEL_BG,
+    );
+    draw_rect_outline(
+        frame,
+        width,
+        height,
+        resume_button.x,
+        resume_button.y,
+        resume_button.w,
+        resume_button.h,
+        COLOR_PANEL_BORDER,
+    );
+    draw_text(
+        frame,
+        width,
+        height,
+        resume_button.x.saturating_add(16),
+        resume_button.y.saturating_add(resume_button.h / 2).saturating_sub(6),
+        "RESUME",
+        COLOR_PAUSE_MENU_TEXT,
+    );
+
+    PauseMenuLayout { panel, resume_button }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -405,13 +589,43 @@ fn fill_rect(
     let max_x = (x + w).min(width);
     let max_y = (y + h).min(height);
 
-    for py in y..max_y {
-        for px in x..max_x {
-            let idx = ((py * width + px) * 4) as usize;
-            if idx + 4 <= frame.len() {
-                frame[idx..idx + 4].copy_from_slice(&color);
-            }
+    if x >= max_x || y >= max_y {
+        return;
+    }
+
+    let width = width as usize;
+    let height = height as usize;
+    let expected_len = width
+        .checked_mul(height)
+        .and_then(|v| v.checked_mul(4))
+        .unwrap_or(0);
+    if expected_len == 0 || frame.len() < expected_len {
+        return;
+    }
+
+    let row_pixels = (max_x - x) as usize;
+    let row_bytes = row_pixels.checked_mul(4).unwrap_or(0);
+    if row_bytes == 0 {
+        return;
+    }
+
+    let stride = width.checked_mul(4).unwrap_or(0);
+    let mut row_start = (y as usize)
+        .checked_mul(stride)
+        .and_then(|v| v.checked_add((x as usize).checked_mul(4)?))
+        .unwrap_or(0);
+
+    let [r, g, b, a] = color;
+    for _ in y..max_y {
+        let row_end = row_start + row_bytes;
+        let row = &mut frame[row_start..row_end];
+        for px in row.chunks_exact_mut(4) {
+            px[0] = r;
+            px[1] = g;
+            px[2] = b;
+            px[3] = a;
         }
+        row_start += stride;
     }
 }
 
