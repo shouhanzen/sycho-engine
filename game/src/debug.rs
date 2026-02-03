@@ -290,6 +290,54 @@ pub fn draw_text(
     }
 }
 
+/// Draw a tiny blocky text string into an RGBA frame buffer with a custom scale.
+///
+/// Scale is interpreted as the pixel size of each glyph "dot" (e.g. scale=2 matches `draw_text`).
+pub fn draw_text_scaled(
+    frame: &mut [u8],
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+    text: &str,
+    color: [u8; 4],
+    scale: u32,
+) {
+    let scale = scale.max(1);
+    let glyph_advance_x = (GLYPH_W + 1).saturating_mul(scale);
+    let line_advance_y = (GLYPH_H + 1).saturating_mul(scale);
+
+    let mut cursor_x = x;
+    let mut cursor_y = y;
+
+    for ch in text.chars() {
+        match ch {
+            '\n' => {
+                cursor_x = x;
+                cursor_y = cursor_y.saturating_add(line_advance_y);
+                if cursor_y >= height {
+                    break;
+                }
+                continue;
+            }
+            ' ' => {
+                cursor_x = cursor_x.saturating_add(glyph_advance_x);
+                if cursor_x >= width {
+                    break;
+                }
+                continue;
+            }
+            _ => {}
+        }
+
+        draw_char_scaled(frame, width, height, cursor_x, cursor_y, ch, color, scale);
+        cursor_x = cursor_x.saturating_add(glyph_advance_x);
+        if cursor_x >= width {
+            break;
+        }
+    }
+}
+
 fn draw_char(
     frame: &mut [u8],
     width: u32,
@@ -310,6 +358,35 @@ fn draw_char(
             let px0 = x.saturating_add(col.saturating_mul(FONT_SCALE));
             for dy in 0..FONT_SCALE {
                 for dx in 0..FONT_SCALE {
+                    set_pixel(frame, width, height, px0 + dx, py0 + dy, color);
+                }
+            }
+        }
+    }
+}
+
+fn draw_char_scaled(
+    frame: &mut [u8],
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+    ch: char,
+    color: [u8; 4],
+    scale: u32,
+) {
+    let scale = scale.max(1);
+    let rows = glyph_rows(ch);
+    for (row, bits) in rows.into_iter().enumerate() {
+        let py0 = y.saturating_add((row as u32).saturating_mul(scale));
+        for col in 0..GLYPH_W {
+            let mask = 1u8 << (GLYPH_W - 1 - col);
+            if (bits & mask) == 0 {
+                continue;
+            }
+            let px0 = x.saturating_add(col.saturating_mul(scale));
+            for dy in 0..scale {
+                for dx in 0..scale {
                     set_pixel(frame, width, height, px0 + dx, py0 + dy, color);
                 }
             }

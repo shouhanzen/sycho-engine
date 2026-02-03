@@ -1,9 +1,12 @@
 use engine::HeadlessRunner;
+use engine::graphics::CpuRenderer;
 use engine::recording::{Mp4Config, Mp4Recorder};
+use engine::regression::{record_state_and_video_then_replay_and_compare, VideoCaptureConfig};
 use engine::render::{draw_board, CELL_SIZE};
+use engine::surface::SurfaceSize;
 
 use game::playtest::{InputAction, TetrisLogic};
-use game::tetris_core::{Piece, Vec2i, BOARD_HEIGHT, BOARD_WIDTH};
+use game::tetris_core::{Piece, TetrisCore, Vec2i, BOARD_HEIGHT, BOARD_WIDTH};
 
 use std::fs;
 use std::path::PathBuf;
@@ -65,7 +68,13 @@ impl E2eMp4 {
 
     fn capture(&mut self, runner: &HeadlessRunner<TetrisLogic>) {
         let board = runner.state().board_with_active_piece();
-        draw_board(&mut self.buf, self.width, self.height, &board);
+        {
+            let mut gfx = CpuRenderer::new(
+                self.buf.as_mut_slice(),
+                SurfaceSize::new(self.width, self.height),
+            );
+            draw_board(&mut gfx, &board);
+        }
         for _ in 0..self.hold_frames {
             self.rec
                 .push_rgba_frame(&self.buf)
@@ -73,13 +82,14 @@ impl E2eMp4 {
         }
     }
 
-    fn finish(mut self) {
+    fn finish(mut self) -> PathBuf {
         let out = self.rec.output().to_path_buf();
         self.rec
             .finish()
             .expect("ffmpeg failed while finalizing the mp4");
         let meta = fs::metadata(&out).expect("mp4 output missing after ffmpeg finished");
         assert!(meta.len() > 0, "mp4 output was empty");
+        out
     }
 }
 
@@ -153,6 +163,76 @@ fn e2e_hard_drop_places_o_piece() {
     if let Some(r) = rec.take() {
         r.finish();
     }
+}
+
+#[test]
+fn e2e_state_recording_replay_video_matches_live_video() {
+    if !env_flag("ROLLOUT_E2E_VERIFY_STATE_REPLAY") {
+        return;
+    }
+
+    if !env_flag("ROLLOUT_E2E_RECORD_MP4") {
+        eprintln!("skipping: ROLLOUT_E2E_VERIFY_STATE_REPLAY requires ROLLOUT_E2E_RECORD_MP4=1");
+        return;
+    }
+
+    if !Mp4Recorder::ffmpeg_available() {
+        eprintln!("skipping: ffmpeg not found on PATH; cannot record/verify videos");
+        return;
+    }
+
+    let test_name = "e2e_state_recording_replay_video_matches_live_video";
+    let fps = env_u32("ROLLOUT_E2E_RECORD_FPS").unwrap_or(30);
+    let hold_frames = env_usize("ROLLOUT_E2E_RECORD_HOLD_FRAMES").unwrap_or(10).max(1);
+
+    // Render just the board, with a 1-cell padding so the outline is visible.
+    let padding_cells = 1u32;
+    let width = (BOARD_WIDTH as u32 + padding_cells * 2) * CELL_SIZE;
+    let height = (BOARD_HEIGHT as u32 + padding_cells * 2) * CELL_SIZE;
+
+    let video = VideoCaptureConfig {
+        mp4: Mp4Config { width, height, fps },
+        hold_frames,
+    };
+
+    // Deterministic, forward-only run (so replay = iterate 0..history_len).
+    let logic = TetrisLogic::new(123, vec![Piece::T, Piece::O, Piece::I]);
+
+    let actions = [
+        InputAction::MoveLeft,
+        InputAction::RotateCw,
+        InputAction::SoftDrop,
+        InputAction::SoftDrop,
+        InputAction::MoveRight,
+        InputAction::HardDrop,
+        InputAction::MoveLeft,
+        InputAction::RotateCcw,
+        InputAction::SoftDrop,
+        InputAction::HardDrop,
+        InputAction::MoveRight,
+        InputAction::Rotate180,
+        InputAction::SoftDrop,
+        InputAction::SoftDrop,
+        InputAction::HardDrop,
+    ];
+
+    let artifacts = record_state_and_video_then_replay_and_compare(
+        test_name,
+        default_record_dir(),
+        logic,
+        actions,
+        video,
+        |state: &TetrisCore, buf: &mut [u8], width: u32, height: u32| {
+            let board = state.board_with_active_piece();
+            let mut gfx = CpuRenderer::new(buf, SurfaceSize::new(width, height));
+            draw_board(&mut gfx, &board);
+        },
+    )
+    .expect("record/replay regression should succeed");
+
+    eprintln!("state recording: {}", artifacts.state_json.display());
+    eprintln!("live mp4:       {}", artifacts.live_mp4.display());
+    eprintln!("replay mp4:     {}", artifacts.replay_mp4.display());
 }
 
 #[test]

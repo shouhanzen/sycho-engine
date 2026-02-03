@@ -1,12 +1,23 @@
-pub mod agent;
+pub mod agent; // PATCH_TEST
 pub mod editor;
 pub mod render;
 pub mod surface;
 pub mod recording;
+pub mod regression;
 pub mod profiling;
 pub mod ui;
+pub mod graphics;
+pub mod pixels_renderer;
 
-#[derive(Debug)]
+use std::{
+    fs,
+    io::{self, BufReader, BufWriter, Write},
+    path::Path,
+};
+
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TimeMachine<State> {
     states: Vec<State>,
     frame: usize,
@@ -26,6 +37,10 @@ impl<State> TimeMachine<State> {
 
     pub fn len(&self) -> usize {
         self.states.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.states.is_empty()
     }
 
     pub fn state(&self) -> &State {
@@ -48,6 +63,16 @@ impl<State> TimeMachine<State> {
         self.frame + 1 < self.states.len()
     }
 
+    pub fn seek(&mut self, frame: usize) -> usize {
+        if self.states.is_empty() {
+            self.frame = 0;
+            return 0;
+        }
+        let max_frame = self.states.len().saturating_sub(1);
+        self.frame = frame.min(max_frame);
+        self.frame
+    }
+
     pub fn rewind(&mut self, frames: usize) -> usize {
         self.frame = self.frame.saturating_sub(frames);
         self.frame
@@ -66,6 +91,55 @@ impl<State> TimeMachine<State> {
         self.states.push(state);
         self.frame += 1;
         self.frame
+    }
+
+    pub fn save_json_file(&self, path: impl AsRef<Path>) -> io::Result<()>
+    where
+        State: Serialize,
+    {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        let file = fs::File::create(path)?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, self)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        writer.flush()?;
+        Ok(())
+    }
+
+    pub fn load_json_file(path: impl AsRef<Path>) -> io::Result<Self>
+    where
+        State: DeserializeOwned,
+    {
+        let path = path.as_ref();
+        let file = fs::File::open(path)?;
+        let reader = BufReader::new(file);
+        let tm: Self =
+            serde_json::from_reader(reader).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        if tm.states.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "timemachine recording has no states",
+            ));
+        }
+        if tm.frame >= tm.states.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "timemachine recording frame {} out of bounds (len {})",
+                    tm.frame,
+                    tm.states.len()
+                ),
+            ));
+        }
+
+        Ok(tm)
     }
 }
 
@@ -90,6 +164,10 @@ impl<G: GameLogic> HeadlessRunner<G> {
             game,
             timemachine: TimeMachine::new(initial_state),
         }
+    }
+
+    pub fn from_timemachine(game: G, timemachine: TimeMachine<G::State>) -> Self {
+        Self { game, timemachine }
     }
 
     pub fn frame(&self) -> usize {
@@ -156,6 +234,10 @@ impl<G: GameLogic> HeadlessRunner<G> {
 
     pub fn forward(&mut self, frames: usize) -> usize {
         self.timemachine.forward(frames)
+    }
+
+    pub fn seek(&mut self, frame: usize) -> usize {
+        self.timemachine.seek(frame)
     }
 }
 

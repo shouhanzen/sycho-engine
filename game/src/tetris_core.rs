@@ -1,12 +1,14 @@
 use std::ops::Add;
 
+use serde::{Deserialize, Serialize};
+
 pub const BOARD_WIDTH: usize = 10;
 pub const BOARD_HEIGHT: usize = 20;
 pub const NEXT_QUEUE_LEN: usize = 5;
 
 const HARD_DROP_POINTS_PER_ROW: u32 = 2;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Piece {
     I,
     O,
@@ -33,7 +35,7 @@ impl Piece {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Vec2i {
     pub x: i32,
     pub y: i32,
@@ -55,7 +57,7 @@ impl Add for Vec2i {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RotationDir {
     Cw,
     Ccw,
@@ -72,7 +74,7 @@ impl RotationDir {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TetrisSnapshot {
     pub board: Vec<Vec<u8>>,
     pub current_piece: Option<Piece>,
@@ -87,7 +89,7 @@ pub struct TetrisSnapshot {
     pub game_over: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TetrisCore {
     board: Vec<Vec<u8>>,
     current_piece: Option<Piece>,
@@ -243,6 +245,10 @@ impl TetrisCore {
 
     pub fn score(&self) -> u32 {
         self.score
+    }
+
+    pub fn is_game_over(&self) -> bool {
+        self.game_over
     }
 
     pub fn snapshot(&self) -> TetrisSnapshot {
@@ -533,7 +539,7 @@ fn line_clear_points(lines: u32) -> u32 {
     base.saturating_add(rem_points)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Rng {
     state: u64,
 }

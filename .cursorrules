@@ -14,5 +14,7 @@ Verify
 
 Control Surface
 - Use the `go.sh` script to control program execution.
-- Prefer flags like `--start` and `--stop` (and related flags) to manage lifecycle.
+- Prefer flags like `--start`, `--stop`, `--status` (and related flags) to manage lifecycle.
+- `--start` runs in the foreground by default; use `--detach` for background (pid/log-managed) runs.
+- Use `--stop` to stop background processes started via `--start --detach`.
 - This is the standard agent control surface; use it instead of ad-hoc commands.

@@ -18,12 +18,13 @@ usage() {
 go.sh - rollout_engine control surface
 
 Usage:
-  ./go.sh --start [--game|--editor] [--headful|--headless] [--foreground] [--release]
+  ./go.sh --start [--game|--editor] [--headful|--headless] [--record [PATH]] [--replay PATH] [--detach] [--release]
   ./go.sh --stop [--game|--editor]
-  ./go.sh --restart [--game|--editor] [--headful|--headless] [--foreground] [--release]
+  ./go.sh --restart [--game|--editor] [--headful|--headless] [--record [PATH]] [--replay PATH] [--detach] [--release]
   ./go.sh --status [--game|--editor]
   ./go.sh --test [--release]
-  ./go.sh --e2e [--record] [--ffmpeg /path/to/ffmpeg] [--release]
+  ./go.sh --e2e [--video] [--ffmpeg /path/to/ffmpeg] [--release]
+  ./go.sh --profile [--release]
   ./go.sh --help
 
 Targets:
@@ -33,6 +34,11 @@ Targets:
 Modes:
   --headful      Run the windowed game (default). Uses: cargo run -p game --bin headful
   --headless     Run headless playtests (non-interactive). Uses: cargo test -p game --test e2e_playtest_tests
+
+Recording / Replay (headful game only):
+  --record [PATH]   Save a frame-by-frame state recording (JSON) on exit.
+                   If PATH is omitted, the game chooses a default under `target/recordings/`.
+  --replay PATH      Replay a previously saved state recording (JSON).
 
 Build:
   --release      Use release profile for cargo commands (faster runtime, slower compile).
@@ -50,18 +56,25 @@ Ports (multi-worktree safe defaults):
     ROLLOUT_EDITOR_DEV_PORT     (default: 5173 + offset)
 
 Lifecycle:
-  --start        Starts the selected target/mode. Default is background (writes pid/log files).
+  --start        Starts the selected target/mode. Default is foreground (attached to the terminal).
+  --detach       Run in background (writes pid/log files).
                 If a background process exits immediately, go.sh will print recent logs to the terminal.
-  --foreground   Runs attached to the current terminal (no pid/log management).
-  --stop         Stops the background process started by --start.
+  --foreground   (default) Runs attached to the current terminal (no pid/log management).
+  --stop         Stops the background process started by --start --detach.
   --restart      Equivalent to --stop then --start.
-  --status       Prints whether a background process is running.
+  --status       Prints whether a background process is running (--start --detach).
 
 Testing:
   --test         cargo test (workspace)
   --e2e          cargo test -p game --test e2e_playtest_tests
-  --record       (e2e) record an mp4 per test via ffmpeg (requires `ffmpeg` on PATH)
+  --video        (e2e) record an mp4 per test via ffmpeg (requires `ffmpeg` on PATH)
   --ffmpeg PATH  (e2e) path to ffmpeg binary (sets ROLLOUT_FFMPEG_BIN)
+  --profile      run the headless profiler (cargo run -p game --bin profile)
+                Env knobs:
+                  ROLLOUT_PROFILE_FRAMES=10000
+                  ROLLOUT_PROFILE_WARMUP=200
+                  ROLLOUT_PROFILE_WIDTH=960
+                  ROLLOUT_PROFILE_HEIGHT=720
 EOF
 }
 
@@ -170,6 +183,39 @@ is_uint() {
   [[ "${1:-}" =~ ^[0-9]+$ ]]
 }
 
+kill_listeners_on_port() {
+  local port="$1"
+
+  if ! is_uint "$port" || ((port < 1 || port > 65535)); then
+    return 0
+  fi
+
+  # macOS / Linux
+  if command -v lsof >/dev/null 2>&1; then
+    local pids
+    pids="$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
+    if [[ -n "$pids" ]]; then
+      for pid in $pids; do
+        kill "$pid" 2>/dev/null || true
+      done
+    fi
+    return 0
+  fi
+
+  # Windows Git Bash fallback
+  if command -v netstat >/dev/null 2>&1 && command -v taskkill >/dev/null 2>&1; then
+    local pids
+    # netstat -ano columns: proto local foreign state pid
+    pids="$(netstat -ano 2>/dev/null | awk -v p=":${port}$" '$2 ~ p && $4 == "LISTENING" { print $5 }' | sort -u)"
+    if [[ -n "$pids" ]]; then
+      for pid in $pids; do
+        taskkill //PID "$pid" //F >/dev/null 2>&1 || true
+      done
+    fi
+    return 0
+  fi
+}
+
 worktree_port_offset() {
   # Stable per-worktree offset derived from the worktree root directory path.
   # Use a wide enough range to make collisions very unlikely across a handful of worktrees.
@@ -199,7 +245,9 @@ compute_editor_ports() {
   fi
 
   EDITOR_API_URL="http://127.0.0.1:${EDITOR_API_PORT}"
-  EDITOR_DEV_URL="http://localhost:${EDITOR_DEV_PORT}"
+  # Use 127.0.0.1 rather than localhost to avoid Windows IPv4/IPv6 resolution mismatches
+  # that can prevent the Tauri dev server proxy from reaching Vite.
+  EDITOR_DEV_URL="http://127.0.0.1:${EDITOR_DEV_PORT}"
 }
 
 generate_tauri_worktree_config() {
@@ -213,7 +261,7 @@ generate_tauri_worktree_config() {
 
   # Replace the dev server URL + CSP API endpoints so multiple worktrees can run side-by-side.
   sed \
-    -e "s|http://localhost:5173|http://localhost:${dev_port}|g" \
+    -e "s|http://127.0.0.1:5173|http://127.0.0.1:${dev_port}|g" \
     -e "s|http://127.0.0.1:4000|http://127.0.0.1:${api_port}|g" \
     -e "s|http://localhost:4000|http://localhost:${api_port}|g" \
     "$base_conf" >"$gen_conf"
@@ -223,9 +271,12 @@ generate_tauri_worktree_config() {
 
 TARGET="game"
 MODE="headful"
-FOREGROUND="false"
+FOREGROUND="true"
 ACTION=""
-RECORD="false"
+VIDEO="false"
+RECORD_FLAG="false"
+RECORD_PATH=""
+REPLAY_PATH=""
 FFMPEG_BIN=""
 RELEASE="false"
 EDITOR_API_PORT=""
@@ -235,7 +286,7 @@ EDITOR_DEV_URL=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --start|--stop|--restart|--status|--test|--e2e)
+    --start|--stop|--restart|--status|--test|--e2e|--profile)
       ACTION="$1"
       shift
       ;;
@@ -259,9 +310,31 @@ while [[ $# -gt 0 ]]; do
       FOREGROUND="true"
       shift
       ;;
-    --record)
-      RECORD="true"
+    --detach)
+      FOREGROUND="false"
       shift
+      ;;
+    --video)
+      VIDEO="true"
+      shift
+      ;;
+    --record)
+      RECORD_FLAG="true"
+      # Optional path argument (only meaningful for headful state recordings).
+      if [[ $# -ge 2 ]] && ! [[ "$2" == --* ]]; then
+        RECORD_PATH="$2"
+        shift 2
+      else
+        shift
+      fi
+      ;;
+    --replay)
+      if [[ $# -lt 2 ]]; then
+        echo "--replay requires a path" >&2
+        exit 2
+      fi
+      REPLAY_PATH="$2"
+      shift 2
       ;;
     --ffmpeg)
       if [[ $# -lt 2 ]]; then
@@ -295,8 +368,65 @@ fi
 
 cd "$ROOT_DIR"
 
-# Auto-detect ffmpeg for `--record` runs (useful on Windows Git Bash where PATH may not include Scoop shims).
-if [[ "$RECORD" == "true" ]] && [[ -z "$FFMPEG_BIN" ]]; then
+# Interpret `--record`:
+# - headful mode: state recording (passed through to the headful binary)
+# - headless / e2e mode: legacy alias for `--video` (mp4 capture)
+STATE_RECORD="false"
+STATE_RECORD_PATH=""
+if [[ "$RECORD_FLAG" == "true" ]]; then
+  if [[ "$ACTION" == "--e2e" || "$MODE" == "headless" ]]; then
+    if [[ -n "$RECORD_PATH" ]]; then
+      echo "--record PATH is only supported for headful state recordings; use --video for e2e mp4 capture" >&2
+      exit 2
+    fi
+    if [[ "$VIDEO" == "true" ]]; then
+      echo "cannot combine --record and --video" >&2
+      exit 2
+    fi
+    VIDEO="true"
+    echo "warning: --record in headless/e2e mode is deprecated; use --video" >&2
+  else
+    STATE_RECORD="true"
+    STATE_RECORD_PATH="$RECORD_PATH"
+  fi
+fi
+
+if [[ -n "$REPLAY_PATH" ]]; then
+  if [[ "$TARGET" != "game" ]]; then
+    echo "--replay is a game-only flag; remove --editor" >&2
+    exit 2
+  fi
+  if [[ "$MODE" != "headful" ]]; then
+    echo "--replay is headful-only; remove --headless" >&2
+    exit 2
+  fi
+  if [[ "$STATE_RECORD" == "true" ]]; then
+    echo "cannot combine --record and --replay" >&2
+    exit 2
+  fi
+  if [[ "$ACTION" != "--start" && "$ACTION" != "--restart" ]]; then
+    echo "--replay requires --start (or --restart)" >&2
+    exit 2
+  fi
+fi
+
+if [[ "$STATE_RECORD" == "true" ]]; then
+  if [[ "$TARGET" != "game" ]]; then
+    echo "--record is a game-only flag; remove --editor" >&2
+    exit 2
+  fi
+  if [[ "$MODE" != "headful" ]]; then
+    echo "--record (state recording) is headful-only; remove --headless" >&2
+    exit 2
+  fi
+  if [[ "$ACTION" != "--start" && "$ACTION" != "--restart" ]]; then
+    echo "--record requires --start (or --restart)" >&2
+    exit 2
+  fi
+fi
+
+# Auto-detect ffmpeg for `--video` runs (useful on Windows Git Bash where PATH may not include Scoop shims).
+if [[ "$VIDEO" == "true" ]] && [[ -z "$FFMPEG_BIN" ]]; then
   if command -v ffmpeg >/dev/null 2>&1; then
     FFMPEG_BIN=""
   else
@@ -350,6 +480,12 @@ case "$ACTION" in
       stop_pidfile "$EDITOR_APP_PID_FILE"
       stop_pidfile "$EDITOR_API_PID_FILE"
 
+      # Best-effort cleanup for stray processes (e.g. Vite dev server) if the editor crashed
+      # or the PID file went stale.
+      compute_editor_ports
+      kill_listeners_on_port "$EDITOR_DEV_PORT"
+      kill_listeners_on_port "$EDITOR_API_PORT"
+
       # Backward compatibility: stop old pidfiles if they exist.
       stop_pidfile "$ROOT_DIR/.go.editor-frontend.pid" || true
       stop_pidfile "$ROOT_DIR/.go.editor-backend.pid" || true
@@ -362,6 +498,10 @@ case "$ACTION" in
     if [[ "$TARGET" == "editor" ]]; then
       stop_pidfile "$EDITOR_APP_PID_FILE"
       stop_pidfile "$EDITOR_API_PID_FILE"
+
+      compute_editor_ports
+      kill_listeners_on_port "$EDITOR_DEV_PORT"
+      kill_listeners_on_port "$EDITOR_API_PORT"
 
       # Backward compatibility: stop old pidfiles if they exist.
       stop_pidfile "$ROOT_DIR/.go.editor-frontend.pid" || true
@@ -382,7 +522,29 @@ case "$ACTION" in
       compute_editor_ports
       tauri_conf="$(generate_tauri_worktree_config "$EDITOR_API_PORT" "$EDITOR_DEV_PORT")"
 
+      api_running="false"
+      app_running="false"
+      if is_running_pidfile "$EDITOR_API_PID_FILE"; then
+        api_running="true"
+      fi
+      if is_running_pidfile "$EDITOR_APP_PID_FILE"; then
+        app_running="true"
+      fi
+
       if [[ "$FOREGROUND" == "true" ]]; then
+        if [[ "$api_running" == "true" ]] || [[ "$app_running" == "true" ]]; then
+          if [[ "$api_running" == "true" ]]; then
+            echo "already running editor api (pid $(cat "$EDITOR_API_PID_FILE"))"
+            echo "api logs: $EDITOR_API_LOG_FILE"
+          fi
+          if [[ "$app_running" == "true" ]]; then
+            echo "already running editor app (pid $(cat "$EDITOR_APP_PID_FILE"))"
+            echo "app logs: $EDITOR_APP_LOG_FILE"
+          fi
+          echo "stop with: ./go.sh --stop --editor"
+          exit 0
+        fi
+
         echo "starting editor api ($EDITOR_API_URL) + tauri app ($EDITOR_DEV_URL) in foreground"
         env ROLLOUT_EDITOR_API_ADDR="127.0.0.1:$EDITOR_API_PORT" cargo run -p game --bin editor_api "${CARGO_PROFILE_ARGS[@]}" &
         api_pid=$!
@@ -399,15 +561,6 @@ case "$ACTION" in
         trap 'kill "$api_pid" "$app_pid" 2>/dev/null || true' INT TERM EXIT
         wait
         exit 0
-      fi
-
-      api_running="false"
-      app_running="false"
-      if is_running_pidfile "$EDITOR_API_PID_FILE"; then
-        api_running="true"
-      fi
-      if is_running_pidfile "$EDITOR_APP_PID_FILE"; then
-        app_running="true"
       fi
 
       if [[ "$api_running" == "true" ]] && [[ "$app_running" == "true" ]]; then
@@ -451,14 +604,14 @@ case "$ACTION" in
       exit 0
     fi
 
-    if [[ "$FOREGROUND" == "false" ]] && is_running_pidfile "$GAME_PID_FILE"; then
+    if is_running_pidfile "$GAME_PID_FILE"; then
       echo "already running (pid $(cat "$GAME_PID_FILE"))"
       exit 0
     fi
 
     if [[ "$MODE" == "headless" ]]; then
       if [[ "$FOREGROUND" == "true" ]]; then
-        if [[ "$RECORD" == "true" ]]; then
+        if [[ "$VIDEO" == "true" ]]; then
           if [[ -n "$FFMPEG_BIN" ]]; then
             exec env ROLLOUT_E2E_RECORD_MP4=1 ROLLOUT_FFMPEG_BIN="$FFMPEG_BIN" cargo test -p game --test e2e_playtest_tests "${CARGO_PROFILE_ARGS[@]}" -- --nocapture
           fi
@@ -468,7 +621,7 @@ case "$ACTION" in
       fi
 
       # Background headless run (still useful for CI-ish usage).
-      if [[ "$RECORD" == "true" ]]; then
+      if [[ "$VIDEO" == "true" ]]; then
         if [[ -n "$FFMPEG_BIN" ]]; then
           nohup env ROLLOUT_E2E_RECORD_MP4=1 ROLLOUT_FFMPEG_BIN="$FFMPEG_BIN" cargo test -p game --test e2e_playtest_tests "${CARGO_PROFILE_ARGS[@]}" -- --nocapture >"$GAME_LOG_FILE" 2>&1 &
         else
@@ -485,11 +638,28 @@ case "$ACTION" in
     fi
 
     # Headful (default)
+    HEADFUL_ARGS=()
+    if [[ -n "$REPLAY_PATH" ]]; then
+      HEADFUL_ARGS+=(--replay "$REPLAY_PATH")
+    elif [[ "$STATE_RECORD" == "true" ]]; then
+      HEADFUL_ARGS+=(--record)
+      if [[ -n "$STATE_RECORD_PATH" ]]; then
+        HEADFUL_ARGS+=("$STATE_RECORD_PATH")
+      fi
+    fi
+
     if [[ "$FOREGROUND" == "true" ]]; then
+      if [[ ${#HEADFUL_ARGS[@]} -gt 0 ]]; then
+        exec cargo run -p game --bin headful "${CARGO_PROFILE_ARGS[@]}" -- "${HEADFUL_ARGS[@]}"
+      fi
       exec cargo run -p game --bin headful "${CARGO_PROFILE_ARGS[@]}"
     fi
 
-    nohup cargo run -p game --bin headful "${CARGO_PROFILE_ARGS[@]}" >"$GAME_LOG_FILE" 2>&1 &
+    if [[ ${#HEADFUL_ARGS[@]} -gt 0 ]]; then
+      nohup cargo run -p game --bin headful "${CARGO_PROFILE_ARGS[@]}" -- "${HEADFUL_ARGS[@]}" >"$GAME_LOG_FILE" 2>&1 &
+    else
+      nohup cargo run -p game --bin headful "${CARGO_PROFILE_ARGS[@]}" >"$GAME_LOG_FILE" 2>&1 &
+    fi
     echo $! >"$GAME_PID_FILE"
     ensure_pid_alive_or_dump_logs "$GAME_PID_FILE" "$GAME_LOG_FILE" "headful game"
     echo "started headful game (pid $(cat "$GAME_PID_FILE"))"
@@ -501,12 +671,20 @@ case "$ACTION" in
     ;;
 
   --e2e)
-    if [[ "$RECORD" == "true" ]]; then
+    if [[ "$VIDEO" == "true" ]]; then
       if [[ -n "$FFMPEG_BIN" ]]; then
         exec env ROLLOUT_E2E_RECORD_MP4=1 ROLLOUT_FFMPEG_BIN="$FFMPEG_BIN" cargo test -p game --test e2e_playtest_tests "${CARGO_PROFILE_ARGS[@]}" -- --nocapture
       fi
       exec env ROLLOUT_E2E_RECORD_MP4=1 cargo test -p game --test e2e_playtest_tests "${CARGO_PROFILE_ARGS[@]}" -- --nocapture
     fi
     exec cargo test -p game --test e2e_playtest_tests "${CARGO_PROFILE_ARGS[@]}" -- --nocapture
+    ;;
+
+  --profile)
+    if [[ "$TARGET" != "game" ]]; then
+      echo "--profile is a game-only action; remove --editor" >&2
+      exit 2
+    fi
+    exec cargo run -p game --bin profile "${CARGO_PROFILE_ARGS[@]}"
     ;;
 esac

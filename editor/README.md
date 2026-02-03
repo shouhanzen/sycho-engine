@@ -9,8 +9,8 @@ The editor is a **game-agnostic** UI that connects to the **engine-provided edit
 
 ## Run (local)
 - Via `go.sh` (recommended):
-  - Foreground (best for dev): `./go.sh --start --editor --foreground`
-  - Background: `./go.sh --start --editor` (stop with `./go.sh --stop --editor`)
+  - Foreground (best for dev): `./go.sh --start --editor`
+  - Background: `./go.sh --start --editor --detach` (stop with `./go.sh --stop --editor`)
 
 - Engine editor API (example impl for this repo's game): `cargo run -p game --bin editor_api`
 - Editor app: `cd editor/frontend && npm install && npm run tauri dev`

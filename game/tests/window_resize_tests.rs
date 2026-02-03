@@ -1,3 +1,4 @@
+use engine::graphics::CpuRenderer;
 use engine::render::draw_board;
 use engine::surface::{RgbaBufferSurface, Surface, SurfaceSize};
 use engine::HeadlessRunner;
@@ -16,7 +17,10 @@ fn headless_surface_resize_changes_buffer_size_and_allows_rendering() {
     // Render once at the initial size.
     let board = runner.state().board_with_active_piece();
     let size = surface.size();
-    draw_board(surface.frame_mut(), size.width, size.height, &board);
+    {
+        let mut gfx = CpuRenderer::new(surface.frame_mut(), size);
+        draw_board(&mut gfx, &board);
+    }
     surface.present().unwrap();
 
     // Simulate a window resize (headless).
@@ -26,7 +30,10 @@ fn headless_surface_resize_changes_buffer_size_and_allows_rendering() {
     // Render again at the new size.
     let board = runner.state().board_with_active_piece();
     let size = surface.size();
-    draw_board(surface.frame_mut(), size.width, size.height, &board);
+    {
+        let mut gfx = CpuRenderer::new(surface.frame_mut(), size);
+        draw_board(&mut gfx, &board);
+    }
     surface.present().unwrap();
 }
 

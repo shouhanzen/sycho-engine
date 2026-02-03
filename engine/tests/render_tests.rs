@@ -1,4 +1,6 @@
+use engine::graphics::CpuRenderer;
 use engine::render::{color_for_cell, draw_board, CELL_SIZE};
+use engine::surface::SurfaceSize;
 
 #[test]
 fn color_mapping_is_stable() {
@@ -20,7 +22,8 @@ fn draw_board_renders_bottom_row_at_buffer_bottom() {
     // row 0 is the *bottom* row in this representation
     board[0][0] = 1;
 
-    draw_board(&mut frame, width, height, &board);
+    let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
+    draw_board(&mut gfx, &board);
 
     let bottom_left_index = ((height - 1) * width * 4) as usize;
     let pixel = &frame[bottom_left_index..bottom_left_index + 4];
@@ -38,7 +41,8 @@ fn draw_board_centers_board_in_larger_buffer() {
     let mut board = vec![vec![0u8; board_width]; board_height];
     board[0][0] = 1;
 
-    draw_board(&mut frame, width, height, &board);
+    let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
+    draw_board(&mut gfx, &board);
 
     let board_pixel_width = board_width as u32 * CELL_SIZE;
     let board_pixel_height = board_height as u32 * CELL_SIZE;
@@ -70,7 +74,8 @@ fn draw_board_draws_faint_outline_and_grid_dots() {
     let mut board = vec![vec![0u8; board_width]; board_height];
     board[0][0] = 1;
 
-    draw_board(&mut frame, width, height, &board);
+    let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
+    draw_board(&mut gfx, &board);
 
     let board_pixel_width = board_width as u32 * CELL_SIZE;
     let board_pixel_height = board_height as u32 * CELL_SIZE;

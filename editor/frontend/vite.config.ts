@@ -20,6 +20,9 @@ function readApiBase(env: Record<string, string | undefined>): string {
 export default defineConfig({
   plugins: [react()],
   server: {
+    // Force IPv4 loopback. On Windows, "localhost" can resolve in a way that causes
+    // Tauri's dev-server proxy to miss the Vite server and fall back to dist assets.
+    host: "127.0.0.1",
     port: readPort(process.env),
     strictPort: true,
     proxy: {

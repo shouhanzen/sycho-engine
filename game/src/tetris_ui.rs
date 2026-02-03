@@ -1,12 +1,15 @@
 use engine::render::{color_for_cell, draw_board, CELL_SIZE};
 use engine::ui as ui;
 
-use crate::debug::draw_text;
+use crate::debug::{draw_text, draw_text_scaled};
 use crate::tetris_core::{piece_board_offset, piece_grid, piece_type, Piece, TetrisCore, Vec2i};
 
 const COLOR_PANEL_BG: [u8; 4] = [16, 16, 22, 255];
 const COLOR_PANEL_BORDER: [u8; 4] = [40, 40, 55, 255];
 const COLOR_PANEL_BORDER_DISABLED: [u8; 4] = [28, 28, 38, 255];
+const BUTTON_HOVER_BRIGHTEN: f32 = 0.12;
+
+pub const MAIN_MENU_TITLE: &str = "UNTITLED";
 
 const PAUSE_BUTTON_SIZE: u32 = 44;
 const PAUSE_BUTTON_MARGIN: u32 = 12;
@@ -28,19 +31,7 @@ const PREVIEW_GAP_Y: u32 = 10;
 
 const GHOST_ALPHA: u8 = 80;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Rect {
-    pub x: u32,
-    pub y: u32,
-    pub w: u32,
-    pub h: u32,
-}
-
-impl Rect {
-    pub fn contains(&self, px: u32, py: u32) -> bool {
-        px >= self.x && px < self.x.saturating_add(self.w) && py >= self.y && py < self.y.saturating_add(self.h)
-    }
-}
+pub type Rect = ui::Rect;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UiLayout {
@@ -54,6 +45,7 @@ pub struct UiLayout {
 pub struct PauseMenuLayout {
     pub panel: Rect,
     pub resume_button: Rect,
+    pub end_run_button: Rect,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -61,6 +53,20 @@ pub struct MainMenuLayout {
     pub panel: Rect,
     pub start_button: Rect,
     pub quit_button: Rect,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GameOverMenuLayout {
+    pub panel: Rect,
+    pub restart_button: Rect,
+    pub skilltree_button: Rect,
+    pub quit_button: Rect,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SkillTreeLayout {
+    pub panel: Rect,
+    pub start_new_game_button: Rect,
 }
 
 pub fn compute_layout(width: u32, height: u32, board_w: u32, board_h: u32, next_len: usize) -> UiLayout {
@@ -134,52 +140,42 @@ pub fn compute_layout(width: u32, height: u32, board_w: u32, board_h: u32, next_
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct HardDropPulseFx {
-    /// Normalized progress in `[0, 1]` where `0` is the initial flare and `1` is fully finished.
-    pub progress: f32,
-    /// Normalized intensity in `[0, 1]`. Higher means a stronger flare.
-    pub intensity: f32,
-}
-
-pub fn hard_drop_pulse_intensity(lines_cleared: u32) -> f32 {
-    match lines_cleared.min(4) {
-        0 => 0.10,
-        1 => 0.14,
-        2 => 0.18,
-        3 => 0.22,
-        _ => 0.28,
-    }
-}
-
-pub fn draw_tetris(
-    frame: &mut [u8],
+pub fn draw_tetris_world(
+    frame: &mut dyn Renderer2d,
     width: u32,
     height: u32,
     state: &TetrisCore,
-) -> UiLayout {
-    draw_tetris_with_fx(frame, width, height, state, None)
-}
-
-pub fn draw_tetris_with_fx(
-    frame: &mut [u8],
-    width: u32,
-    height: u32,
-    state: &TetrisCore,
-    hard_drop_pulse: Option<HardDropPulseFx>,
 ) -> UiLayout {
     let board = state.board();
     let board_h = board.len() as u32;
     let board_w = board.first().map(|r| r.len()).unwrap_or(0) as u32;
     let layout = compute_layout(width, height, board_w, board_h, state.next_queue().len());
 
-    draw_board(frame, width, height, board);
-    if let Some(fx) = hard_drop_pulse {
-        apply_hard_drop_pulse(frame, width, height, layout.board, fx);
-    }
+    draw_board(frame, board);
 
     draw_ghost_and_active_piece(frame, width, height, layout.board, board_w, board_h, state);
 
+    layout
+}
+
+pub fn draw_tetris_hud(
+    frame: &mut dyn Renderer2d,
+    width: u32,
+    height: u32,
+    state: &TetrisCore,
+    layout: UiLayout,
+) {
+    draw_tetris_hud_with_cursor(frame, width, height, state, layout, None);
+}
+
+pub fn draw_tetris_hud_with_cursor(
+    frame: &mut dyn Renderer2d,
+    width: u32,
+    height: u32,
+    state: &TetrisCore,
+    layout: UiLayout,
+    cursor: Option<(u32, u32)>,
+) {
     draw_hold_panel(
         frame,
         width,
@@ -190,7 +186,10 @@ pub fn draw_tetris_with_fx(
     );
     draw_next_panel(frame, width, height, layout.next_panel, state.next_queue());
 
-    draw_pause_button(frame, width, height, layout.pause_button);
+    let pause_hovered = cursor
+        .map(|(x, y)| layout.pause_button.contains(x, y))
+        .unwrap_or(false);
+    draw_pause_button(frame, width, height, layout.pause_button, pause_hovered);
 
     // Simple HUD: score + lines, placed near the top-right (left of the pause button).
     let hud_x = layout.pause_button.x.saturating_sub(180);
@@ -207,11 +206,26 @@ pub fn draw_tetris_with_fx(
         &lines_text,
         COLOR_PAUSE_ICON,
     );
+}
 
+pub fn draw_tetris(
+    frame: &mut dyn Renderer2d,
+    width: u32,
+    height: u32,
+    state: &TetrisCore,
+) -> UiLayout {
+    let layout = draw_tetris_world(frame, width, height, state);
+    draw_tetris_hud(frame, width, height, state, layout);
     layout
 }
 
-fn apply_hard_drop_pulse(frame: &mut [u8], width: u32, height: u32, rect: Rect, fx: HardDropPulseFx) {
+fn draw_pause_button(
+    frame: &mut dyn Renderer2d,
+    width: u32,
+    height: u32,
+    rect: Rect,
+    hovered: bool,
+) {
     if rect.w == 0 || rect.h == 0 {
         return;
     }
@@ -219,102 +233,8 @@ fn apply_hard_drop_pulse(frame: &mut [u8], width: u32, height: u32, rect: Rect, 
         return;
     }
 
-    let progress = clamp01(fx.progress);
-    let intensity = fx.intensity.max(0.0);
-    if intensity <= 0.0 {
-        return;
-    }
-
-    // A subtle cool flare reads like "board backlight" on the dark background.
-    let color = [120u8, 210u8, 255u8, 255u8];
-
-    // Fade out over time; start visible immediately on hard drop.
-    let envelope = 1.0 - progress;
-    if envelope <= 0.0 {
-        return;
-    }
-
-    // The flare "rises": the gradient front moves upward faster than the fade.
-    // We clamp to a small epsilon so the initial frame still draws a thin glow.
-    let front = clamp01(progress * 1.4).max(0.02);
-
-    let max_x = rect.x.saturating_add(rect.w).min(width);
-    let max_y = rect.y.saturating_add(rect.h).min(height);
-    if rect.x >= max_x || rect.y >= max_y {
-        return;
-    }
-
-    let h = (max_y - rect.y).max(1);
-    let denom = (h - 1).max(1) as f32;
-    let bottom_y = rect.y.saturating_add(h - 1);
-
-    for py in rect.y..max_y {
-        let y_from_bottom = bottom_y.saturating_sub(py) as f32;
-        let y_norm = y_from_bottom / denom; // 0 at bottom, 1 at top
-
-        if y_norm > front {
-            continue;
-        }
-
-        // A rising fill gradient: strongest at the bottom, tapering to 0 at the rising front.
-        let gradient = 1.0 - (y_norm / front);
-        let row_alpha_f = intensity * envelope * gradient;
-        if row_alpha_f <= 0.0 {
-            continue;
-        }
-
-        let row_alpha = (row_alpha_f * 255.0).min(255.0).max(0.0) as u8;
-        if row_alpha == 0 {
-            continue;
-        }
-
-        for px in rect.x..max_x {
-            let idx = ((py * width + px) * 4) as usize;
-            if idx + 4 > frame.len() {
-                continue;
-            }
-
-            let r0 = frame[idx] as u32;
-            let g0 = frame[idx + 1] as u32;
-            let b0 = frame[idx + 2] as u32;
-
-            // Bias the effect toward darker pixels so it reads like a "back of board" glow.
-            let lum = (r0 * 30 + g0 * 59 + b0 * 11 + 50) / 100; // ~[0,255]
-            let darkness = (255u32 - lum).min(255) as f32 / 255.0; // 0 bright, 1 dark
-            let a = ((row_alpha as f32) * (0.25 + 0.75 * darkness)).min(255.0) as u8;
-            if a == 0 {
-                continue;
-            }
-
-            let a32 = a as u32;
-            let inv = 255u32 - a32;
-            frame[idx] = ((r0 * inv + (color[0] as u32) * a32 + 127) / 255) as u8;
-            frame[idx + 1] = ((g0 * inv + (color[1] as u32) * a32 + 127) / 255) as u8;
-            frame[idx + 2] = ((b0 * inv + (color[2] as u32) * a32 + 127) / 255) as u8;
-            frame[idx + 3] = 255;
-        }
-    }
-}
-
-fn clamp01(x: f32) -> f32 {
-    if x <= 0.0 {
-        0.0
-    } else if x >= 1.0 {
-        1.0
-    } else {
-        x
-    }
-}
-
-fn draw_pause_button(frame: &mut [u8], width: u32, height: u32, rect: Rect) {
-    if rect.w == 0 || rect.h == 0 {
-        return;
-    }
-    if rect.x >= width || rect.y >= height {
-        return;
-    }
-
-    fill_rect(frame, width, height, rect.x, rect.y, rect.w, rect.h, COLOR_PANEL_BG);
+    let (fill, border) = button_colors(hovered);
+    fill_rect(frame, width, height, rect.x, rect.y, rect.w, rect.h, fill);
     draw_rect_outline(
         frame,
         width,
@@ -323,7 +243,7 @@ fn draw_pause_button(frame: &mut [u8], width: u32, height: u32, rect: Rect) {
         rect.y,
         rect.w,
         rect.h,
-        COLOR_PANEL_BORDER,
+        border,
     );
 
     // Draw a simple pause icon: two vertical bars.
@@ -348,7 +268,16 @@ fn draw_pause_button(frame: &mut [u8], width: u32, height: u32, rect: Rect) {
     );
 }
 
-pub fn draw_pause_menu(frame: &mut [u8], width: u32, height: u32) -> PauseMenuLayout {
+pub fn draw_pause_menu(frame: &mut dyn Renderer2d, width: u32, height: u32) -> PauseMenuLayout {
+    draw_pause_menu_with_cursor(frame, width, height, None)
+}
+
+pub fn draw_pause_menu_with_cursor(
+    frame: &mut dyn Renderer2d,
+    width: u32,
+    height: u32,
+    cursor: Option<(u32, u32)>,
+) -> PauseMenuLayout {
     // Dim the entire game view.
     blend_rect(
         frame,
@@ -373,7 +302,7 @@ pub fn draw_pause_menu(frame: &mut [u8], width: u32, height: u32) -> PauseMenuLa
         return PauseMenuLayout::default();
     }
 
-    let panel_size = ui::Size::new(360, 200).clamp_max(safe.size());
+    let panel_size = ui::Size::new(360, 260).clamp_max(safe.size());
     if panel_size.w == 0 || panel_size.h == 0 {
         return PauseMenuLayout::default();
     }
@@ -427,6 +356,7 @@ pub fn draw_pause_menu(frame: &mut [u8], width: u32, height: u32) -> PauseMenuLa
     );
 
     let content = panel_ui.inset(ui::Insets::all(pad));
+    let gap = 12u32;
     let button_size = ui::Size::new(240, 44).clamp_max(content.size());
     let resume_ui = content.place(button_size, ui::Anchor::BottomCenter);
     let resume_button = Rect {
@@ -435,44 +365,148 @@ pub fn draw_pause_menu(frame: &mut [u8], width: u32, height: u32) -> PauseMenuLa
         w: resume_ui.w,
         h: resume_ui.h,
     };
+    let end_run_button = Rect {
+        x: resume_button.x,
+        y: resume_button.y.saturating_sub(resume_button.h.saturating_add(gap)),
+        w: resume_button.w,
+        h: resume_button.h,
+    };
 
-    fill_rect(
+    draw_button(
         frame,
         width,
         height,
-        resume_button.x,
-        resume_button.y,
-        resume_button.w,
-        resume_button.h,
-        COLOR_PANEL_BG,
-    );
-    draw_rect_outline(
-        frame,
-        width,
-        height,
-        resume_button.x,
-        resume_button.y,
-        resume_button.w,
-        resume_button.h,
-        COLOR_PANEL_BORDER,
-    );
-    draw_text(
-        frame,
-        width,
-        height,
-        resume_button.x.saturating_add(16),
-        resume_button
-            .y
-            .saturating_add(resume_button.h / 2)
-            .saturating_sub(6),
+        resume_button,
         "RESUME",
-        COLOR_PAUSE_MENU_TEXT,
+        cursor
+            .map(|(x, y)| resume_button.contains(x, y))
+            .unwrap_or(false),
+    );
+    draw_button(
+        frame,
+        width,
+        height,
+        end_run_button,
+        "END RUN",
+        cursor
+            .map(|(x, y)| end_run_button.contains(x, y))
+            .unwrap_or(false),
     );
 
-    PauseMenuLayout { panel, resume_button }
+    PauseMenuLayout {
+        panel,
+        resume_button,
+        end_run_button,
+    }
 }
 
-pub fn draw_main_menu(frame: &mut [u8], width: u32, height: u32) -> MainMenuLayout {
+pub fn draw_main_menu(frame: &mut dyn Renderer2d, width: u32, height: u32) -> MainMenuLayout {
+    draw_main_menu_with_cursor(frame, width, height, None)
+}
+
+pub fn draw_main_menu_with_cursor(
+    frame: &mut dyn Renderer2d,
+    width: u32,
+    height: u32,
+    cursor: Option<(u32, u32)>,
+) -> MainMenuLayout {
+    // Main menu is its own scene: clear the frame so the Tetris board is not visible underneath.
+    fill_rect(frame, width, height, 0, 0, width, height, color_for_cell(0));
+
+    let margin = 32u32;
+    let pad = 18u32;
+
+    // "Scene bounds" used for layout/hit-testing (not a modal panel).
+    let screen = ui::Rect::from_size(width, height);
+    let safe = screen.inset(ui::Insets::all(margin));
+    if safe.w == 0 || safe.h == 0 {
+        return MainMenuLayout::default();
+    }
+
+    let panel = Rect {
+        x: safe.x,
+        y: safe.y,
+        w: safe.w,
+        h: safe.h,
+    };
+
+    // Layout: a vertical stack (title, start, quit), centered in the safe region.
+    let title = MAIN_MENU_TITLE;
+    let title_chars = title.chars().count() as u32;
+    let glyph_cols = 4u32; // 3 glyph columns + 1 column spacing (matches `draw_text` advances).
+    let denom = title_chars.saturating_mul(glyph_cols).max(1);
+    let max_scale = 12u32;
+    let title_scale = (safe.w / denom).clamp(2, max_scale);
+    let title_w = denom.saturating_mul(title_scale).min(safe.w);
+    let title_h = (5u32).saturating_mul(title_scale).min(safe.h);
+
+    let content = safe.inset(ui::Insets::all(pad));
+    let button_size = ui::Size::new(240, 44).clamp_max(content.size());
+    let button_gap = 12u32;
+    let title_button_gap = 28u32;
+    let stack_h = title_h
+        .saturating_add(title_button_gap)
+        .saturating_add(button_size.h.saturating_mul(2))
+        .saturating_add(button_gap);
+    let top_y = content
+        .y
+        .saturating_add(content.h.saturating_sub(stack_h) / 2);
+
+    let title_x = content.x.saturating_add(content.w.saturating_sub(title_w) / 2);
+    let title_y = top_y;
+    draw_text_scaled(
+        frame,
+        width,
+        height,
+        title_x,
+        title_y,
+        title,
+        COLOR_PAUSE_MENU_TEXT,
+        title_scale,
+    );
+
+    let buttons_y = title_y
+        .saturating_add(title_h)
+        .saturating_add(title_button_gap);
+    let start_button = Rect {
+        x: content.x.saturating_add(content.w.saturating_sub(button_size.w) / 2),
+        y: buttons_y,
+        w: button_size.w,
+        h: button_size.h,
+    };
+    let quit_button = Rect {
+        x: start_button.x,
+        y: start_button.y.saturating_add(start_button.h).saturating_add(button_gap),
+        w: start_button.w,
+        h: start_button.h,
+    };
+
+    for (rect, label) in [(start_button, "START"), (quit_button, "QUIT")] {
+        let hovered = cursor.map(|(x, y)| rect.contains(x, y)).unwrap_or(false);
+        draw_button(frame, width, height, rect, label, hovered);
+    }
+
+    MainMenuLayout {
+        panel,
+        start_button,
+        quit_button,
+    }
+}
+
+pub fn draw_game_over_menu(
+    frame: &mut dyn Renderer2d,
+    width: u32,
+    height: u32,
+) -> GameOverMenuLayout {
+    draw_game_over_menu_with_cursor(frame, width, height, None)
+}
+
+pub fn draw_game_over_menu_with_cursor(
+    frame: &mut dyn Renderer2d,
+    width: u32,
+    height: u32,
+    cursor: Option<(u32, u32)>,
+) -> GameOverMenuLayout {
     // Dim the entire game view.
     blend_rect(
         frame,
@@ -490,9 +524,9 @@ pub fn draw_main_menu(frame: &mut [u8], width: u32, height: u32) -> MainMenuLayo
     let pad = 18u32;
 
     let panel_w = 420u32.min(width.saturating_sub(margin.saturating_mul(2)));
-    let panel_h = 260u32.min(height.saturating_sub(margin.saturating_mul(2)));
+    let panel_h = 280u32.min(height.saturating_sub(margin.saturating_mul(2)));
     if panel_w == 0 || panel_h == 0 {
-        return MainMenuLayout::default();
+        return GameOverMenuLayout::default();
     }
 
     let panel = Rect {
@@ -529,7 +563,7 @@ pub fn draw_main_menu(frame: &mut [u8], width: u32, height: u32) -> MainMenuLayo
         height,
         panel.x.saturating_add(pad),
         panel.y.saturating_add(pad),
-        "TETREE",
+        "GAME OVER",
         COLOR_PAUSE_MENU_TEXT,
     );
     draw_text(
@@ -538,7 +572,7 @@ pub fn draw_main_menu(frame: &mut [u8], width: u32, height: u32) -> MainMenuLayo
         height,
         panel.x.saturating_add(pad),
         panel.y.saturating_add(pad + 24),
-        "ENTER TO START",
+        "RUN ENDED",
         COLOR_PAUSE_MENU_TEXT,
     );
     draw_text(
@@ -547,67 +581,198 @@ pub fn draw_main_menu(frame: &mut [u8], width: u32, height: u32) -> MainMenuLayo
         height,
         panel.x.saturating_add(pad),
         panel.y.saturating_add(pad + 48),
-        "ESC TO QUIT",
+        "ENTER TO RESTART",
+        COLOR_PAUSE_MENU_TEXT,
+    );
+    draw_text(
+        frame,
+        width,
+        height,
+        panel.x.saturating_add(pad),
+        panel.y.saturating_add(pad + 72),
+        "K: SKILL TREE",
+        COLOR_PAUSE_MENU_TEXT,
+    );
+    draw_text(
+        frame,
+        width,
+        height,
+        panel.x.saturating_add(pad),
+        panel.y.saturating_add(pad + 96),
+        "ESC: MAIN MENU",
         COLOR_PAUSE_MENU_TEXT,
     );
 
     let button_h = 44u32.min(panel.h.saturating_sub(pad.saturating_mul(2)));
     let button_w = 240u32.min(panel.w.saturating_sub(pad.saturating_mul(2)));
     let gap = 12u32;
-    let buttons_total_h = button_h.saturating_mul(2).saturating_add(gap);
+    let buttons_total_h = button_h
+        .saturating_mul(3)
+        .saturating_add(gap.saturating_mul(2));
     let top_y = panel
         .y
         .saturating_add(panel.h.saturating_sub(pad.saturating_add(buttons_total_h)));
 
-    let start_button = Rect {
+    let restart_button = Rect {
         x: panel.x.saturating_add(panel.w.saturating_sub(button_w) / 2),
         y: top_y,
         w: button_w,
         h: button_h,
     };
+    let skilltree_button = Rect {
+        x: restart_button.x,
+        y: restart_button.y.saturating_add(button_h + gap),
+        w: button_w,
+        h: button_h,
+    };
     let quit_button = Rect {
-        x: start_button.x,
-        y: start_button.y.saturating_add(button_h + gap),
+        x: restart_button.x,
+        y: skilltree_button.y.saturating_add(button_h + gap),
         w: button_w,
         h: button_h,
     };
 
-    for (rect, label) in [(start_button, "START"), (quit_button, "QUIT")] {
-        fill_rect(
-            frame,
-            width,
-            height,
-            rect.x,
-            rect.y,
-            rect.w,
-            rect.h,
-            COLOR_PANEL_BG,
-        );
-        draw_rect_outline(
-            frame,
-            width,
-            height,
-            rect.x,
-            rect.y,
-            rect.w,
-            rect.h,
-            COLOR_PANEL_BORDER,
-        );
-        draw_text(
-            frame,
-            width,
-            height,
-            rect.x.saturating_add(16),
-            rect.y.saturating_add(rect.h / 2).saturating_sub(6),
-            label,
-            COLOR_PAUSE_MENU_TEXT,
-        );
+    for (rect, label) in [
+        (restart_button, "RESTART"),
+        (skilltree_button, "SKILL TREE"),
+        (quit_button, "QUIT"),
+    ] {
+        let hovered = cursor.map(|(x, y)| rect.contains(x, y)).unwrap_or(false);
+        draw_button(frame, width, height, rect, label, hovered);
     }
 
-    MainMenuLayout {
+    GameOverMenuLayout {
         panel,
-        start_button,
+        restart_button,
+        skilltree_button,
         quit_button,
+    }
+}
+
+pub fn draw_skilltree(frame: &mut dyn Renderer2d, width: u32, height: u32) -> SkillTreeLayout {
+    draw_skilltree_with_cursor(frame, width, height, None)
+}
+
+pub fn draw_skilltree_with_cursor(
+    frame: &mut dyn Renderer2d,
+    width: u32,
+    height: u32,
+    cursor: Option<(u32, u32)>,
+) -> SkillTreeLayout {
+    // Skilltree is its own scene: clear the frame so the Tetris board is not visible.
+    fill_rect(frame, width, height, 0, 0, width, height, color_for_cell(0));
+
+    let margin = 32u32;
+    let pad = 18u32;
+
+    let screen = ui::Rect::from_size(width, height);
+    let safe = screen.inset(ui::Insets::all(margin));
+    if safe.w == 0 || safe.h == 0 {
+        return SkillTreeLayout::default();
+    }
+
+    // Use the safe region as our "world bounds" for this scene (not a floating modal panel).
+    let panel = Rect {
+        x: safe.x,
+        y: safe.y,
+        w: safe.w,
+        h: safe.h,
+    };
+
+    draw_text(
+        frame,
+        width,
+        height,
+        safe.x.saturating_add(pad),
+        safe.y.saturating_add(pad),
+        "SKILL TREE",
+        COLOR_PAUSE_MENU_TEXT,
+    );
+    draw_text(
+        frame,
+        width,
+        height,
+        safe.x.saturating_add(pad),
+        safe.y.saturating_add(pad + 24),
+        "TODO: add progression nodes",
+        COLOR_PAUSE_MENU_TEXT,
+    );
+    draw_text(
+        frame,
+        width,
+        height,
+        safe.x.saturating_add(pad),
+        safe.y.saturating_add(pad + 48),
+        "ENTER: START NEW RUN",
+        COLOR_PAUSE_MENU_TEXT,
+    );
+    draw_text(
+        frame,
+        width,
+        height,
+        safe.x.saturating_add(pad),
+        safe.y.saturating_add(pad + 72),
+        "ESC: MAIN MENU",
+        COLOR_PAUSE_MENU_TEXT,
+    );
+
+    // Placeholder "nodes" so the skilltree reads like an in-world scene rather than a modal panel.
+    let content = safe.inset(ui::Insets::all(pad));
+    let node_size = ui::Size::new(140, 64).clamp_max(content.size());
+    if node_size.w > 0 && node_size.h > 0 {
+        let nodes_band = ui::Rect::new(content.x, content.y.saturating_add(120), content.w, content.h);
+        let mut x = nodes_band
+            .x
+            .saturating_add(nodes_band.w.saturating_sub(node_size.w.saturating_mul(3)) / 2);
+        let y = nodes_band.y;
+        let gap = 24u32;
+
+        for label in ["+SCORE", "+TIME", "+SPEED"] {
+            let r = Rect {
+                x,
+                y,
+                w: node_size.w,
+                h: node_size.h,
+            };
+            fill_rect(frame, width, height, r.x, r.y, r.w, r.h, COLOR_PANEL_BG);
+            draw_rect_outline(frame, width, height, r.x, r.y, r.w, r.h, COLOR_PANEL_BORDER);
+            draw_text(
+                frame,
+                width,
+                height,
+                r.x.saturating_add(16),
+                r.y.saturating_add(r.h / 2).saturating_sub(6),
+                label,
+                COLOR_PAUSE_MENU_TEXT,
+            );
+            x = x.saturating_add(node_size.w.saturating_add(gap));
+        }
+    }
+
+    let button_size = ui::Size::new(240, 44).clamp_max(content.size());
+    let start_ui = content.place(button_size, ui::Anchor::BottomCenter);
+    let start_new_game_button = Rect {
+        x: start_ui.x,
+        y: start_ui.y,
+        w: start_ui.w,
+        h: start_ui.h,
+    };
+
+    let hovered = cursor
+        .map(|(x, y)| start_new_game_button.contains(x, y))
+        .unwrap_or(false);
+    draw_button(
+        frame,
+        width,
+        height,
+        start_new_game_button,
+        "START NEW RUN",
+        hovered,
+    );
+
+    SkillTreeLayout {
+        panel,
+        start_new_game_button,
     }
 }
 
@@ -819,6 +984,41 @@ fn dim_color(mut c: [u8; 4], factor: f32) -> [u8; 4] {
     c[1] = ((c[1] as f32) * f) as u8;
     c[2] = ((c[2] as f32) * f) as u8;
     c
+}
+
+fn brighten_color(mut c: [u8; 4], amount: f32) -> [u8; 4] {
+    let t = amount.clamp(0.0, 1.0);
+    for i in 0..3 {
+        let v = c[i] as f32;
+        c[i] = (v + (255.0 - v) * t).round().clamp(0.0, 255.0) as u8;
+    }
+    c
+}
+
+fn button_colors(hovered: bool) -> ([u8; 4], [u8; 4]) {
+    if hovered {
+        (
+            brighten_color(COLOR_PANEL_BG, BUTTON_HOVER_BRIGHTEN),
+            brighten_color(COLOR_PANEL_BORDER, BUTTON_HOVER_BRIGHTEN),
+        )
+    } else {
+        (COLOR_PANEL_BG, COLOR_PANEL_BORDER)
+    }
+}
+
+fn draw_button(frame: &mut [u8], width: u32, height: u32, rect: Rect, label: &str, hovered: bool) {
+    let (fill, border) = button_colors(hovered);
+    fill_rect(frame, width, height, rect.x, rect.y, rect.w, rect.h, fill);
+    draw_rect_outline(frame, width, height, rect.x, rect.y, rect.w, rect.h, border);
+    draw_text(
+        frame,
+        width,
+        height,
+        rect.x.saturating_add(16),
+        rect.y.saturating_add(rect.h / 2).saturating_sub(6),
+        label,
+        COLOR_PAUSE_MENU_TEXT,
+    );
 }
 
 fn fill_rect(
