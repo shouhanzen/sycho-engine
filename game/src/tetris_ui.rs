@@ -2,6 +2,7 @@ use engine::graphics::Renderer2d;
 use engine::render::{color_for_cell, draw_board, CELL_SIZE};
 use engine::ui as ui;
 
+use crate::skilltree::{NodeState, SkillTreeDef, SkillTreeProgress, SkillTreeRuntime};
 use crate::tetris_core::{piece_board_offset, piece_grid, piece_type, Piece, TetrisCore, Vec2i};
 
 const COLOR_PANEL_BG: [u8; 4] = [16, 16, 22, 255];
@@ -52,6 +53,7 @@ pub struct PauseMenuLayout {
 pub struct MainMenuLayout {
     pub panel: Rect,
     pub start_button: Rect,
+    pub skilltree_editor_button: Rect,
     pub quit_button: Rect,
 }
 
@@ -67,6 +69,16 @@ pub struct GameOverMenuLayout {
 pub struct SkillTreeLayout {
     pub panel: Rect,
     pub start_new_game_button: Rect,
+
+    // Grid viewport + mapping (for hit-testing / editor interactions).
+    pub grid: Rect,
+    pub grid_origin_x: u32,
+    pub grid_origin_y: u32,
+    pub grid_cell: u32,
+    pub grid_cols: u32,
+    pub grid_rows: u32,
+    pub grid_cam_min_x: i32,
+    pub grid_cam_min_y: i32,
 }
 
 pub fn compute_layout(width: u32, height: u32, board_w: u32, board_h: u32, next_len: usize) -> UiLayout {
@@ -430,7 +442,7 @@ pub fn draw_main_menu_with_cursor(
         h: safe.h,
     };
 
-    // Layout: a vertical stack (title, start, quit), centered in the safe region.
+    // Layout: a vertical stack (title, start, skilltree editor, quit), centered in the safe region.
     let title = MAIN_MENU_TITLE;
     let title_chars = title.chars().count() as u32;
     let glyph_cols = 4u32; // 3 glyph columns + 1 column spacing (matches `draw_text` advances).
@@ -446,8 +458,8 @@ pub fn draw_main_menu_with_cursor(
     let title_button_gap = 28u32;
     let stack_h = title_h
         .saturating_add(title_button_gap)
-        .saturating_add(button_size.h.saturating_mul(2))
-        .saturating_add(button_gap);
+        .saturating_add(button_size.h.saturating_mul(3))
+        .saturating_add(button_gap.saturating_mul(2));
     let top_y = content
         .y
         .saturating_add(content.h.saturating_sub(stack_h) / 2);
@@ -474,14 +486,30 @@ pub fn draw_main_menu_with_cursor(
         w: button_size.w,
         h: button_size.h,
     };
+    let skilltree_editor_button = Rect {
+        x: start_button.x,
+        y: start_button
+            .y
+            .saturating_add(start_button.h)
+            .saturating_add(button_gap),
+        w: start_button.w,
+        h: start_button.h,
+    };
     let quit_button = Rect {
         x: start_button.x,
-        y: start_button.y.saturating_add(start_button.h).saturating_add(button_gap),
+        y: skilltree_editor_button
+            .y
+            .saturating_add(skilltree_editor_button.h)
+            .saturating_add(button_gap),
         w: start_button.w,
         h: start_button.h,
     };
 
-    for (rect, label) in [(start_button, "START"), (quit_button, "QUIT")] {
+    for (rect, label) in [
+        (start_button, "START"),
+        (skilltree_editor_button, "SKILLTREE EDITOR"),
+        (quit_button, "QUIT"),
+    ] {
         let hovered = cursor.map(|(x, y)| rect.contains(x, y)).unwrap_or(false);
         draw_button(frame, width, height, rect, label, hovered);
     }
@@ -489,6 +517,7 @@ pub fn draw_main_menu_with_cursor(
     MainMenuLayout {
         panel,
         start_button,
+        skilltree_editor_button,
         quit_button,
     }
 }
@@ -653,11 +682,45 @@ pub fn draw_skilltree(frame: &mut dyn Renderer2d, width: u32, height: u32) -> Sk
     draw_skilltree_with_cursor(frame, width, height, None)
 }
 
+pub fn draw_skilltree_runtime_with_cursor(
+    frame: &mut dyn Renderer2d,
+    width: u32,
+    height: u32,
+    cursor: Option<(u32, u32)>,
+    runtime: &SkillTreeRuntime,
+) -> SkillTreeLayout {
+    draw_skilltree_impl(
+        frame,
+        width,
+        height,
+        cursor,
+        Some(runtime),
+        &runtime.def,
+        &runtime.progress,
+    )
+}
+
 pub fn draw_skilltree_with_cursor(
     frame: &mut dyn Renderer2d,
     width: u32,
     height: u32,
     cursor: Option<(u32, u32)>,
+) -> SkillTreeLayout {
+    // Keep this function deterministic + I/O-free for tests; the headful game uses
+    // `draw_skilltree_runtime_with_cursor` instead.
+    let def = SkillTreeDef::default();
+    let progress = SkillTreeProgress::default();
+    draw_skilltree_impl(frame, width, height, cursor, None, &def, &progress)
+}
+
+fn draw_skilltree_impl(
+    frame: &mut dyn Renderer2d,
+    width: u32,
+    height: u32,
+    cursor: Option<(u32, u32)>,
+    runtime: Option<&SkillTreeRuntime>,
+    def: &SkillTreeDef,
+    progress: &SkillTreeProgress,
 ) -> SkillTreeLayout {
     // Skilltree is its own scene: clear the frame so the Tetris board is not visible.
     fill_rect(frame, width, height, 0, 0, width, height, color_for_cell(0));
@@ -679,6 +742,20 @@ pub fn draw_skilltree_with_cursor(
         h: safe.h,
     };
 
+    let header_h = 120u32.min(safe.h);
+    let footer_h = 80u32.min(safe.h.saturating_sub(header_h));
+
+    let content = safe.inset(ui::Insets::all(pad));
+    let grid = Rect {
+        x: content.x,
+        y: content.y.saturating_add(header_h.saturating_sub(pad)),
+        w: content.w,
+        h: content
+            .h
+            .saturating_sub(header_h.saturating_sub(pad))
+            .saturating_sub(footer_h),
+    };
+
     draw_text(
         frame,
         width,
@@ -688,64 +765,255 @@ pub fn draw_skilltree_with_cursor(
         "SKILL TREE",
         COLOR_PAUSE_MENU_TEXT,
     );
+
+    let money_text = format!("MONEY {}", progress.money);
     draw_text(
         frame,
         width,
         height,
         safe.x.saturating_add(pad),
         safe.y.saturating_add(pad + 24),
-        "TODO: add progression nodes",
+        &money_text,
         COLOR_PAUSE_MENU_TEXT,
     );
+
+    let editor_enabled = runtime.map(|rt| rt.editor.enabled).unwrap_or(false);
+    if editor_enabled {
+        let tool = runtime.map(|rt| format!("{:?}", rt.editor.tool)).unwrap_or_default();
+        let tool_text = format!("EDITOR ON  TOOL {tool}  (TAB CYCLE, S SAVE, R RELOAD)");
+        draw_text(
+            frame,
+            width,
+            height,
+            safe.x.saturating_add(pad),
+            safe.y.saturating_add(pad + 48),
+            &tool_text,
+            COLOR_PAUSE_MENU_TEXT,
+        );
+        draw_text(
+            frame,
+            width,
+            height,
+            safe.x.saturating_add(pad),
+            safe.y.saturating_add(pad + 72),
+            "ARROWS PAN  +/- ZOOM  N NEW  DEL DELETE  ESC EXIT EDITOR",
+            COLOR_PAUSE_MENU_TEXT,
+        );
+    } else {
+        draw_text(
+            frame,
+            width,
+            height,
+            safe.x.saturating_add(pad),
+            safe.y.saturating_add(pad + 48),
+            "CLICK: BUY  (F4: TOGGLE EDITOR)",
+            COLOR_PAUSE_MENU_TEXT,
+        );
+        draw_text(
+            frame,
+            width,
+            height,
+            safe.x.saturating_add(pad),
+            safe.y.saturating_add(pad + 72),
+            "ENTER: START NEW RUN   ESC: MAIN MENU",
+            COLOR_PAUSE_MENU_TEXT,
+        );
+    }
     draw_text(
         frame,
         width,
         height,
         safe.x.saturating_add(pad),
-        safe.y.saturating_add(pad + 48),
-        "ENTER: START NEW RUN",
-        COLOR_PAUSE_MENU_TEXT,
-    );
-    draw_text(
-        frame,
-        width,
-        height,
-        safe.x.saturating_add(pad),
-        safe.y.saturating_add(pad + 72),
-        "ESC: MAIN MENU",
+        safe.y.saturating_add(pad + 96),
+        "TIP: EDITOR CHANGES SAVE TO game/assets/skilltree.json",
         COLOR_PAUSE_MENU_TEXT,
     );
 
-    // Placeholder "nodes" so the skilltree reads like an in-world scene rather than a modal panel.
-    let content = safe.inset(ui::Insets::all(pad));
-    let node_size = ui::Size::new(140, 64).clamp_max(content.size());
-    if node_size.w > 0 && node_size.h > 0 {
-        let nodes_band = ui::Rect::new(content.x, content.y.saturating_add(120), content.w, content.h);
-        let mut x = nodes_band
-            .x
-            .saturating_add(nodes_band.w.saturating_sub(node_size.w.saturating_mul(3)) / 2);
-        let y = nodes_band.y;
-        let gap = 24u32;
+    // Grid rendering (world coords; y increases upward).
+    //
+    // Camera:
+    // - `grid_cam_min_*` are integer world cell coordinates (used for stable indexing / hit-testing).
+    // - `grid_pan_px_*` are sub-cell pixel offsets derived from the camera's fractional pan, so panning
+    //   can be smooth even though the world is cell-based.
+    let grid_cell = runtime
+        .map(|rt| rt.camera.cell_px.round().clamp(8.0, 64.0) as u32)
+        .unwrap_or(20u32);
+    let grid_cols = if grid_cell > 0 { grid.w / grid_cell } else { 0 };
+    let grid_rows = if grid_cell > 0 { grid.h / grid_cell } else { 0 };
 
-        for label in ["+SCORE", "+TIME", "+SPEED"] {
-            let r = Rect {
-                x,
-                y,
-                w: node_size.w,
-                h: node_size.h,
-            };
-            fill_rect(frame, width, height, r.x, r.y, r.w, r.h, COLOR_PANEL_BG);
-            draw_rect_outline(frame, width, height, r.x, r.y, r.w, r.h, COLOR_PANEL_BORDER);
+    let grid_pixel_w = grid_cols.saturating_mul(grid_cell).min(grid.w);
+    let grid_pixel_h = grid_rows.saturating_mul(grid_cell).min(grid.h);
+    let grid_origin_x = grid.x.saturating_add(grid.w.saturating_sub(grid_pixel_w) / 2);
+    let grid_origin_y = grid.y.saturating_add(grid.h.saturating_sub(grid_pixel_h) / 2);
+
+    let default_cam_min_x = -(grid_cols as i32) / 2;
+    let default_cam_min_y = 0i32;
+
+    let mut cam_min_x = default_cam_min_x as f32;
+    let mut cam_min_y = default_cam_min_y as f32;
+    if let Some(rt) = runtime {
+        cam_min_x += rt.camera.pan.x;
+        cam_min_y += rt.camera.pan.y;
+    }
+
+    let grid_cam_min_x = cam_min_x.floor() as i32;
+    let grid_cam_min_y = cam_min_y.floor() as i32;
+
+    let frac_x = cam_min_x - grid_cam_min_x as f32;
+    let frac_y = cam_min_y - grid_cam_min_y as f32;
+
+    let grid_pan_px_x = -((frac_x * grid_cell as f32).round() as i32);
+    let grid_pan_px_y = (frac_y * grid_cell as f32).round() as i32;
+
+    let grid_cell_i32 = grid_cell as i32;
+    let grid_pixel_w_i32 = grid_pixel_w as i32;
+    let grid_pixel_h_i32 = grid_pixel_h as i32;
+    let grid_view_x0 = grid_origin_x as i32;
+    let grid_view_y0 = grid_origin_y as i32;
+    let grid_view_x1 = grid_view_x0.saturating_add(grid_pixel_w_i32);
+    let grid_view_y1 = grid_view_y0.saturating_add(grid_pixel_h_i32);
+
+    // Subtle dot grid (scrolls with the camera).
+    if grid_cols > 0 && grid_rows > 0 {
+        let dot = 2u32;
+        let dot_color = [18, 18, 24, 255];
+        for row in 0..grid_rows {
+            for col in 0..grid_cols {
+                let x0 = grid_view_x0
+                    .saturating_add(col as i32 * grid_cell_i32)
+                    .saturating_add(grid_pan_px_x);
+                let y0 = grid_view_y0
+                    .saturating_add(row as i32 * grid_cell_i32)
+                    .saturating_add(grid_pan_px_y);
+                let cx = x0 + grid_cell_i32 / 2 - dot as i32 / 2;
+                let cy = y0 + grid_cell_i32 / 2 - dot as i32 / 2;
+
+                if cx >= grid_view_x0
+                    && cy >= grid_view_y0
+                    && cx < grid_view_x1
+                    && cy < grid_view_y1
+                {
+                    fill_rect_i32(frame, width, height, cx, cy, dot, dot, dot_color);
+                }
+            }
+        }
+    }
+
+    // Draw nodes as polyblocks.
+    let unlocked: std::collections::HashSet<&str> =
+        progress.unlocked.iter().map(|s| s.as_str()).collect();
+    let selected = runtime.and_then(|rt| rt.editor.selected.as_deref());
+    let connect_from = runtime.and_then(|rt| rt.editor.connect_from.as_deref());
+    for node in &def.nodes {
+        let (state, can_buy) = if let Some(rt) = runtime {
+            (rt.node_state(node), rt.can_buy(node))
+        } else if unlocked.contains(node.id.as_str()) {
+            (NodeState::Unlocked, false)
+        } else if node.requires.iter().all(|r| unlocked.contains(r.as_str())) {
+            (NodeState::Available, progress.money >= node.cost)
+        } else {
+            (NodeState::Locked, false)
+        };
+
+        let mut fill = color_for_cell(node.color);
+        let mut border = COLOR_PANEL_BORDER;
+        let is_selected = selected == Some(node.id.as_str());
+        let is_connect_from = connect_from == Some(node.id.as_str());
+        match state {
+            NodeState::Unlocked => {
+                border = COLOR_PANEL_BORDER;
+            }
+            NodeState::Available => {
+                if can_buy {
+                    fill = brighten_color(fill, 0.12);
+                    border = brighten_color(border, 0.12);
+                } else {
+                    fill = dim_color(fill, 0.55);
+                    border = dim_color(border, 0.65);
+                }
+            }
+            NodeState::Locked => {
+                fill = dim_color(fill, 0.25);
+                border = dim_color(border, 0.55);
+            }
+        }
+        if is_connect_from {
+            border = brighten_color(border, 0.22);
+        }
+        if is_selected {
+            border = [245, 245, 255, 255];
+        }
+
+        let mut bbox_min_x: Option<u32> = None;
+        let mut bbox_min_y: Option<u32> = None;
+        let mut bbox_max_x: u32 = 0;
+        let mut bbox_max_y: u32 = 0;
+
+        for rel in &node.shape {
+            let wx = node.pos.x + rel.x;
+            let wy = node.pos.y + rel.y;
+            let col = wx - grid_cam_min_x;
+            let row_from_bottom = wy - grid_cam_min_y;
+            let row_from_top = grid_rows as i32 - 1 - row_from_bottom;
+
+            // Convert to pixel coords (allowing an extra col/row for fractional panning).
+            let px = grid_view_x0
+                .saturating_add(col.saturating_mul(grid_cell_i32))
+                .saturating_add(grid_pan_px_x);
+            let py = grid_view_y0
+                .saturating_add(row_from_top.saturating_mul(grid_cell_i32))
+                .saturating_add(grid_pan_px_y);
+
+            let cell_x1 = px.saturating_add(grid_cell_i32);
+            let cell_y1 = py.saturating_add(grid_cell_i32);
+            let overlaps = cell_x1 > grid_view_x0
+                && px < grid_view_x1
+                && cell_y1 > grid_view_y0
+                && py < grid_view_y1;
+            if !overlaps {
+                continue;
+            }
+
+            fill_rect_i32(frame, width, height, px, py, grid_cell, grid_cell, fill);
+            if px >= 0
+                && py >= 0
+                && (px as u32).saturating_add(grid_cell) <= width
+                && (py as u32).saturating_add(grid_cell) <= height
+            {
+                draw_rect_outline(frame, width, height, px as u32, py as u32, grid_cell, grid_cell, border);
+            }
+
+            let px0 = px.max(0) as u32;
+            let py0 = py.max(0) as u32;
+            bbox_min_x = Some(bbox_min_x.map(|v| v.min(px0)).unwrap_or(px0));
+            bbox_min_y = Some(bbox_min_y.map(|v| v.min(py0)).unwrap_or(py0));
+            bbox_max_x = bbox_max_x.max(px0.saturating_add(grid_cell));
+            bbox_max_y = bbox_max_y.max(py0.saturating_add(grid_cell));
+        }
+
+        // Label + cost.
+        if let (Some(min_x), Some(min_y)) = (bbox_min_x, bbox_min_y) {
+            let label_x = min_x.saturating_add(6);
+            let label_y = min_y.saturating_add(6);
+            draw_text(frame, width, height, label_x, label_y, &node.name, COLOR_PAUSE_MENU_TEXT);
+            if node.cost > 0 {
+                let cost = format!("${}", node.cost);
+                draw_text(frame, width, height, label_x, label_y.saturating_add(18), &cost, COLOR_PAUSE_MENU_TEXT);
+            }
+        }
+    }
+
+    if let Some(rt) = runtime {
+        if let Some(status) = rt.editor.status.as_deref() {
             draw_text(
                 frame,
                 width,
                 height,
-                r.x.saturating_add(16),
-                r.y.saturating_add(r.h / 2).saturating_sub(6),
-                label,
+                safe.x.saturating_add(pad),
+                safe.y.saturating_add(safe.h.saturating_sub(pad + 16)),
+                status,
                 COLOR_PAUSE_MENU_TEXT,
             );
-            x = x.saturating_add(node_size.w.saturating_add(gap));
         }
     }
 
@@ -773,6 +1041,14 @@ pub fn draw_skilltree_with_cursor(
     SkillTreeLayout {
         panel,
         start_new_game_button,
+        grid,
+        grid_origin_x,
+        grid_origin_y,
+        grid_cell,
+        grid_cols,
+        grid_rows,
+        grid_cam_min_x,
+        grid_cam_min_y,
     }
 }
 
@@ -1045,6 +1321,31 @@ fn fill_rect(
     color: [u8; 4],
 ) {
     frame.fill_rect(Rect::new(x, y, w, h), color);
+}
+
+fn fill_rect_i32(
+    frame: &mut dyn Renderer2d,
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    color: [u8; 4],
+) {
+    if w == 0 || h == 0 {
+        return;
+    }
+
+    let x0 = x.max(0) as u32;
+    let y0 = y.max(0) as u32;
+    let x1 = (x.saturating_add(w as i32)).clamp(0, width as i32) as u32;
+    let y1 = (y.saturating_add(h as i32)).clamp(0, height as i32) as u32;
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+
+    fill_rect(frame, width, height, x0, y0, x1 - x0, y1 - y0, color);
 }
 
 fn blend_rect(
