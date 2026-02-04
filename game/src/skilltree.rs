@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::tetris_core::Vec2i;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Vec2f {
     pub x: f32,
     pub y: f32,
@@ -61,7 +61,7 @@ pub enum SkillEffect {
     FasterGravity { percent: u32 },
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillTreeRunMods {
     pub extra_round_time_seconds: u32,
     pub gravity_faster_percent: u32,
@@ -107,21 +107,23 @@ impl Default for SkillTreeProgress {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeState {
     Unlocked,
     Available,
     Locked,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SkillTreeEditorTool {
-    SelectMove,
-    PaintCells,
+    Select,
+    Move,
+    AddCell,
+    RemoveCell,
     ConnectPrereqs,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SkillTreeEditorState {
     pub enabled: bool,
     pub tool: SkillTreeEditorTool,
@@ -141,7 +143,7 @@ impl Default for SkillTreeEditorState {
     fn default() -> Self {
         Self {
             enabled: false,
-            tool: SkillTreeEditorTool::SelectMove,
+            tool: SkillTreeEditorTool::Select,
             selected: None,
             move_grab_offset: None,
             connect_from: None,
@@ -151,7 +153,7 @@ impl Default for SkillTreeEditorState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SkillTreeCamera {
     /// Current zoom level in pixels per grid cell (lerps towards `target_cell_px`).
     pub cell_px: f32,
@@ -260,7 +262,55 @@ pub struct SkillTreeRuntime {
     unlocked_set: HashSet<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillTreeSnapshot {
+    pub def: SkillTreeDef,
+    pub progress: SkillTreeProgress,
+    pub camera: SkillTreeCamera,
+    pub editor: SkillTreeEditorState,
+}
+
 impl SkillTreeRuntime {
+    pub fn from_defaults() -> Self {
+        let mut rt = Self {
+            def: SkillTreeDef::default(),
+            progress: SkillTreeProgress::default(),
+            def_path: None,
+            progress_path: default_progress_path(),
+            camera: SkillTreeCamera::default(),
+            editor: SkillTreeEditorState::default(),
+            id_to_index: HashMap::new(),
+            unlocked_set: HashSet::new(),
+        };
+        rt.rebuild_caches();
+        rt
+    }
+
+    pub fn to_snapshot(&self) -> SkillTreeSnapshot {
+        SkillTreeSnapshot {
+            def: self.def.clone(),
+            progress: self.progress.clone(),
+            camera: self.camera,
+            editor: self.editor.clone(),
+        }
+    }
+
+    pub fn from_snapshot(snapshot: SkillTreeSnapshot) -> Self {
+        let mut rt = Self {
+            def: snapshot.def,
+            progress: snapshot.progress,
+            def_path: None,
+            progress_path: default_progress_path(),
+            camera: snapshot.camera,
+            editor: snapshot.editor,
+            id_to_index: HashMap::new(),
+            unlocked_set: HashSet::new(),
+        };
+        rt.rebuild_caches();
+        rt
+    }
+
     pub fn load_default() -> Self {
         let (def, def_path) = load_def_from_default_path();
         let progress_path = default_progress_path();
@@ -403,10 +453,17 @@ impl SkillTreeRuntime {
 
     pub fn editor_cycle_tool(&mut self) {
         self.editor.tool = match self.editor.tool {
-            SkillTreeEditorTool::SelectMove => SkillTreeEditorTool::PaintCells,
-            SkillTreeEditorTool::PaintCells => SkillTreeEditorTool::ConnectPrereqs,
-            SkillTreeEditorTool::ConnectPrereqs => SkillTreeEditorTool::SelectMove,
+            SkillTreeEditorTool::Select => SkillTreeEditorTool::Move,
+            SkillTreeEditorTool::Move => SkillTreeEditorTool::AddCell,
+            SkillTreeEditorTool::AddCell => SkillTreeEditorTool::RemoveCell,
+            SkillTreeEditorTool::RemoveCell => SkillTreeEditorTool::ConnectPrereqs,
+            SkillTreeEditorTool::ConnectPrereqs => SkillTreeEditorTool::Select,
         };
+        self.editor.status = Some(format!("TOOL {:?}", self.editor.tool));
+    }
+
+    pub fn editor_set_tool(&mut self, tool: SkillTreeEditorTool) {
+        self.editor.tool = tool;
         self.editor.status = Some(format!("TOOL {:?}", self.editor.tool));
     }
 
@@ -418,6 +475,12 @@ impl SkillTreeRuntime {
 
     pub fn editor_selected_id(&self) -> Option<&str> {
         self.editor.selected.as_deref()
+    }
+
+    pub fn editor_clear_selection(&mut self) {
+        self.editor.selected = None;
+        self.editor.move_grab_offset = None;
+        self.editor.status = Some("SELECT NONE".to_string());
     }
 
     pub fn node_index(&self, id: &str) -> Option<usize> {
@@ -514,6 +577,47 @@ impl SkillTreeRuntime {
         true
     }
 
+    pub fn editor_add_cell_at_world(&mut self, world: Vec2i) -> bool {
+        let Some(id) = self.editor.selected.clone() else {
+            return false;
+        };
+        let Some(node) = self.node_mut(&id) else {
+            return false;
+        };
+
+        let rel = Vec2i::new(world.x - node.pos.x, world.y - node.pos.y);
+        if node.shape.iter().any(|c| c.x == rel.x && c.y == rel.y) {
+            return false;
+        }
+        node.shape.push(rel);
+        self.rebuild_caches();
+        self.editor.dirty = true;
+        self.editor.status = Some(format!("ADD {id}"));
+        true
+    }
+
+    pub fn editor_remove_cell_at_world(&mut self, world: Vec2i) -> bool {
+        let Some(id) = self.editor.selected.clone() else {
+            return false;
+        };
+        let Some(node) = self.node_mut(&id) else {
+            return false;
+        };
+
+        let rel = Vec2i::new(world.x - node.pos.x, world.y - node.pos.y);
+        let Some(i) = node.shape.iter().position(|c| c.x == rel.x && c.y == rel.y) else {
+            return false;
+        };
+        if node.shape.len() <= 1 {
+            return false;
+        }
+        node.shape.remove(i);
+        self.rebuild_caches();
+        self.editor.dirty = true;
+        self.editor.status = Some(format!("REMOVE {id}"));
+        true
+    }
+
     pub fn editor_toggle_prereq(&mut self, prereq: &str, node_id: &str) -> bool {
         let Some(node) = self.node_mut(node_id) else {
             return false;
@@ -531,6 +635,25 @@ impl SkillTreeRuntime {
         self.editor.dirty = true;
         self.editor.status = Some(format!("REQ {prereq} -> {node_id}"));
         true
+    }
+}
+
+impl Serialize for SkillTreeRuntime {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.to_snapshot().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SkillTreeRuntime {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let snapshot = SkillTreeSnapshot::deserialize(deserializer)?;
+        Ok(SkillTreeRuntime::from_snapshot(snapshot))
     }
 }
 

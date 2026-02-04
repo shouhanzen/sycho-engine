@@ -6,7 +6,8 @@ use engine::render::{draw_board, CELL_SIZE};
 use engine::surface::SurfaceSize;
 
 use game::playtest::{InputAction, TetrisLogic};
-use game::tetris_core::{Piece, TetrisCore, Vec2i, BOARD_HEIGHT, BOARD_WIDTH};
+use game::state::GameState;
+use game::tetris_core::{Piece, Vec2i, BOARD_HEIGHT, BOARD_WIDTH};
 
 use std::fs;
 use std::path::PathBuf;
@@ -67,7 +68,7 @@ impl E2eMp4 {
     }
 
     fn capture(&mut self, runner: &HeadlessRunner<TetrisLogic>) {
-        let board = runner.state().board_with_active_piece();
+        let board = runner.state().tetris.board_with_active_piece();
         {
             let mut gfx = CpuRenderer::new(
                 self.buf.as_mut_slice(),
@@ -140,7 +141,7 @@ fn e2e_hard_drop_places_o_piece() {
     if let Some(r) = rec.as_mut() {
         r.capture(&runner);
     }
-    let snapshot = runner.state().snapshot();
+    let snapshot = runner.state().tetris.snapshot();
 
     let filled = snapshot
         .board
@@ -222,8 +223,8 @@ fn e2e_state_recording_replay_video_matches_live_video() {
         logic,
         actions,
         video,
-        |state: &TetrisCore, buf: &mut [u8], width: u32, height: u32| {
-            let board = state.board_with_active_piece();
+        |state: &GameState, buf: &mut [u8], width: u32, height: u32| {
+            let board = state.tetris.board_with_active_piece();
             let mut gfx = CpuRenderer::new(buf, SurfaceSize::new(width, height));
             draw_board(&mut gfx, &board);
         },
@@ -253,14 +254,14 @@ fn e2e_rewind_restores_previous_frame() {
     if let Some(r) = rec.as_mut() {
         r.capture(&runner);
     }
-    let after_rotate = runner.state().snapshot();
+    let after_rotate = runner.state().tetris.snapshot();
     assert_eq!(after_rotate.current_piece_rotation, 1);
 
     runner.step(InputAction::MoveRight);
     if let Some(r) = rec.as_mut() {
         r.capture(&runner);
     }
-    let after_move_right = runner.state().snapshot();
+    let after_move_right = runner.state().tetris.snapshot();
     assert_ne!(
         after_rotate.current_piece_pos,
         after_move_right.current_piece_pos
@@ -270,7 +271,7 @@ fn e2e_rewind_restores_previous_frame() {
     if let Some(r) = rec.as_mut() {
         r.capture(&runner);
     }
-    let rewound = runner.state().snapshot();
+    let rewound = runner.state().tetris.snapshot();
     assert_eq!(rewound.current_piece_pos, after_rotate.current_piece_pos);
     assert_eq!(
         rewound.current_piece_rotation,

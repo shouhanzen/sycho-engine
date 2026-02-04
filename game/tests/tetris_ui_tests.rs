@@ -1,12 +1,16 @@
-use engine::render::{color_for_cell, CELL_SIZE};
 use engine::graphics::CpuRenderer;
+use engine::render::{color_for_cell, CELL_SIZE};
 use engine::surface::SurfaceSize;
+use engine::ui;
+use engine::ui_tree::{UiInput, UiTree};
 
 use game::tetris_core::{Piece, TetrisCore, Vec2i, BOARD_HEIGHT};
+use game::skilltree::SkillTreeRuntime;
 use game::tetris_ui::{
-    draw_game_over_menu, draw_main_menu, draw_main_menu_with_cursor, draw_pause_menu, draw_skilltree, draw_tetris,
-    MAIN_MENU_TITLE,
+    draw_game_over_menu, draw_main_menu, draw_main_menu_with_ui, draw_pause_menu,
+    draw_skilltree, draw_skilltree_runtime_with_ui, draw_tetris, MAIN_MENU_TITLE,
 };
+use game::ui_ids::UI_CANVAS;
 
 #[test]
 fn draw_tetris_renders_hold_panel_outside_board_area() {
@@ -212,7 +216,19 @@ fn draw_main_menu_brightens_start_button_on_hover() {
         px.copy_from_slice(&bg);
     }
     let mut gfx_hover = CpuRenderer::new(&mut frame_hover, SurfaceSize::new(width, height));
-    let _layout_hover = draw_main_menu_with_cursor(&mut gfx_hover, width, height, Some((hover_x, hover_y)));
+    let mut ui_tree = UiTree::new();
+    ui_tree.ensure_canvas(UI_CANVAS, ui::Rect::from_size(width, height));
+    ui_tree.add_root(UI_CANVAS);
+    let _ = draw_main_menu_with_ui(&mut gfx_hover, width, height, &mut ui_tree);
+    let _ = ui_tree.process_input(UiInput {
+        mouse_pos: Some((hover_x, hover_y)),
+        mouse_down: false,
+        mouse_up: false,
+    });
+    ui_tree.begin_frame();
+    ui_tree.ensure_canvas(UI_CANVAS, ui::Rect::from_size(width, height));
+    ui_tree.add_root(UI_CANVAS);
+    let _layout_hover = draw_main_menu_with_ui(&mut gfx_hover, width, height, &mut ui_tree);
     let mut hover_px = [0u8; 4];
     hover_px.copy_from_slice(&frame_hover[idx..idx + 4]);
 
@@ -343,3 +359,44 @@ fn draw_skilltree_draws_a_panel_and_start_new_game_button() {
         "expected the skilltree start button to draw over the background"
     );
 }
+
+#[test]
+fn draw_skilltree_editor_hides_start_new_game_button() {
+    let width = 800u32;
+    let height = 600u32;
+
+    let mut frame = vec![0u8; (width * height * 4) as usize];
+
+    let mut runtime = SkillTreeRuntime::load_default();
+    runtime.editor.enabled = true;
+
+    let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
+    let mut ui_tree = UiTree::new();
+    ui_tree.ensure_canvas(UI_CANVAS, ui::Rect::from_size(width, height));
+    ui_tree.add_root(UI_CANVAS);
+    let layout = draw_skilltree_runtime_with_ui(&mut gfx, width, height, &mut ui_tree, &runtime);
+    assert!(layout.panel.w > 0 && layout.panel.h > 0);
+    assert_eq!(layout.start_new_game_button.w, 0);
+    assert_eq!(layout.start_new_game_button.h, 0);
+}
+
+#[test]
+fn draw_skilltree_draws_dependency_arrows() {
+    let width = 800u32;
+    let height = 600u32;
+    let mut frame = vec![0u8; (width * height * 4) as usize];
+
+    let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
+    let mut ui_tree = UiTree::new();
+    ui_tree.ensure_canvas(UI_CANVAS, ui::Rect::from_size(width, height));
+    ui_tree.add_root(UI_CANVAS);
+    let runtime = SkillTreeRuntime::load_default();
+    draw_skilltree_runtime_with_ui(&mut gfx, width, height, &mut ui_tree, &runtime);
+
+    let link_color = [110u8, 110, 150, 255];
+    let found = frame
+        .chunks_exact(4)
+        .any(|px| px == link_color);
+    assert!(found, "expected dependency arrow pixel to be drawn");
+}
+

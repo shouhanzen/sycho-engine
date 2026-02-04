@@ -6,6 +6,7 @@ pub mod recording;
 pub mod regression;
 pub mod profiling;
 pub mod ui;
+pub mod ui_tree;
 pub mod graphics;
 pub mod pixels_renderer;
 
@@ -21,6 +22,8 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 pub struct TimeMachine<State> {
     states: Vec<State>,
     frame: usize,
+    #[serde(default = "default_record_every_n_frames")]
+    record_every_n_frames: usize,
 }
 
 impl<State> TimeMachine<State> {
@@ -28,11 +31,20 @@ impl<State> TimeMachine<State> {
         Self {
             states: vec![initial_state],
             frame: 0,
+            record_every_n_frames: default_record_every_n_frames(),
         }
     }
 
     pub fn frame(&self) -> usize {
         self.frame
+    }
+
+    pub fn record_every_n_frames(&self) -> usize {
+        self.record_every_n_frames.max(1)
+    }
+
+    pub fn set_record_every_n_frames(&mut self, frames: usize) {
+        self.record_every_n_frames = frames.max(1);
     }
 
     pub fn len(&self) -> usize {
@@ -119,7 +131,7 @@ impl<State> TimeMachine<State> {
         let path = path.as_ref();
         let file = fs::File::open(path)?;
         let reader = BufReader::new(file);
-        let tm: Self =
+        let mut tm: Self =
             serde_json::from_reader(reader).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         if tm.states.is_empty() {
@@ -139,12 +151,20 @@ impl<State> TimeMachine<State> {
             ));
         }
 
+        if tm.record_every_n_frames == 0 {
+            tm.record_every_n_frames = default_record_every_n_frames();
+        }
+
         Ok(tm)
     }
 }
 
+fn default_record_every_n_frames() -> usize {
+    1
+}
+
 pub trait GameLogic {
-    type State;
+    type State: Clone;
     type Input;
 
     fn initial_state(&self) -> Self::State;
@@ -155,6 +175,8 @@ pub trait GameLogic {
 pub struct HeadlessRunner<G: GameLogic> {
     game: G,
     timemachine: TimeMachine<G::State>,
+    state: G::State,
+    absolute_frame: usize,
 }
 
 impl<G: GameLogic> HeadlessRunner<G> {
@@ -162,20 +184,47 @@ impl<G: GameLogic> HeadlessRunner<G> {
         let initial_state = game.initial_state();
         Self {
             game,
-            timemachine: TimeMachine::new(initial_state),
+            timemachine: TimeMachine::new(initial_state.clone()),
+            state: initial_state,
+            absolute_frame: 0,
         }
     }
 
     pub fn from_timemachine(game: G, timemachine: TimeMachine<G::State>) -> Self {
-        Self { game, timemachine }
+        let state = timemachine.state().clone();
+        let absolute_frame = timemachine
+            .frame()
+            .saturating_mul(timemachine.record_every_n_frames());
+        Self {
+            game,
+            timemachine,
+            state,
+            absolute_frame,
+        }
     }
 
     pub fn frame(&self) -> usize {
         self.timemachine.frame()
     }
 
+    pub fn absolute_frame(&self) -> usize {
+        self.absolute_frame
+    }
+
+    pub fn record_every_n_frames(&self) -> usize {
+        self.timemachine.record_every_n_frames()
+    }
+
+    pub fn set_record_every_n_frames(&mut self, frames: usize) {
+        self.timemachine.set_record_every_n_frames(frames);
+    }
+
     pub fn state(&self) -> &G::State {
-        self.timemachine.state()
+        &self.state
+    }
+
+    pub fn state_mut(&mut self) -> &mut G::State {
+        &mut self.state
     }
 
     pub fn history(&self) -> &[G::State] {
@@ -187,8 +236,15 @@ impl<G: GameLogic> HeadlessRunner<G> {
     }
 
     pub fn step(&mut self, input: G::Input) -> usize {
-        let next_state = self.game.step(self.timemachine.state(), input);
-        self.timemachine.record(next_state)
+        let next_state = self.game.step(&self.state, input);
+        self.state = next_state.clone();
+        self.absolute_frame = self.absolute_frame.saturating_add(1);
+
+        if self.absolute_frame % self.timemachine.record_every_n_frames() == 0 {
+            self.timemachine.record(next_state)
+        } else {
+            self.timemachine.frame()
+        }
     }
 
     pub fn step_profiled<P: profiling::Profiler>(&mut self, input: G::Input, profiler: &mut P) -> usize {
@@ -197,12 +253,22 @@ impl<G: GameLogic> HeadlessRunner<G> {
         let total_start = Instant::now();
 
         let step_start = Instant::now();
-        let next_state = self.game.step(self.timemachine.state(), input);
+        let next_state = self.game.step(&self.state, input);
         let step_dt = step_start.elapsed();
 
         let record_start = Instant::now();
-        let frame = self.timemachine.record(next_state);
-        let record_dt = record_start.elapsed();
+        self.state = next_state.clone();
+        self.absolute_frame = self.absolute_frame.saturating_add(1);
+        let frame = if self.absolute_frame % self.timemachine.record_every_n_frames() == 0 {
+            self.timemachine.record(next_state)
+        } else {
+            self.timemachine.frame()
+        };
+        let record_dt = if self.absolute_frame % self.timemachine.record_every_n_frames() == 0 {
+            record_start.elapsed()
+        } else {
+            std::time::Duration::ZERO
+        };
 
         let total_dt = total_start.elapsed();
         profiler.on_step(
@@ -229,15 +295,24 @@ impl<G: GameLogic> HeadlessRunner<G> {
     }
 
     pub fn rewind(&mut self, frames: usize) -> usize {
-        self.timemachine.rewind(frames)
+        let frame = self.timemachine.rewind(frames);
+        self.state = self.timemachine.state().clone();
+        self.absolute_frame = frame.saturating_mul(self.timemachine.record_every_n_frames());
+        frame
     }
 
     pub fn forward(&mut self, frames: usize) -> usize {
-        self.timemachine.forward(frames)
+        let frame = self.timemachine.forward(frames);
+        self.state = self.timemachine.state().clone();
+        self.absolute_frame = frame.saturating_mul(self.timemachine.record_every_n_frames());
+        frame
     }
 
     pub fn seek(&mut self, frame: usize) -> usize {
-        self.timemachine.seek(frame)
+        let frame = self.timemachine.seek(frame);
+        self.state = self.timemachine.state().clone();
+        self.absolute_frame = frame.saturating_mul(self.timemachine.record_every_n_frames());
+        frame
     }
 }
 
@@ -331,5 +406,42 @@ mod tests {
         let t = capture.timings[0];
         assert!(t.total >= t.step);
         assert!(t.total >= t.record);
+    }
+
+    #[test]
+    fn runner_records_every_n_frames() {
+        struct Additive;
+
+        impl GameLogic for Additive {
+            type State = i32;
+            type Input = i32;
+
+            fn initial_state(&self) -> Self::State {
+                0
+            }
+
+            fn step(&self, state: &Self::State, input: Self::Input) -> Self::State {
+                *state + input
+            }
+        }
+
+        let mut runner = HeadlessRunner::new(Additive);
+        runner.set_record_every_n_frames(2);
+        assert_eq!(runner.record_every_n_frames(), 2);
+
+        runner.step(1);
+        assert_eq!(runner.state(), &1);
+        assert_eq!(runner.frame(), 0);
+        assert_eq!(runner.history().len(), 1);
+
+        runner.step(1);
+        assert_eq!(runner.state(), &2);
+        assert_eq!(runner.frame(), 1);
+        assert_eq!(runner.history().len(), 2);
+
+        runner.step(1);
+        assert_eq!(runner.state(), &3);
+        assert_eq!(runner.frame(), 1);
+        assert_eq!(runner.history().len(), 2);
     }
 }

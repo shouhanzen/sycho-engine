@@ -3,7 +3,7 @@ use engine::{GameLogic, HeadlessRunner};
 #[derive(Debug)]
 struct CounterGame;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CounterState {
     value: i32,
 }

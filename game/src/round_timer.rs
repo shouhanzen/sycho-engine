@@ -1,9 +1,13 @@
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 /// A tiny helper for "time boxed" game sessions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoundTimer {
+    #[serde(with = "crate::serde_duration")]
     elapsed: Duration,
+    #[serde(with = "crate::serde_duration")]
     limit: Duration,
 }
 

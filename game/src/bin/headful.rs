@@ -12,6 +12,7 @@ use engine::editor::{EditorSnapshot, EditorTimeline};
 use engine::profiling::{Profiler, StepTimings};
 use engine::pixels_renderer::PixelsRenderer2d;
 use engine::surface::SurfaceSize;
+use engine::ui_tree::{UiEvent, UiInput, UiTree};
 use pixels::{Pixels, PixelsBuilder, SurfaceTexture};
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
 use winit::{
@@ -25,24 +26,26 @@ use game::debug::DebugHud;
 use game::headful_editor_api::{RemoteCmd, RemoteServer};
 use game::playtest::{InputAction, TetrisLogic};
 use game::round_timer::RoundTimer;
+use game::state::{GameState, DEFAULT_GRAVITY_INTERVAL, DEFAULT_ROUND_LIMIT};
 use game::skilltree::{
     clamp_camera_min_to_bounds, skilltree_world_bounds, SkillTreeEditorTool, SkillTreeRunMods,
     SkillTreeRuntime, Vec2f,
 };
 use game::sfx::{ACTION_SFX_VOLUME, MUSIC_VOLUME};
-use game::tetris_core::{Piece, TetrisCore, Vec2i};
+use game::tetris_core::{Piece, Vec2i};
 use game::tetris_ui::{
-    draw_game_over_menu_with_cursor, draw_main_menu_with_cursor, draw_pause_menu_with_cursor,
-    draw_skilltree_runtime_with_cursor, draw_tetris_hud_with_cursor, draw_tetris_world, GameOverMenuLayout,
+    draw_game_over_menu_with_ui, draw_main_menu_with_ui, draw_pause_menu_with_ui,
+    draw_skilltree_runtime_with_ui, draw_tetris_hud_with_ui, draw_tetris_world, GameOverMenuLayout,
     MainMenuLayout, PauseMenuLayout, Rect, SkillTreeLayout, UiLayout,
 };
+use game::ui_ids::*;
 use game::view::{GameView, GameViewEffect, GameViewEvent};
 
-fn money_earned_from_run(state: &TetrisCore) -> u32 {
+fn money_earned_from_run(state: &GameState) -> u32 {
     // Simple, deterministic conversion from in-run performance to meta-currency.
     // Tunable later; for now it makes the buy-loop visible quickly.
-    let score = state.score();
-    let lines = state.lines_cleared();
+    let score = state.tetris.score();
+    let lines = state.tetris.lines_cleared();
     score / 10 + lines.saturating_mul(5)
 }
 
@@ -194,25 +197,28 @@ fn run_tuning_from_mods(base_round_limit: Duration, base_gravity_interval: Durat
 fn reset_run(
     runner: &mut HeadlessRunner<TetrisLogic>,
     base_logic: &TetrisLogic,
-    skilltree: &SkillTreeRuntime,
     base_round_limit: Duration,
     base_gravity_interval: Duration,
-    round_timer: &mut RoundTimer,
-    gravity_interval: &mut Duration,
-    last_gravity: &mut Instant,
     horizontal_repeat: &mut HorizontalRepeat,
 ) {
+    let skilltree = runner.state().skilltree.clone();
+    let view = runner.state().view;
     let mods = skilltree.run_mods();
     let tuning = run_tuning_from_mods(base_round_limit, base_gravity_interval, mods);
 
     let logic = base_logic
         .clone()
         .with_score_bonus_per_line(tuning.score_bonus_per_line);
-    *runner = HeadlessRunner::new(logic);
-
-    *round_timer = RoundTimer::new(tuning.round_limit);
-    *gravity_interval = tuning.gravity_interval;
-    *last_gravity = Instant::now();
+    let mut next_runner = HeadlessRunner::new(logic);
+    {
+        let state = next_runner.state_mut();
+        state.skilltree = skilltree;
+        state.view = view;
+        state.round_timer = RoundTimer::new(tuning.round_limit);
+        state.gravity_interval = tuning.gravity_interval;
+        state.gravity_elapsed = Duration::ZERO;
+    }
+    *runner = next_runner;
     horizontal_repeat.clear();
 }
 
@@ -847,37 +853,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let base_logic = TetrisLogic::new(0, Piece::all());
     let mut runner = if let Some(path) = replay_path.as_ref() {
-        let tm = TimeMachine::<TetrisCore>::load_json_file(path)?;
+        let tm = TimeMachine::<GameState>::load_json_file(path)?;
         let mut runner = HeadlessRunner::from_timemachine(base_logic.clone(), tm);
         runner.seek(0);
         runner
     } else {
         HeadlessRunner::new(base_logic.clone())
     };
+    if let Some(record_every) = env_usize("ROLLOUT_RECORD_EVERY_N_FRAMES") {
+        runner.set_record_every_n_frames(record_every.max(1));
+    }
     let sfx = Sfx::new().ok();
     let mut debug_hud = DebugHud::new();
-    let mut skilltree = SkillTreeRuntime::load_default();
+    let mut ui_tree = UiTree::new();
     let mut last_layout = UiLayout::default();
     let mut last_main_menu = MainMenuLayout::default();
     let mut last_pause_menu = PauseMenuLayout::default();
     let mut last_skilltree = SkillTreeLayout::default();
     let mut last_game_over_menu = GameOverMenuLayout::default();
-    let mut view = if profiling || replay_mode {
-        GameView::Tetris { paused: false }
-    } else {
-        GameView::MainMenu
-    };
     let mut mouse_x: u32 = 0;
     let mut mouse_y: u32 = 0;
     let mut skilltree_cam_input = SkillTreeCameraInput::default();
 
-    let mut last_gravity = Instant::now();
-    let base_gravity_interval = Duration::from_millis(500);
-    let mut gravity_interval = base_gravity_interval;
+    let base_gravity_interval = DEFAULT_GRAVITY_INTERVAL;
     let mut last_frame = Instant::now();
     let mut horizontal_repeat = HorizontalRepeat::default();
-    let base_round_limit = Duration::from_secs(20);
-    let mut round_timer = RoundTimer::new(base_round_limit);
+    let base_round_limit = DEFAULT_ROUND_LIMIT;
+
+    if !replay_mode {
+        let state = runner.state_mut();
+        state.view = if profiling {
+            GameView::Tetris { paused: false }
+        } else {
+            GameView::MainMenu
+        };
+        state.skilltree = SkillTreeRuntime::load_default();
+        state.round_timer = RoundTimer::new(base_round_limit);
+        state.gravity_interval = base_gravity_interval;
+        state.gravity_elapsed = Duration::ZERO;
+    }
 
     // Cap redraw rate to avoid burning CPU in a busy loop (ControlFlow::Poll).
     // Rendering is cheap in release; uncapped redraw mostly wastes CPU/power.
@@ -909,6 +923,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let new_x = position.x.max(0.0) as u32;
                     let new_y = position.y.max(0.0) as u32;
 
+                    let view = runner.state().view;
                     if matches!(view, GameView::SkillTree)
                         && skilltree_cam_input.left_down
                         && skilltree_cam_input.drag_started_in_view
@@ -930,12 +945,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if skilltree_cam_input.drag_started && (dx != 0 || dy != 0) {
                             let cell_px = (last_skilltree.grid_cell as f32).max(1.0);
                             // "Grab" drag: dragging right moves the world right (camera pans left).
+                            let skilltree = &mut runner.state_mut().skilltree;
                             skilltree.camera.pan.x -= dx as f32 / cell_px;
                             skilltree.camera.pan.y += dy as f32 / cell_px;
                             skilltree.camera.target_pan = skilltree.camera.pan;
 
                             clamp_skilltree_camera_to_bounds(
-                                &mut skilltree,
+                                skilltree,
                                 last_skilltree.grid_cols,
                                 last_skilltree.grid_rows,
                             );
@@ -947,11 +963,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     mouse_x = new_x;
                     mouse_y = new_y;
+                    let _ = ui_tree.process_input(UiInput {
+                        mouse_pos: Some((mouse_x, mouse_y)),
+                        mouse_down: false,
+                        mouse_up: false,
+                    });
                 }
                 WindowEvent::MouseWheel { delta, .. } => {
                     if replay_mode {
                         return;
                     }
+                    let view = runner.state().view;
                     if !matches!(view, GameView::SkillTree) {
                         return;
                     }
@@ -974,125 +996,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if debug_hud.handle_click(mouse_x, mouse_y, size.width, size.height) {
                         return;
                     }
-                    match view {
-                        GameView::MainMenu => {
-                            if last_main_menu.start_button.contains(mouse_x, mouse_y) {
-                                let (next, effect) = view.handle(GameViewEvent::StartGame);
-                                view = next;
-                                if matches!(effect, GameViewEffect::ResetTetris) {
-                                    reset_run(
-                                        &mut runner,
-                                        &base_logic,
-                                        &skilltree,
-                                        base_round_limit,
-                                        base_gravity_interval,
-                                        &mut round_timer,
-                                        &mut gravity_interval,
-                                        &mut last_gravity,
-                                        &mut horizontal_repeat,
-                                    );
-                                }
-                                if let Some(sfx) = sfx.as_ref() {
-                                    sfx.play_click(ACTION_SFX_VOLUME);
-                                }
-                            } else if last_main_menu
-                                .skilltree_editor_button
-                                .contains(mouse_x, mouse_y)
-                            {
-                                let (next, _) = view.handle(GameViewEvent::OpenSkillTreeEditor);
-                                view = next;
-                                horizontal_repeat.clear();
-                                if !skilltree.editor.enabled {
-                                    skilltree.editor_toggle();
-                                }
-                                if let Some(sfx) = sfx.as_ref() {
-                                    sfx.play_click(ACTION_SFX_VOLUME);
-                                }
-                            } else if last_main_menu.quit_button.contains(mouse_x, mouse_y) {
-                                *control_flow = ControlFlow::Exit;
-                            }
-                        }
-                        GameView::SkillTree => {
-                            // SkillTree uses left-button drag panning. We defer click actions until
-                            // release so we can distinguish click vs drag.
-                            skilltree_cam_input.left_down = true;
-                            skilltree_cam_input.drag_started = false;
-                            skilltree_cam_input.drag_started_in_view = skilltree_grid_viewport(last_skilltree)
-                                .map(|r| r.contains(mouse_x, mouse_y))
-                                .unwrap_or(false);
-                            skilltree_cam_input.down_x = mouse_x;
-                            skilltree_cam_input.down_y = mouse_y;
-                            skilltree_cam_input.last_x = mouse_x;
-                            skilltree_cam_input.last_y = mouse_y;
-                        }
-                        GameView::Tetris { paused } => {
-                            if last_layout.pause_button.contains(mouse_x, mouse_y) {
-                                let (next, _) = view.handle(GameViewEvent::TogglePause);
-                                view = next;
-                                last_gravity = Instant::now();
-                                if let Some(sfx) = sfx.as_ref() {
-                                    sfx.play_click(ACTION_SFX_VOLUME);
-                                }
-                            } else if paused {
-                                if last_pause_menu.resume_button.contains(mouse_x, mouse_y) {
-                                    let (next, _) = view.handle(GameViewEvent::TogglePause);
-                                    view = next;
-                                    last_gravity = Instant::now();
-                                    if let Some(sfx) = sfx.as_ref() {
-                                        sfx.play_click(ACTION_SFX_VOLUME);
-                                    }
-                                } else if last_pause_menu.end_run_button.contains(mouse_x, mouse_y) {
-                                    let earned = money_earned_from_run(runner.state());
-                                    if earned > 0 {
-                                        skilltree.add_money(earned);
-                                    }
-                                    let (next, _) = view.handle(GameViewEvent::GameOver);
-                                    view = next;
-                                    horizontal_repeat.clear();
-                                    if let Some(sfx) = sfx.as_ref() {
-                                        sfx.play_click(ACTION_SFX_VOLUME);
-                                    }
-                                }
-                            } else if last_layout.hold_panel.contains(mouse_x, mouse_y) {
-                                apply_action(
-                                    &mut runner,
-                                    sfx.as_ref(),
-                                    &mut debug_hud,
-                                    InputAction::Hold,
-                                );
-                            }
-                        }
-                        GameView::GameOver => {
-                            if last_game_over_menu.restart_button.contains(mouse_x, mouse_y) {
-                                let (next, effect) = view.handle(GameViewEvent::StartGame);
-                                view = next;
-                                if matches!(effect, GameViewEffect::ResetTetris) {
-                                    reset_run(
-                                        &mut runner,
-                                        &base_logic,
-                                        &skilltree,
-                                        base_round_limit,
-                                        base_gravity_interval,
-                                        &mut round_timer,
-                                        &mut gravity_interval,
-                                        &mut last_gravity,
-                                        &mut horizontal_repeat,
-                                    );
-                                }
-                                if let Some(sfx) = sfx.as_ref() {
-                                    sfx.play_click(ACTION_SFX_VOLUME);
-                                }
-                            } else if last_game_over_menu.skilltree_button.contains(mouse_x, mouse_y) {
-                                let (next, _) = view.handle(GameViewEvent::OpenSkillTree);
-                                view = next;
-                                horizontal_repeat.clear();
-                                if let Some(sfx) = sfx.as_ref() {
-                                    sfx.play_click(ACTION_SFX_VOLUME);
-                                }
-                            } else if last_game_over_menu.quit_button.contains(mouse_x, mouse_y) {
-                                *control_flow = ControlFlow::Exit;
-                            }
-                        }
+                    let _ = ui_tree.process_input(UiInput {
+                        mouse_pos: Some((mouse_x, mouse_y)),
+                        mouse_down: true,
+                        mouse_up: false,
+                    });
+                    let view = runner.state().view;
+                    if matches!(view, GameView::SkillTree) {
+                        // SkillTree uses left-button drag panning. We defer click actions until
+                        // release so we can distinguish click vs drag.
+                        skilltree_cam_input.left_down = true;
+                        skilltree_cam_input.drag_started = false;
+                        skilltree_cam_input.drag_started_in_view = skilltree_grid_viewport(last_skilltree)
+                            .map(|r| r.contains(mouse_x, mouse_y))
+                            .unwrap_or(false);
+                        skilltree_cam_input.down_x = mouse_x;
+                        skilltree_cam_input.down_y = mouse_y;
+                        skilltree_cam_input.last_x = mouse_x;
+                        skilltree_cam_input.last_y = mouse_y;
                     }
                 }
                 WindowEvent::MouseInput {
@@ -1104,24 +1025,277 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         return;
                     }
 
-                    let was_down = skilltree_cam_input.left_down;
                     let was_drag = skilltree_cam_input.drag_started;
                     skilltree_cam_input.left_down = false;
                     skilltree_cam_input.drag_started = false;
                     skilltree_cam_input.drag_started_in_view = false;
 
-                    if !was_down || !matches!(view, GameView::SkillTree) || was_drag {
+                    let ui_events = ui_tree.process_input(UiInput {
+                        mouse_pos: Some((mouse_x, mouse_y)),
+                        mouse_down: false,
+                        mouse_up: true,
+                    });
+                    let mut ui_handled = false;
+                    for event in ui_events {
+                        if let UiEvent::Click {
+                            action: Some(action),
+                            ..
+                        } = event
+                        {
+                            match action {
+                                ACTION_MAIN_MENU_START => {
+                                    let view = runner.state().view;
+                                    if matches!(view, GameView::MainMenu) {
+                                        let (next, effect) = view.handle(GameViewEvent::StartGame);
+                                        runner.state_mut().view = next;
+                                        if matches!(effect, GameViewEffect::ResetTetris) {
+                                            reset_run(
+                                                &mut runner,
+                                                &base_logic,
+                                                base_round_limit,
+                                                base_gravity_interval,
+                                                &mut horizontal_repeat,
+                                            );
+                                        }
+                                        if let Some(sfx) = sfx.as_ref() {
+                                            sfx.play_click(ACTION_SFX_VOLUME);
+                                        }
+                                        ui_handled = true;
+                                    }
+                                }
+                                ACTION_MAIN_MENU_SKILLTREE_EDITOR => {
+                                    let view = runner.state().view;
+                                    if matches!(view, GameView::MainMenu) {
+                                        let (next, _) = view.handle(GameViewEvent::OpenSkillTreeEditor);
+                                        runner.state_mut().view = next;
+                                        horizontal_repeat.clear();
+                                        let skilltree = &mut runner.state_mut().skilltree;
+                                        if !skilltree.editor.enabled {
+                                            skilltree.editor_toggle();
+                                        }
+                                        if let Some(sfx) = sfx.as_ref() {
+                                            sfx.play_click(ACTION_SFX_VOLUME);
+                                        }
+                                        ui_handled = true;
+                                    }
+                                }
+                                ACTION_MAIN_MENU_QUIT => {
+                                    let view = runner.state().view;
+                                    if matches!(view, GameView::MainMenu) {
+                                        *control_flow = ControlFlow::Exit;
+                                        ui_handled = true;
+                                    }
+                                }
+                                ACTION_TETRIS_TOGGLE_PAUSE => {
+                                    let view = runner.state().view;
+                                    if view.is_tetris() {
+                                        let (next, _) = view.handle(GameViewEvent::TogglePause);
+                                        let state = runner.state_mut();
+                                        state.view = next;
+                                        state.gravity_elapsed = Duration::ZERO;
+                                        if let Some(sfx) = sfx.as_ref() {
+                                            sfx.play_click(ACTION_SFX_VOLUME);
+                                        }
+                                        ui_handled = true;
+                                    }
+                                }
+                                ACTION_TETRIS_HOLD => {
+                                    let view = runner.state().view;
+                                    if matches!(view, GameView::Tetris { paused: false }) {
+                                        apply_action(
+                                            &mut runner,
+                                            sfx.as_ref(),
+                                            &mut debug_hud,
+                                            InputAction::Hold,
+                                        );
+                                        ui_handled = true;
+                                    }
+                                }
+                                ACTION_PAUSE_RESUME => {
+                                    let view = runner.state().view;
+                                    if matches!(view, GameView::Tetris { paused: true }) {
+                                        let (next, _) = view.handle(GameViewEvent::TogglePause);
+                                        let state = runner.state_mut();
+                                        state.view = next;
+                                        state.gravity_elapsed = Duration::ZERO;
+                                        if let Some(sfx) = sfx.as_ref() {
+                                            sfx.play_click(ACTION_SFX_VOLUME);
+                                        }
+                                        ui_handled = true;
+                                    }
+                                }
+                                ACTION_PAUSE_END_RUN => {
+                                    let view = runner.state().view;
+                                    if matches!(view, GameView::Tetris { paused: true }) {
+                                        let earned = money_earned_from_run(runner.state());
+                                        if earned > 0 {
+                                            runner.state_mut().skilltree.add_money(earned);
+                                        }
+                                        let (next, _) = view.handle(GameViewEvent::GameOver);
+                                        runner.state_mut().view = next;
+                                        horizontal_repeat.clear();
+                                        if let Some(sfx) = sfx.as_ref() {
+                                            sfx.play_click(ACTION_SFX_VOLUME);
+                                        }
+                                        ui_handled = true;
+                                    }
+                                }
+                                ACTION_GAME_OVER_RESTART => {
+                                    let view = runner.state().view;
+                                    if matches!(view, GameView::GameOver) {
+                                        let (next, effect) = view.handle(GameViewEvent::StartGame);
+                                        runner.state_mut().view = next;
+                                        if matches!(effect, GameViewEffect::ResetTetris) {
+                                            reset_run(
+                                                &mut runner,
+                                                &base_logic,
+                                                base_round_limit,
+                                                base_gravity_interval,
+                                                &mut horizontal_repeat,
+                                            );
+                                        }
+                                        if let Some(sfx) = sfx.as_ref() {
+                                            sfx.play_click(ACTION_SFX_VOLUME);
+                                        }
+                                        ui_handled = true;
+                                    }
+                                }
+                                ACTION_GAME_OVER_SKILLTREE => {
+                                    let view = runner.state().view;
+                                    if matches!(view, GameView::GameOver) {
+                                        let (next, _) = view.handle(GameViewEvent::OpenSkillTree);
+                                        runner.state_mut().view = next;
+                                        horizontal_repeat.clear();
+                                        if let Some(sfx) = sfx.as_ref() {
+                                            sfx.play_click(ACTION_SFX_VOLUME);
+                                        }
+                                        ui_handled = true;
+                                    }
+                                }
+                                ACTION_GAME_OVER_QUIT => {
+                                    let view = runner.state().view;
+                                    if matches!(view, GameView::GameOver) {
+                                        *control_flow = ControlFlow::Exit;
+                                        ui_handled = true;
+                                    }
+                                }
+                                ACTION_SKILLTREE_START_RUN => {
+                                    let view = runner.state().view;
+                                    let skilltree_editor_enabled = runner.state().skilltree.editor.enabled;
+                                    if matches!(view, GameView::SkillTree) && !skilltree_editor_enabled {
+                                        let (next, effect) = view.handle(GameViewEvent::StartGame);
+                                        runner.state_mut().view = next;
+                                        if matches!(effect, GameViewEffect::ResetTetris) {
+                                            reset_run(
+                                                &mut runner,
+                                                &base_logic,
+                                                base_round_limit,
+                                                base_gravity_interval,
+                                                &mut horizontal_repeat,
+                                            );
+                                        }
+                                        if let Some(sfx) = sfx.as_ref() {
+                                            sfx.play_click(ACTION_SFX_VOLUME);
+                                        }
+                                        ui_handled = true;
+                                    }
+                                }
+                                ACTION_SKILLTREE_TOOL_SELECT => {
+                                    let view = runner.state().view;
+                                    let skilltree = &mut runner.state_mut().skilltree;
+                                    if matches!(view, GameView::SkillTree) && skilltree.editor.enabled {
+                                        skilltree.editor_set_tool(SkillTreeEditorTool::Select);
+                                        if let Some(sfx) = sfx.as_ref() {
+                                            sfx.play_click(ACTION_SFX_VOLUME);
+                                        }
+                                        ui_handled = true;
+                                    }
+                                }
+                                ACTION_SKILLTREE_TOOL_MOVE => {
+                                    let view = runner.state().view;
+                                    let skilltree = &mut runner.state_mut().skilltree;
+                                    if matches!(view, GameView::SkillTree) && skilltree.editor.enabled {
+                                        skilltree.editor_set_tool(SkillTreeEditorTool::Move);
+                                        if let Some(sfx) = sfx.as_ref() {
+                                            sfx.play_click(ACTION_SFX_VOLUME);
+                                        }
+                                        ui_handled = true;
+                                    }
+                                }
+                                ACTION_SKILLTREE_TOOL_ADD_CELL => {
+                                    let view = runner.state().view;
+                                    let skilltree = &mut runner.state_mut().skilltree;
+                                    if matches!(view, GameView::SkillTree) && skilltree.editor.enabled {
+                                        skilltree.editor_set_tool(SkillTreeEditorTool::AddCell);
+                                        if let Some(sfx) = sfx.as_ref() {
+                                            sfx.play_click(ACTION_SFX_VOLUME);
+                                        }
+                                        ui_handled = true;
+                                    }
+                                }
+                                ACTION_SKILLTREE_TOOL_REMOVE_CELL => {
+                                    let view = runner.state().view;
+                                    let skilltree = &mut runner.state_mut().skilltree;
+                                    if matches!(view, GameView::SkillTree) && skilltree.editor.enabled {
+                                        skilltree.editor_set_tool(SkillTreeEditorTool::RemoveCell);
+                                        if let Some(sfx) = sfx.as_ref() {
+                                            sfx.play_click(ACTION_SFX_VOLUME);
+                                        }
+                                        ui_handled = true;
+                                    }
+                                }
+                                ACTION_SKILLTREE_TOOL_LINK => {
+                                    let view = runner.state().view;
+                                    let skilltree = &mut runner.state_mut().skilltree;
+                                    if matches!(view, GameView::SkillTree) && skilltree.editor.enabled {
+                                        skilltree.editor_set_tool(SkillTreeEditorTool::ConnectPrereqs);
+                                        if let Some(sfx) = sfx.as_ref() {
+                                            sfx.play_click(ACTION_SFX_VOLUME);
+                                        }
+                                        ui_handled = true;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    if ui_handled {
                         return;
                     }
 
-                    if skilltree.editor.enabled {
-                        if let Some(world) =
-                            skilltree_world_cell_at_screen(&skilltree, last_skilltree, mouse_x, mouse_y)
-                        {
+                    let view = runner.state().view;
+                    if !matches!(view, GameView::SkillTree) {
+                        return;
+                    }
+                    if was_drag {
+                        return;
+                    }
+
+                    let skilltree_editor_enabled = runner.state().skilltree.editor.enabled;
+                    if skilltree_editor_enabled {
+                        if let Some(world) = skilltree_world_cell_at_screen(
+                            &runner.state().skilltree,
+                            last_skilltree,
+                            mouse_x,
+                            mouse_y,
+                        ) {
+                            let skilltree = &mut runner.state_mut().skilltree;
                             let hit_id =
-                                skilltree_node_at_world(&skilltree, world).map(|s| s.to_string());
+                                skilltree_node_at_world(skilltree, world).map(|s| s.to_string());
+
                             match skilltree.editor.tool {
-                                SkillTreeEditorTool::SelectMove => {
+                                SkillTreeEditorTool::Select => {
+                                    if let Some(id) = hit_id {
+                                        skilltree.editor_select(&id, None);
+                                        if let Some(sfx) = sfx.as_ref() {
+                                            sfx.play_click(ACTION_SFX_VOLUME);
+                                        }
+                                    } else {
+                                        skilltree.editor_clear_selection();
+                                    }
+                                }
+                                SkillTreeEditorTool::Move => {
                                     if let Some(id) = hit_id {
                                         if let Some(idx) = skilltree.node_index(&id) {
                                             let pos = skilltree.def.nodes[idx].pos;
@@ -1146,7 +1320,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                     }
                                 }
-                                SkillTreeEditorTool::PaintCells => {
+                                SkillTreeEditorTool::AddCell => {
                                     if let Some(id) = hit_id {
                                         let already =
                                             skilltree.editor.selected.as_deref() == Some(id.as_str());
@@ -1158,7 +1332,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             return;
                                         }
                                     }
-                                    if skilltree.editor_toggle_cell_at_world(world) {
+                                    if skilltree.editor_add_cell_at_world(world) {
+                                        if let Some(sfx) = sfx.as_ref() {
+                                            sfx.play_click(ACTION_SFX_VOLUME);
+                                        }
+                                    }
+                                }
+                                SkillTreeEditorTool::RemoveCell => {
+                                    if let Some(id) = hit_id {
+                                        let already =
+                                            skilltree.editor.selected.as_deref() == Some(id.as_str());
+                                        if !already {
+                                            skilltree.editor_select(&id, None);
+                                            if let Some(sfx) = sfx.as_ref() {
+                                                sfx.play_click(ACTION_SFX_VOLUME);
+                                            }
+                                            return;
+                                        }
+                                    }
+                                    if skilltree.editor_remove_cell_at_world(world) {
                                         if let Some(sfx) = sfx.as_ref() {
                                             sfx.play_click(ACTION_SFX_VOLUME);
                                         }
@@ -1192,30 +1384,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         return;
                     }
 
-                    if last_skilltree.start_new_game_button.contains(mouse_x, mouse_y) {
-                        let (next, effect) = view.handle(GameViewEvent::StartGame);
-                        view = next;
-                        if matches!(effect, GameViewEffect::ResetTetris) {
-                            reset_run(
-                                &mut runner,
-                                &base_logic,
-                                &skilltree,
-                                base_round_limit,
-                                base_gravity_interval,
-                                &mut round_timer,
-                                &mut gravity_interval,
-                                &mut last_gravity,
-                                &mut horizontal_repeat,
-                            );
-                        }
-                        if let Some(sfx) = sfx.as_ref() {
-                            sfx.play_click(ACTION_SFX_VOLUME);
-                        }
-                    } else if let Some(world) =
-                        skilltree_world_cell_at_screen(&skilltree, last_skilltree, mouse_x, mouse_y)
-                    {
+                    if let Some(world) = skilltree_world_cell_at_screen(
+                        &runner.state().skilltree,
+                        last_skilltree,
+                        mouse_x,
+                        mouse_y,
+                    ) {
+                        let skilltree = &mut runner.state_mut().skilltree;
                         if let Some(node_id) =
-                            skilltree_node_at_world(&skilltree, world).map(|s| s.to_string())
+                            skilltree_node_at_world(skilltree, world).map(|s| s.to_string())
                         {
                             if skilltree.try_buy(&node_id) {
                                 if let Some(sfx) = sfx.as_ref() {
@@ -1296,21 +1473,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             return;
                         }
 
+                        let mut view = runner.state().view;
                         match view {
                             GameView::MainMenu => {
                                 if key == VirtualKeyCode::Return || key == VirtualKeyCode::Space {
                                     let (next, effect) = view.handle(GameViewEvent::StartGame);
                                     view = next;
+                                    runner.state_mut().view = view;
                                     if matches!(effect, GameViewEffect::ResetTetris) {
                                         reset_run(
                                             &mut runner,
                                             &base_logic,
-                                            &skilltree,
                                             base_round_limit,
                                             base_gravity_interval,
-                                            &mut round_timer,
-                                            &mut gravity_interval,
-                                            &mut last_gravity,
                                             &mut horizontal_repeat,
                                         );
                                     }
@@ -1320,7 +1495,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 } else if key == VirtualKeyCode::K {
                                     let (next, _) = view.handle(GameViewEvent::OpenSkillTreeEditor);
                                     view = next;
+                                    runner.state_mut().view = view;
                                     horizontal_repeat.clear();
+                                    let skilltree = &mut runner.state_mut().skilltree;
                                     if !skilltree.editor.enabled {
                                         skilltree.editor_toggle();
                                     }
@@ -1334,6 +1511,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             GameView::SkillTree => {
                                 if key == VirtualKeyCode::F4 {
+                                    let skilltree = &mut runner.state_mut().skilltree;
                                     skilltree.editor_toggle();
                                     if let Some(sfx) = sfx.as_ref() {
                                         sfx.play_click(ACTION_SFX_VOLUME);
@@ -1341,10 +1519,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     return;
                                 }
 
-                                if skilltree.editor.enabled {
+                                let skilltree_editor_enabled = runner.state().skilltree.editor.enabled;
+                                if skilltree_editor_enabled {
+                                    let skilltree = &mut runner.state_mut().skilltree;
                                     match key {
                                         VirtualKeyCode::Escape => {
                                             skilltree.editor_toggle();
+                                            let (next, _) = view.handle(GameViewEvent::Back);
+                                            view = next;
+                                            runner.state_mut().view = view;
+                                            horizontal_repeat.clear();
                                             if let Some(sfx) = sfx.as_ref() {
                                                 sfx.play_click(ACTION_SFX_VOLUME);
                                             }
@@ -1379,7 +1563,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             skilltree.camera.target_cell_px = skilltree.camera.cell_px;
                                         }
                                         VirtualKeyCode::N => {
-                                            if let Some(world) = skilltree_world_cell_at_screen(&skilltree, last_skilltree, mouse_x, mouse_y) {
+                                            if let Some(world) = skilltree_world_cell_at_screen(
+                                                skilltree,
+                                                last_skilltree,
+                                                mouse_x,
+                                                mouse_y,
+                                            ) {
                                                 skilltree.editor_create_node_at(world);
                                             }
                                         }
@@ -1410,6 +1599,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if key == VirtualKeyCode::Escape {
                                     let (next, _) = view.handle(GameViewEvent::Back);
                                     view = next;
+                                    runner.state_mut().view = view;
                                     horizontal_repeat.clear();
                                     if let Some(sfx) = sfx.as_ref() {
                                         sfx.play_click(ACTION_SFX_VOLUME);
@@ -1417,16 +1607,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 } else if key == VirtualKeyCode::Return || key == VirtualKeyCode::Space {
                                     let (next, effect) = view.handle(GameViewEvent::StartGame);
                                     view = next;
+                                    runner.state_mut().view = view;
                                     if matches!(effect, GameViewEffect::ResetTetris) {
                                         reset_run(
                                             &mut runner,
                                             &base_logic,
-                                            &skilltree,
                                             base_round_limit,
                                             base_gravity_interval,
-                                            &mut round_timer,
-                                            &mut gravity_interval,
-                                            &mut last_gravity,
                                             &mut horizontal_repeat,
                                         );
                                     }
@@ -1440,6 +1627,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if key == VirtualKeyCode::Escape {
                                     let (next, _) = view.handle(GameViewEvent::Back);
                                     view = next;
+                                    runner.state_mut().view = view;
                                     horizontal_repeat.clear();
                                     if let Some(sfx) = sfx.as_ref() {
                                         sfx.play_click(ACTION_SFX_VOLUME);
@@ -1447,16 +1635,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 } else if key == VirtualKeyCode::Return || key == VirtualKeyCode::Space {
                                     let (next, effect) = view.handle(GameViewEvent::StartGame);
                                     view = next;
+                                    runner.state_mut().view = view;
                                     if matches!(effect, GameViewEffect::ResetTetris) {
                                         reset_run(
                                             &mut runner,
                                             &base_logic,
-                                            &skilltree,
                                             base_round_limit,
                                             base_gravity_interval,
-                                            &mut round_timer,
-                                            &mut gravity_interval,
-                                            &mut last_gravity,
                                             &mut horizontal_repeat,
                                         );
                                     }
@@ -1466,6 +1651,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 } else if key == VirtualKeyCode::K {
                                     let (next, _) = view.handle(GameViewEvent::OpenSkillTree);
                                     view = next;
+                                    runner.state_mut().view = view;
                                     horizontal_repeat.clear();
                                     if let Some(sfx) = sfx.as_ref() {
                                         sfx.play_click(ACTION_SFX_VOLUME);
@@ -1477,7 +1663,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if key == VirtualKeyCode::Escape {
                                     let (next, _) = view.handle(GameViewEvent::TogglePause);
                                     view = next;
-                                    last_gravity = Instant::now();
+                                    {
+                                        let state = runner.state_mut();
+                                        state.view = view;
+                                        state.gravity_elapsed = Duration::ZERO;
+                                    }
                                     horizontal_repeat.clear();
                                     if let Some(sfx) = sfx.as_ref() {
                                         sfx.play_click(ACTION_SFX_VOLUME);
@@ -1527,6 +1717,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if replay_mode {
                             return;
                         }
+                        let view = runner.state().view;
                         if !view.is_tetris() {
                             return;
                         }
@@ -1601,12 +1792,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 reset_run(
                                     &mut runner,
                                     &base_logic,
-                                    &skilltree,
                                     base_round_limit,
                                     base_gravity_interval,
-                                    &mut round_timer,
-                                    &mut gravity_interval,
-                                    &mut last_gravity,
                                     &mut horizontal_repeat,
                                 );
                                 let _ = respond.send(snapshot(&runner));
@@ -1638,6 +1825,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // In profiling mode, we keep the run deterministic by stepping once per frame
                 // (in RedrawRequested) and ignoring real-time gravity / key repeat.
                 if trace.is_none() {
+                    let view = runner.state().view;
                     if view.is_tetris_playing() {
                         let now = Instant::now();
                         if let Some(action) = horizontal_repeat.next_repeat_action(now) {
@@ -1648,12 +1836,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 action,
                             );
                         }
-                    }
-                    if view.is_tetris_playing() && last_gravity.elapsed() >= gravity_interval {
-                        let gravity_start = Instant::now();
-                        runner.step_profiled(InputAction::SoftDrop, &mut debug_hud);
-                        debug_hud.record_gravity(gravity_start.elapsed());
-                        last_gravity = Instant::now();
                     }
                 }
                 let now = Instant::now();
@@ -1668,20 +1850,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 last_frame = now;
 
                 if !profiling && !replay_mode {
-                    round_timer.tick_if_running(frame_dt, view.is_tetris_playing());
-                    if view.is_tetris_playing() && round_timer.is_up() {
-                        let earned = money_earned_from_run(runner.state());
-                        if earned > 0 {
-                            skilltree.add_money(earned);
+                    let mut trigger_game_over = false;
+                    {
+                        let state = runner.state_mut();
+                        state
+                            .round_timer
+                            .tick_if_running(frame_dt, state.view.is_tetris_playing());
+                        if state.view.is_tetris_playing() && state.round_timer.is_up() {
+                            let earned = money_earned_from_run(state);
+                            if earned > 0 {
+                                state.skilltree.add_money(earned);
+                            }
+                            let (next, _) = state.view.handle(GameViewEvent::GameOver);
+                            state.view = next;
+                            state.gravity_elapsed = Duration::ZERO;
+                            trigger_game_over = true;
                         }
-                        let (next, _) = view.handle(GameViewEvent::GameOver);
-                        view = next;
+                    }
+                    if trigger_game_over {
                         horizontal_repeat.clear();
                     }
                 }
 
+                if trace.is_none() && !replay_mode {
+                    let mut gravity_steps = 0usize;
+                    {
+                        let state = runner.state_mut();
+                        if state.view.is_tetris_playing() {
+                            state.gravity_elapsed = state.gravity_elapsed.saturating_add(frame_dt);
+                            while state.gravity_elapsed >= state.gravity_interval {
+                                state.gravity_elapsed = state.gravity_elapsed.saturating_sub(state.gravity_interval);
+                                gravity_steps = gravity_steps.saturating_add(1);
+                            }
+                        } else {
+                            state.gravity_elapsed = Duration::ZERO;
+                        }
+                    }
+                    for _ in 0..gravity_steps {
+                        let gravity_start = Instant::now();
+                        runner.step_profiled(InputAction::SoftDrop, &mut debug_hud);
+                        debug_hud.record_gravity(gravity_start.elapsed());
+                    }
+                }
+
+                let view = runner.state().view;
+
                 // SkillTree camera controller (mouse drag / edge pan / scroll zoom).
                 if matches!(view, GameView::SkillTree) {
+                    let skilltree = &mut runner.state_mut().skilltree;
                     let dt_s = frame_dt.as_secs_f32();
 
                     // Consume scroll input once per frame (if the cursor is over the grid viewport).
@@ -1744,7 +1960,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         skilltree.camera.target_pan.y = cam_min_y_new;
 
                                         clamp_skilltree_camera_to_bounds(
-                                            &mut skilltree,
+                                            skilltree,
                                             grid_cols_new,
                                             grid_rows_new,
                                         );
@@ -1799,7 +2015,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     skilltree.camera.target_pan.x += dx_cells;
                                     skilltree.camera.target_pan.y += dy_cells;
                                     clamp_skilltree_camera_to_bounds(
-                                        &mut skilltree,
+                                        skilltree,
                                         last_skilltree.grid_cols,
                                         last_skilltree.grid_rows,
                                     );
@@ -1808,25 +2024,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    // Lerp current towards target (edge-pan + zoom feel smooth).
+                    // Snap current to target (no lerp).
                     skilltree.camera.target_cell_px = skilltree
                         .camera
                         .target_cell_px
                         .clamp(SKILLTREE_CAMERA_MIN_CELL_PX, SKILLTREE_CAMERA_MAX_CELL_PX);
-                    let t_pan = smooth_t_from_rate(dt_s, SKILLTREE_CAMERA_PAN_LERP_RATE);
-                    let t_zoom = smooth_t_from_rate(dt_s, SKILLTREE_CAMERA_ZOOM_LERP_RATE);
-                    skilltree.camera.pan.x =
-                        lerp_f32(skilltree.camera.pan.x, skilltree.camera.target_pan.x, t_pan);
-                    skilltree.camera.pan.y =
-                        lerp_f32(skilltree.camera.pan.y, skilltree.camera.target_pan.y, t_pan);
-                    skilltree.camera.cell_px = lerp_f32(
-                        skilltree.camera.cell_px,
-                        skilltree.camera.target_cell_px,
-                        t_zoom,
-                    )
-                    .clamp(SKILLTREE_CAMERA_MIN_CELL_PX, SKILLTREE_CAMERA_MAX_CELL_PX);
+                    skilltree.camera.pan.x = skilltree.camera.target_pan.x;
+                    skilltree.camera.pan.y = skilltree.camera.target_pan.y;
+                    skilltree.camera.cell_px = skilltree
+                        .camera
+                        .target_cell_px
+                        .clamp(SKILLTREE_CAMERA_MIN_CELL_PX, SKILLTREE_CAMERA_MAX_CELL_PX);
                     clamp_skilltree_camera_to_bounds(
-                        &mut skilltree,
+                        skilltree,
                         last_skilltree.grid_cols,
                         last_skilltree.grid_rows,
                     );
@@ -1855,6 +2065,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let size = renderer.size();
 
+                ui_tree.begin_frame();
+                ui_tree.ensure_canvas(UI_CANVAS, Rect::from_size(size.width, size.height));
+                ui_tree.add_root(UI_CANVAS);
                 let (draw_start, draw_dt, overlay_start, overlay_dt) = match renderer.draw_frame(|gfx| {
                     let draw_start = Instant::now();
                     if matches!(view, GameView::SkillTree | GameView::MainMenu) {
@@ -1862,15 +2075,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         last_layout = UiLayout::default();
                     } else {
                         let tetris_layout =
-                            draw_tetris_world(gfx, size.width, size.height, state);
+                            draw_tetris_world(gfx, size.width, size.height, state.tetris());
                         if view.is_tetris() {
-                            draw_tetris_hud_with_cursor(
+                            draw_tetris_hud_with_ui(
                                 gfx,
                                 size.width,
                                 size.height,
-                                state,
+                                state.tetris(),
                                 tetris_layout,
-                                Some((mouse_x, mouse_y)),
+                                &mut ui_tree,
                             );
                         }
                         last_layout = tetris_layout;
@@ -1884,7 +2097,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .y
                             .saturating_add(6)
                             .saturating_add(28);
-                        let remaining_s = round_timer.remaining().as_secs_f32();
+                        let remaining_s = state.round_timer.remaining().as_secs_f32();
                         let timer_text = format!("TIME {remaining_s:>4.1}");
                         gfx.draw_text(hud_x, hud_y, &timer_text, [235, 235, 245, 255]);
                     }
@@ -1894,11 +2107,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let overlay_start = Instant::now();
                     match view {
                         GameView::MainMenu => {
-                            last_main_menu = draw_main_menu_with_cursor(
+                            last_main_menu = draw_main_menu_with_ui(
                                 gfx,
                                 size.width,
                                 size.height,
-                                Some((mouse_x, mouse_y)),
+                                &mut ui_tree,
                             );
                             last_pause_menu = PauseMenuLayout::default();
                             last_skilltree = SkillTreeLayout::default();
@@ -1907,22 +2120,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         GameView::SkillTree => {
                             last_main_menu = MainMenuLayout::default();
                             last_pause_menu = PauseMenuLayout::default();
-                            last_skilltree = draw_skilltree_runtime_with_cursor(
+                            last_skilltree = draw_skilltree_runtime_with_ui(
                                 gfx,
                                 size.width,
                                 size.height,
-                                Some((mouse_x, mouse_y)),
-                                &skilltree,
+                                &mut ui_tree,
+                                &state.skilltree,
                             );
                             last_game_over_menu = GameOverMenuLayout::default();
                         }
                         GameView::Tetris { paused: true } => {
                             last_main_menu = MainMenuLayout::default();
-                            last_pause_menu = draw_pause_menu_with_cursor(
+                            last_pause_menu = draw_pause_menu_with_ui(
                                 gfx,
                                 size.width,
                                 size.height,
-                                Some((mouse_x, mouse_y)),
+                                &mut ui_tree,
                             );
                             last_skilltree = SkillTreeLayout::default();
                             last_game_over_menu = GameOverMenuLayout::default();
@@ -1937,11 +2150,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             last_main_menu = MainMenuLayout::default();
                             last_pause_menu = PauseMenuLayout::default();
                             last_skilltree = SkillTreeLayout::default();
-                            last_game_over_menu = draw_game_over_menu_with_cursor(
+                            last_game_over_menu = draw_game_over_menu_with_ui(
                                 gfx,
                                 size.width,
                                 size.height,
-                                Some((mouse_x, mouse_y)),
+                                &mut ui_tree,
                             );
                         }
                     }

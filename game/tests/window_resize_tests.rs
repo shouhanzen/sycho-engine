@@ -15,7 +15,7 @@ fn headless_surface_resize_changes_buffer_size_and_allows_rendering() {
     assert_eq!(surface.frame().len(), 320 * 240 * 4);
 
     // Render once at the initial size.
-    let board = runner.state().board_with_active_piece();
+    let board = runner.state().tetris.board_with_active_piece();
     let size = surface.size();
     {
         let mut gfx = CpuRenderer::new(surface.frame_mut(), size);
@@ -28,7 +28,7 @@ fn headless_surface_resize_changes_buffer_size_and_allows_rendering() {
     assert_eq!(surface.frame().len(), 800 * 600 * 4);
 
     // Render again at the new size.
-    let board = runner.state().board_with_active_piece();
+    let board = runner.state().tetris.board_with_active_piece();
     let size = surface.size();
     {
         let mut gfx = CpuRenderer::new(surface.frame_mut(), size);

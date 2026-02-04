@@ -206,6 +206,67 @@ to_native_path() {
   fi
 }
 
+is_windows() {
+  case "$(uname -s 2>/dev/null || echo "")" in
+    MINGW*|MSYS*|CYGWIN*) return 0 ;;
+  esac
+  [[ "${OS:-}" == "Windows_NT" ]]
+}
+
+resolve_powershell() {
+  if command -v pwsh >/dev/null 2>&1; then
+    echo "pwsh"
+    return 0
+  fi
+  if command -v powershell.exe >/dev/null 2>&1; then
+    echo "powershell.exe"
+    return 0
+  fi
+  if command -v powershell >/dev/null 2>&1; then
+    echo "powershell"
+    return 0
+  fi
+  return 1
+}
+
+start_detached() {
+  local log_file="$1"
+  shift
+  local exe="$1"
+  shift
+  local args=("$@")
+
+  if is_windows; then
+    local ps_bin
+    ps_bin="$(resolve_powershell 2>/dev/null || true)"
+    if [[ -n "$ps_bin" ]]; then
+      local log_native
+      log_native="$(to_native_path "$log_file")"
+
+      local ps_args=""
+      for arg in "${args[@]}"; do
+        local escaped="${arg//\'/\'\'}"
+        if [[ -n "$ps_args" ]]; then
+          ps_args+=", "
+        fi
+        ps_args+="'$escaped'"
+      done
+
+      local ps_cmd
+      ps_cmd="\$p = Start-Process -FilePath '$exe' -ArgumentList $ps_args -RedirectStandardOutput '$log_native' -RedirectStandardError '$log_native' -PassThru; Write-Output \$p.Id"
+      local pid
+      pid="$("$ps_bin" -NoProfile -Command "$ps_cmd" 2>/dev/null | tr -d '\r' | awk 'NF{last=$0} END{print last}')"
+      if [[ -n "$pid" ]]; then
+        echo "$pid"
+        return 0
+      fi
+    fi
+  fi
+
+  nohup "$exe" "${args[@]}" >"$log_file" 2>&1 &
+  echo $!
+}
+
 common_repo_root() {
   command -v git >/dev/null 2>&1 || return 1
 
@@ -586,7 +647,7 @@ case "$ACTION" in
       stop_pidfile "$GAME_PID_FILE"
     fi
     ACTION="--start"
-    ;;&
+    ;&
 
   --start)
     if [[ "$TARGET" == "editor" ]]; then
@@ -732,11 +793,11 @@ case "$ACTION" in
     fi
 
     if [[ ${#HEADFUL_ARGS[@]} -gt 0 ]]; then
-      nohup cargo run -p game --bin headful "${CARGO_PROFILE_ARGS[@]}" -- "${HEADFUL_ARGS[@]}" >"$GAME_LOG_FILE" 2>&1 &
+      pid="$(start_detached "$GAME_LOG_FILE" cargo run -p game --bin headful "${CARGO_PROFILE_ARGS[@]}" -- "${HEADFUL_ARGS[@]}")"
     else
-      nohup cargo run -p game --bin headful "${CARGO_PROFILE_ARGS[@]}" >"$GAME_LOG_FILE" 2>&1 &
+      pid="$(start_detached "$GAME_LOG_FILE" cargo run -p game --bin headful "${CARGO_PROFILE_ARGS[@]}")"
     fi
-    echo $! >"$GAME_PID_FILE"
+    echo "$pid" >"$GAME_PID_FILE"
     ensure_pid_alive_or_dump_logs "$GAME_PID_FILE" "$GAME_LOG_FILE" "headful game"
     echo "started headful game (pid $(cat "$GAME_PID_FILE"))"
     echo "logs: $GAME_LOG_FILE"

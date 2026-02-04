@@ -1,5 +1,6 @@
 use engine::GameLogic;
 
+use crate::state::GameState;
 use crate::tetris_core::{Piece, RotationDir, TetrisCore, Vec2i};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,19 +34,19 @@ impl TetrisGame {
 }
 
 impl GameLogic for TetrisGame {
-    type State = TetrisCore;
+    type State = GameState;
     type Input = TetrisAction;
 
     fn initial_state(&self) -> Self::State {
         let mut core = TetrisCore::new(self.seed);
         core.set_available_pieces(self.available_pieces.clone());
         core.initialize_game();
-        core
+        GameState::new(core)
     }
 
     fn step(&self, state: &Self::State, input: Self::Input) -> Self::State {
         let mut next = state.clone();
-        apply_action(&mut next, input);
+        apply_action(&mut next.tetris, input);
         next
     }
 }

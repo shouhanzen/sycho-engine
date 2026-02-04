@@ -49,6 +49,36 @@ fn draw_text_clips_without_panicking() {
 }
 
 #[test]
+fn draw_text_renders_brackets_and_dollar_sign() {
+    fn render_char(ch: &str) -> Vec<u8> {
+        let width = 32u32;
+        let height = 16u32;
+        let color = [255u8, 255u8, 255u8, 255u8];
+        let mut frame = vec![0u8; (width * height * 4) as usize];
+        let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
+        gfx.draw_text(0, 0, ch, color);
+        frame
+    }
+
+    let fallback = render_char("?");
+    assert_ne!(
+        render_char("$"),
+        fallback,
+        "expected $ to render a distinct glyph"
+    );
+    assert_ne!(
+        render_char("["),
+        fallback,
+        "expected [ to render a distinct glyph"
+    );
+    assert_ne!(
+        render_char("]"),
+        fallback,
+        "expected ] to render a distinct glyph"
+    );
+}
+
+#[test]
 fn debug_hud_emits_lines_with_expected_labels() {
     let mut hud = DebugHud::new();
     hud.record_input(Duration::from_micros(250));
@@ -79,3 +109,32 @@ fn debug_hud_emits_lines_with_expected_labels() {
     );
 }
 
+
+#[test]
+fn debug_hud_minimize_collapses_overlay_lines() {
+    let mut hud = DebugHud::new();
+    let expanded = hud.overlay_lines();
+    assert!(
+        expanded.len() > 1,
+        "expected expanded overlay to include multiple lines"
+    );
+
+    hud.toggle_minimized();
+    let minimized = hud.overlay_lines();
+    assert_eq!(
+        minimized.len(),
+        1,
+        "expected minimized overlay to render a single header line"
+    );
+    assert!(
+        minimized[0].contains("DEBUG"),
+        "expected minimized header to label the debug overlay"
+    );
+
+    hud.toggle_minimized();
+    let expanded_again = hud.overlay_lines();
+    assert!(
+        expanded_again.len() > 1,
+        "expected overlay to expand after toggling again"
+    );
+}

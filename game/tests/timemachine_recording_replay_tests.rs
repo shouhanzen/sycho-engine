@@ -7,7 +7,8 @@ use std::{
 use engine::{HeadlessRunner, TimeMachine};
 use game::{
     playtest::{InputAction, TetrisLogic},
-    tetris_core::{Piece, TetrisCore},
+    state::GameState,
+    tetris_core::Piece,
 };
 
 fn unique_temp_json_path() -> PathBuf {
@@ -33,19 +34,23 @@ fn tetris_timemachine_can_be_saved_and_replayed_from_disk() {
         .save_json_file(&out)
         .expect("save tetris timemachine json");
 
-    let loaded_tm = TimeMachine::<TetrisCore>::load_json_file(&out).expect("load tetris timemachine json");
+    let loaded_tm =
+        TimeMachine::<GameState>::load_json_file(&out).expect("load tetris timemachine json");
     let replay_runner = HeadlessRunner::from_timemachine(logic, loaded_tm);
 
     assert_eq!(replay_runner.frame(), runner.frame());
-    assert_eq!(replay_runner.state().snapshot(), runner.state().snapshot());
+    assert_eq!(
+        replay_runner.state().tetris.snapshot(),
+        runner.state().tetris.snapshot()
+    );
 
     let orig_tm = runner.timemachine();
     let replay_tm = replay_runner.timemachine();
     assert_eq!(replay_tm.len(), orig_tm.len());
 
     for frame in 0..orig_tm.len() {
-        let a = orig_tm.state_at(frame).unwrap().snapshot();
-        let b = replay_tm.state_at(frame).unwrap().snapshot();
+        let a = orig_tm.state_at(frame).unwrap().tetris.snapshot();
+        let b = replay_tm.state_at(frame).unwrap().tetris.snapshot();
         assert_eq!(a, b, "snapshot mismatch at frame {frame}");
     }
 

@@ -5,7 +5,8 @@ use engine::editor::{
 };
 
 use crate::playtest::{InputAction, TetrisLogic};
-use crate::tetris_core::{Piece, TetrisCore};
+use crate::state::GameState;
+use crate::tetris_core::Piece;
 
 #[derive(Debug)]
 pub enum EditorApiError {
@@ -123,7 +124,7 @@ pub fn action_from_id(id: &str) -> Option<InputAction> {
     }
 }
 
-fn snapshot_from_response(response: AgentResponse<TetrisCore>) -> EditorSnapshot {
+fn snapshot_from_response(response: AgentResponse<GameState>) -> EditorSnapshot {
     match response {
         AgentResponse::State { frame, state } => snapshot_from_state(frame, &state),
         AgentResponse::History { .. } => {
@@ -132,25 +133,25 @@ fn snapshot_from_response(response: AgentResponse<TetrisCore>) -> EditorSnapshot
     }
 }
 
-pub fn snapshot_from_state(frame: usize, state: &TetrisCore) -> EditorSnapshot {
-    let pos = state.current_piece_pos();
-    let state_json = serde_json::to_value(state).expect("tetris core should be json-serializable");
+pub fn snapshot_from_state(frame: usize, state: &GameState) -> EditorSnapshot {
+    let pos = state.tetris.current_piece_pos();
+    let state_json = serde_json::to_value(state).expect("game state should be json-serializable");
 
     let stats = vec![
-        stat("score", state.score()),
-        stat("linesCleared", state.lines_cleared()),
-        stat_opt("currentPiece", state.current_piece().map(piece_label)),
-        stat_opt("nextPiece", state.next_piece().map(piece_label)),
+        stat("score", state.tetris.score()),
+        stat("linesCleared", state.tetris.lines_cleared()),
+        stat_opt("currentPiece", state.tetris.current_piece().map(piece_label)),
+        stat_opt("nextPiece", state.tetris.next_piece().map(piece_label)),
         stat("posX", pos.x),
         stat("posY", pos.y),
-        stat("rotation", state.current_piece_rotation()),
-        stat_opt("heldPiece", state.held_piece().map(piece_label)),
-        stat("canHold", state.can_hold()),
+        stat("rotation", state.tetris.current_piece_rotation()),
+        stat_opt("heldPiece", state.tetris.held_piece().map(piece_label)),
+        stat("canHold", state.tetris.can_hold()),
     ];
 
     let grid = EditorGrid {
         origin: GridOrigin::BottomLeft,
-        cells: state.board_with_active_piece(),
+        cells: state.tetris.board_with_active_piece(),
         palette: Some(default_tetris_palette()),
     };
 

@@ -1,14 +1,31 @@
+use std::collections::HashMap;
+
 use engine::graphics::Renderer2d;
 use engine::render::{color_for_cell, draw_board, CELL_SIZE};
 use engine::ui as ui;
+use engine::ui_tree::UiTree;
 
-use crate::skilltree::{NodeState, SkillTreeDef, SkillTreeProgress, SkillTreeRuntime};
+use crate::skilltree::{
+    NodeState, SkillTreeDef, SkillTreeEditorTool, SkillTreeProgress, SkillTreeRuntime,
+};
 use crate::tetris_core::{piece_board_offset, piece_grid, piece_type, Piece, TetrisCore, Vec2i};
+use crate::ui_ids::*;
+
+mod menus;
+pub use menus::{
+    draw_game_over_menu, draw_game_over_menu_with_ui, draw_main_menu, draw_main_menu_with_ui,
+    draw_pause_menu, draw_pause_menu_with_ui, GameOverMenuLayout, GameOverMenuView, MainMenuLayout,
+    MainMenuView, PauseMenuLayout, PauseMenuView,
+};
 
 const COLOR_PANEL_BG: [u8; 4] = [16, 16, 22, 255];
 const COLOR_PANEL_BORDER: [u8; 4] = [40, 40, 55, 255];
 const COLOR_PANEL_BORDER_DISABLED: [u8; 4] = [28, 28, 38, 255];
 const BUTTON_HOVER_BRIGHTEN: f32 = 0.12;
+const COLOR_SKILLTREE_LINK: [u8; 4] = [110, 110, 150, 255];
+const SKILLTREE_LINK_THICKNESS: u32 = 2;
+const SKILLTREE_ARROW_LENGTH: f32 = 10.0;
+const SKILLTREE_ARROW_WIDTH: f32 = 6.0;
 
 pub const MAIN_MENU_TITLE: &str = "UNTITLED";
 
@@ -43,32 +60,14 @@ pub struct UiLayout {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PauseMenuLayout {
-    pub panel: Rect,
-    pub resume_button: Rect,
-    pub end_run_button: Rect,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct MainMenuLayout {
-    pub panel: Rect,
-    pub start_button: Rect,
-    pub skilltree_editor_button: Rect,
-    pub quit_button: Rect,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct GameOverMenuLayout {
-    pub panel: Rect,
-    pub restart_button: Rect,
-    pub skilltree_button: Rect,
-    pub quit_button: Rect,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SkillTreeLayout {
     pub panel: Rect,
     pub start_new_game_button: Rect,
+    pub tool_select_button: Rect,
+    pub tool_move_button: Rect,
+    pub tool_add_cell_button: Rect,
+    pub tool_remove_cell_button: Rect,
+    pub tool_connect_button: Rect,
 
     // Grid viewport + mapping (for hit-testing / editor interactions).
     pub grid: Rect,
@@ -177,16 +176,19 @@ pub fn draw_tetris_hud(
     state: &TetrisCore,
     layout: UiLayout,
 ) {
-    draw_tetris_hud_with_cursor(frame, width, height, state, layout, None);
+    let mut ui_tree = UiTree::new();
+    ui_tree.ensure_canvas(UI_CANVAS, ui::Rect::from_size(width, height));
+    ui_tree.add_root(UI_CANVAS);
+    draw_tetris_hud_with_ui(frame, width, height, state, layout, &mut ui_tree);
 }
 
-pub fn draw_tetris_hud_with_cursor(
+pub fn draw_tetris_hud_with_ui(
     frame: &mut dyn Renderer2d,
     width: u32,
     height: u32,
     state: &TetrisCore,
     layout: UiLayout,
-    cursor: Option<(u32, u32)>,
+    ui_tree: &mut UiTree,
 ) {
     draw_hold_panel(
         frame,
@@ -198,9 +200,18 @@ pub fn draw_tetris_hud_with_cursor(
     );
     draw_next_panel(frame, width, height, layout.next_panel, state.next_queue());
 
-    let pause_hovered = cursor
-        .map(|(x, y)| layout.pause_button.contains(x, y))
-        .unwrap_or(false);
+    ui_tree.ensure_container(UI_TETRIS_HUD_CONTAINER, ui::Rect::from_size(width, height));
+    ui_tree.add_child(UI_CANVAS, UI_TETRIS_HUD_CONTAINER);
+    ui_tree.ensure_button(
+        UI_TETRIS_PAUSE,
+        layout.pause_button,
+        Some(ACTION_TETRIS_TOGGLE_PAUSE),
+    );
+    ui_tree.add_child(UI_TETRIS_HUD_CONTAINER, UI_TETRIS_PAUSE);
+    ui_tree.ensure_button(UI_TETRIS_HOLD, layout.hold_panel, Some(ACTION_TETRIS_HOLD));
+    ui_tree.add_child(UI_TETRIS_HUD_CONTAINER, UI_TETRIS_HOLD);
+
+    let pause_hovered = ui_tree.is_hovered(UI_TETRIS_PAUSE);
     draw_pause_button(frame, width, height, layout.pause_button, pause_hovered);
 
     // Simple HUD: score + lines, placed near the top-right (left of the pause button).
@@ -280,444 +291,49 @@ fn draw_pause_button(
     );
 }
 
-pub fn draw_pause_menu(frame: &mut dyn Renderer2d, width: u32, height: u32) -> PauseMenuLayout {
-    draw_pause_menu_with_cursor(frame, width, height, None)
-}
-
-pub fn draw_pause_menu_with_cursor(
-    frame: &mut dyn Renderer2d,
-    width: u32,
-    height: u32,
-    cursor: Option<(u32, u32)>,
-) -> PauseMenuLayout {
-    // Dim the entire game view.
-    blend_rect(
-        frame,
-        width,
-        height,
-        0,
-        0,
-        width,
-        height,
-        COLOR_PAUSE_MENU_DIM,
-        PAUSE_MENU_DIM_ALPHA,
-    );
-
-    let margin = 32u32;
-    let pad = 18u32;
-
-    // Layout is expressed via the engine UI layout helpers, then converted to our local `Rect`
-    // for hit-testing and drawing.
-    let screen = ui::Rect::from_size(width, height);
-    let safe = screen.inset(ui::Insets::all(margin));
-    if safe.w == 0 || safe.h == 0 {
-        return PauseMenuLayout::default();
-    }
-
-    let panel_size = ui::Size::new(360, 260).clamp_max(safe.size());
-    if panel_size.w == 0 || panel_size.h == 0 {
-        return PauseMenuLayout::default();
-    }
-
-    let panel_ui = safe.place(panel_size, ui::Anchor::Center);
-    let panel = Rect {
-        x: panel_ui.x,
-        y: panel_ui.y,
-        w: panel_ui.w,
-        h: panel_ui.h,
-    };
-
-    fill_rect(
-        frame,
-        width,
-        height,
-        panel.x,
-        panel.y,
-        panel.w,
-        panel.h,
-        COLOR_PAUSE_MENU_BG,
-    );
-    draw_rect_outline(
-        frame,
-        width,
-        height,
-        panel.x,
-        panel.y,
-        panel.w,
-        panel.h,
-        COLOR_PAUSE_MENU_BORDER,
-    );
-
-    draw_text(
-        frame,
-        width,
-        height,
-        panel.x.saturating_add(pad),
-        panel.y.saturating_add(pad),
-        "PAUSED",
-        COLOR_PAUSE_MENU_TEXT,
-    );
-    draw_text(
-        frame,
-        width,
-        height,
-        panel.x.saturating_add(pad),
-        panel.y.saturating_add(pad + 24),
-        "ESC TO RESUME",
-        COLOR_PAUSE_MENU_TEXT,
-    );
-
-    let content = panel_ui.inset(ui::Insets::all(pad));
-    let gap = 12u32;
-    let button_size = ui::Size::new(240, 44).clamp_max(content.size());
-    let resume_ui = content.place(button_size, ui::Anchor::BottomCenter);
-    let resume_button = Rect {
-        x: resume_ui.x,
-        y: resume_ui.y,
-        w: resume_ui.w,
-        h: resume_ui.h,
-    };
-    let end_run_button = Rect {
-        x: resume_button.x,
-        y: resume_button.y.saturating_sub(resume_button.h.saturating_add(gap)),
-        w: resume_button.w,
-        h: resume_button.h,
-    };
-
-    draw_button(
-        frame,
-        width,
-        height,
-        resume_button,
-        "RESUME",
-        cursor
-            .map(|(x, y)| resume_button.contains(x, y))
-            .unwrap_or(false),
-    );
-    draw_button(
-        frame,
-        width,
-        height,
-        end_run_button,
-        "END RUN",
-        cursor
-            .map(|(x, y)| end_run_button.contains(x, y))
-            .unwrap_or(false),
-    );
-
-    PauseMenuLayout {
-        panel,
-        resume_button,
-        end_run_button,
-    }
-}
-
-pub fn draw_main_menu(frame: &mut dyn Renderer2d, width: u32, height: u32) -> MainMenuLayout {
-    draw_main_menu_with_cursor(frame, width, height, None)
-}
-
-pub fn draw_main_menu_with_cursor(
-    frame: &mut dyn Renderer2d,
-    width: u32,
-    height: u32,
-    cursor: Option<(u32, u32)>,
-) -> MainMenuLayout {
-    // Main menu is its own scene: clear the frame so the Tetris board is not visible underneath.
-    fill_rect(frame, width, height, 0, 0, width, height, color_for_cell(0));
-
-    let margin = 32u32;
-    let pad = 18u32;
-
-    // "Scene bounds" used for layout/hit-testing (not a modal panel).
-    let screen = ui::Rect::from_size(width, height);
-    let safe = screen.inset(ui::Insets::all(margin));
-    if safe.w == 0 || safe.h == 0 {
-        return MainMenuLayout::default();
-    }
-
-    let panel = Rect {
-        x: safe.x,
-        y: safe.y,
-        w: safe.w,
-        h: safe.h,
-    };
-
-    // Layout: a vertical stack (title, start, skilltree editor, quit), centered in the safe region.
-    let title = MAIN_MENU_TITLE;
-    let title_chars = title.chars().count() as u32;
-    let glyph_cols = 4u32; // 3 glyph columns + 1 column spacing (matches `draw_text` advances).
-    let denom = title_chars.saturating_mul(glyph_cols).max(1);
-    let max_scale = 12u32;
-    let title_scale = (safe.w / denom).clamp(2, max_scale);
-    let title_w = denom.saturating_mul(title_scale).min(safe.w);
-    let title_h = (5u32).saturating_mul(title_scale).min(safe.h);
-
-    let content = safe.inset(ui::Insets::all(pad));
-    let button_size = ui::Size::new(240, 44).clamp_max(content.size());
-    let button_gap = 12u32;
-    let title_button_gap = 28u32;
-    let stack_h = title_h
-        .saturating_add(title_button_gap)
-        .saturating_add(button_size.h.saturating_mul(3))
-        .saturating_add(button_gap.saturating_mul(2));
-    let top_y = content
-        .y
-        .saturating_add(content.h.saturating_sub(stack_h) / 2);
-
-    let title_x = content.x.saturating_add(content.w.saturating_sub(title_w) / 2);
-    let title_y = top_y;
-    draw_text_scaled(
-        frame,
-        width,
-        height,
-        title_x,
-        title_y,
-        title,
-        COLOR_PAUSE_MENU_TEXT,
-        title_scale,
-    );
-
-    let buttons_y = title_y
-        .saturating_add(title_h)
-        .saturating_add(title_button_gap);
-    let start_button = Rect {
-        x: content.x.saturating_add(content.w.saturating_sub(button_size.w) / 2),
-        y: buttons_y,
-        w: button_size.w,
-        h: button_size.h,
-    };
-    let skilltree_editor_button = Rect {
-        x: start_button.x,
-        y: start_button
-            .y
-            .saturating_add(start_button.h)
-            .saturating_add(button_gap),
-        w: start_button.w,
-        h: start_button.h,
-    };
-    let quit_button = Rect {
-        x: start_button.x,
-        y: skilltree_editor_button
-            .y
-            .saturating_add(skilltree_editor_button.h)
-            .saturating_add(button_gap),
-        w: start_button.w,
-        h: start_button.h,
-    };
-
-    for (rect, label) in [
-        (start_button, "START"),
-        (skilltree_editor_button, "SKILLTREE EDITOR"),
-        (quit_button, "QUIT"),
-    ] {
-        let hovered = cursor.map(|(x, y)| rect.contains(x, y)).unwrap_or(false);
-        draw_button(frame, width, height, rect, label, hovered);
-    }
-
-    MainMenuLayout {
-        panel,
-        start_button,
-        skilltree_editor_button,
-        quit_button,
-    }
-}
-
-pub fn draw_game_over_menu(
-    frame: &mut dyn Renderer2d,
-    width: u32,
-    height: u32,
-) -> GameOverMenuLayout {
-    draw_game_over_menu_with_cursor(frame, width, height, None)
-}
-
-pub fn draw_game_over_menu_with_cursor(
-    frame: &mut dyn Renderer2d,
-    width: u32,
-    height: u32,
-    cursor: Option<(u32, u32)>,
-) -> GameOverMenuLayout {
-    // Dim the entire game view.
-    blend_rect(
-        frame,
-        width,
-        height,
-        0,
-        0,
-        width,
-        height,
-        COLOR_PAUSE_MENU_DIM,
-        PAUSE_MENU_DIM_ALPHA,
-    );
-
-    let margin = 32u32;
-    let pad = 18u32;
-
-    let panel_w = 420u32.min(width.saturating_sub(margin.saturating_mul(2)));
-    let panel_h = 280u32.min(height.saturating_sub(margin.saturating_mul(2)));
-    if panel_w == 0 || panel_h == 0 {
-        return GameOverMenuLayout::default();
-    }
-
-    let panel = Rect {
-        x: width.saturating_sub(panel_w) / 2,
-        y: height.saturating_sub(panel_h) / 2,
-        w: panel_w,
-        h: panel_h,
-    };
-
-    fill_rect(
-        frame,
-        width,
-        height,
-        panel.x,
-        panel.y,
-        panel.w,
-        panel.h,
-        COLOR_PAUSE_MENU_BG,
-    );
-    draw_rect_outline(
-        frame,
-        width,
-        height,
-        panel.x,
-        panel.y,
-        panel.w,
-        panel.h,
-        COLOR_PAUSE_MENU_BORDER,
-    );
-
-    draw_text(
-        frame,
-        width,
-        height,
-        panel.x.saturating_add(pad),
-        panel.y.saturating_add(pad),
-        "GAME OVER",
-        COLOR_PAUSE_MENU_TEXT,
-    );
-    draw_text(
-        frame,
-        width,
-        height,
-        panel.x.saturating_add(pad),
-        panel.y.saturating_add(pad + 24),
-        "RUN ENDED",
-        COLOR_PAUSE_MENU_TEXT,
-    );
-    draw_text(
-        frame,
-        width,
-        height,
-        panel.x.saturating_add(pad),
-        panel.y.saturating_add(pad + 48),
-        "ENTER TO RESTART",
-        COLOR_PAUSE_MENU_TEXT,
-    );
-    draw_text(
-        frame,
-        width,
-        height,
-        panel.x.saturating_add(pad),
-        panel.y.saturating_add(pad + 72),
-        "K: SKILL TREE",
-        COLOR_PAUSE_MENU_TEXT,
-    );
-    draw_text(
-        frame,
-        width,
-        height,
-        panel.x.saturating_add(pad),
-        panel.y.saturating_add(pad + 96),
-        "ESC: MAIN MENU",
-        COLOR_PAUSE_MENU_TEXT,
-    );
-
-    let button_h = 44u32.min(panel.h.saturating_sub(pad.saturating_mul(2)));
-    let button_w = 240u32.min(panel.w.saturating_sub(pad.saturating_mul(2)));
-    let gap = 12u32;
-    let buttons_total_h = button_h
-        .saturating_mul(3)
-        .saturating_add(gap.saturating_mul(2));
-    let top_y = panel
-        .y
-        .saturating_add(panel.h.saturating_sub(pad.saturating_add(buttons_total_h)));
-
-    let restart_button = Rect {
-        x: panel.x.saturating_add(panel.w.saturating_sub(button_w) / 2),
-        y: top_y,
-        w: button_w,
-        h: button_h,
-    };
-    let skilltree_button = Rect {
-        x: restart_button.x,
-        y: restart_button.y.saturating_add(button_h + gap),
-        w: button_w,
-        h: button_h,
-    };
-    let quit_button = Rect {
-        x: restart_button.x,
-        y: skilltree_button.y.saturating_add(button_h + gap),
-        w: button_w,
-        h: button_h,
-    };
-
-    for (rect, label) in [
-        (restart_button, "RESTART"),
-        (skilltree_button, "SKILL TREE"),
-        (quit_button, "QUIT"),
-    ] {
-        let hovered = cursor.map(|(x, y)| rect.contains(x, y)).unwrap_or(false);
-        draw_button(frame, width, height, rect, label, hovered);
-    }
-
-    GameOverMenuLayout {
-        panel,
-        restart_button,
-        skilltree_button,
-        quit_button,
-    }
-}
-
 pub fn draw_skilltree(frame: &mut dyn Renderer2d, width: u32, height: u32) -> SkillTreeLayout {
-    draw_skilltree_with_cursor(frame, width, height, None)
+    let mut ui_tree = UiTree::new();
+    ui_tree.ensure_canvas(UI_CANVAS, ui::Rect::from_size(width, height));
+    ui_tree.add_root(UI_CANVAS);
+    draw_skilltree_with_ui(frame, width, height, &mut ui_tree)
 }
 
-pub fn draw_skilltree_runtime_with_cursor(
+pub fn draw_skilltree_runtime_with_ui(
     frame: &mut dyn Renderer2d,
     width: u32,
     height: u32,
-    cursor: Option<(u32, u32)>,
+    ui_tree: &mut UiTree,
     runtime: &SkillTreeRuntime,
 ) -> SkillTreeLayout {
     draw_skilltree_impl(
         frame,
         width,
         height,
-        cursor,
+        ui_tree,
         Some(runtime),
         &runtime.def,
         &runtime.progress,
     )
 }
 
-pub fn draw_skilltree_with_cursor(
+pub fn draw_skilltree_with_ui(
     frame: &mut dyn Renderer2d,
     width: u32,
     height: u32,
-    cursor: Option<(u32, u32)>,
+    ui_tree: &mut UiTree,
 ) -> SkillTreeLayout {
     // Keep this function deterministic + I/O-free for tests; the headful game uses
-    // `draw_skilltree_runtime_with_cursor` instead.
+    // `draw_skilltree_runtime_with_ui` instead.
     let def = SkillTreeDef::default();
     let progress = SkillTreeProgress::default();
-    draw_skilltree_impl(frame, width, height, cursor, None, &def, &progress)
+    draw_skilltree_impl(frame, width, height, ui_tree, None, &def, &progress)
 }
 
 fn draw_skilltree_impl(
     frame: &mut dyn Renderer2d,
     width: u32,
     height: u32,
-    cursor: Option<(u32, u32)>,
+    ui_tree: &mut UiTree,
     runtime: Option<&SkillTreeRuntime>,
     def: &SkillTreeDef,
     progress: &SkillTreeProgress,
@@ -725,7 +341,7 @@ fn draw_skilltree_impl(
     // Skilltree is its own scene: clear the frame so the Tetris board is not visible.
     fill_rect(frame, width, height, 0, 0, width, height, color_for_cell(0));
 
-    let margin = 32u32;
+    let margin = 0u32;
     let pad = 18u32;
 
     let screen = ui::Rect::from_size(width, height);
@@ -742,18 +358,12 @@ fn draw_skilltree_impl(
         h: safe.h,
     };
 
-    let header_h = 120u32.min(safe.h);
-    let footer_h = 80u32.min(safe.h.saturating_sub(header_h));
-
     let content = safe.inset(ui::Insets::all(pad));
     let grid = Rect {
-        x: content.x,
-        y: content.y.saturating_add(header_h.saturating_sub(pad)),
-        w: content.w,
-        h: content
-            .h
-            .saturating_sub(header_h.saturating_sub(pad))
-            .saturating_sub(footer_h),
+        x: panel.x,
+        y: panel.y,
+        w: panel.w,
+        h: panel.h,
     };
 
     draw_text(
@@ -778,9 +388,17 @@ fn draw_skilltree_impl(
     );
 
     let editor_enabled = runtime.map(|rt| rt.editor.enabled).unwrap_or(false);
+    let mut tool_select_button = Rect::default();
+    let mut tool_move_button = Rect::default();
+    let mut tool_add_cell_button = Rect::default();
+    let mut tool_remove_cell_button = Rect::default();
+    let mut tool_connect_button = Rect::default();
     if editor_enabled {
-        let tool = runtime.map(|rt| format!("{:?}", rt.editor.tool)).unwrap_or_default();
-        let tool_text = format!("EDITOR ON  TOOL {tool}  (TAB CYCLE, S SAVE, R RELOAD)");
+        let tool = runtime.map(|rt| rt.editor.tool).unwrap_or(SkillTreeEditorTool::Select);
+        let tool_text = format!(
+            "EDITOR ON  TOOL {}  (TAB CYCLE, S SAVE, R RELOAD)",
+            skilltree_tool_label(tool)
+        );
         draw_text(
             frame,
             width,
@@ -796,10 +414,100 @@ fn draw_skilltree_impl(
             height,
             safe.x.saturating_add(pad),
             safe.y.saturating_add(pad + 72),
-            "ARROWS PAN  +/- ZOOM  N NEW  DEL DELETE  ESC EXIT EDITOR",
+            "TOOLS: SELECT MOVE ADD CELL REMOVE CELL LINK  (N NEW, DEL DELETE, ESC EXIT)",
             COLOR_PAUSE_MENU_TEXT,
         );
+
+        let header_h = 120u32.min(safe.h);
+        let tool_gap = 8u32;
+        let tool_button_h = 30u32.min(header_h.saturating_sub(pad));
+        let tool_button_w = 120u32.min(content.w);
+        let tool_count = 5u32;
+        let total_w = tool_button_w
+            .saturating_mul(tool_count)
+            .saturating_add(tool_gap.saturating_mul(tool_count.saturating_sub(1)));
+        let toolbar_x = safe
+            .x
+            .saturating_add(safe.w.saturating_sub(pad))
+            .saturating_sub(total_w);
+        let toolbar_y = safe.y.saturating_add(pad);
+
+        ui_tree.ensure_container(UI_SKILLTREE_TOOLBAR, Rect::from_size(width, height));
+        ui_tree.add_child(UI_SKILLTREE_CONTAINER, UI_SKILLTREE_TOOLBAR);
+
+        let tool_buttons = [
+            (SkillTreeEditorTool::Select, "SELECT"),
+            (SkillTreeEditorTool::Move, "MOVE"),
+            (SkillTreeEditorTool::AddCell, "ADD CELL"),
+            (SkillTreeEditorTool::RemoveCell, "REMOVE CELL"),
+            (SkillTreeEditorTool::ConnectPrereqs, "LINK"),
+        ];
+
+        for (idx, (tool_kind, label)) in tool_buttons.iter().enumerate() {
+            let x = toolbar_x.saturating_add(
+                (tool_button_w + tool_gap).saturating_mul(idx as u32),
+            );
+            let rect = Rect {
+                x,
+                y: toolbar_y,
+                w: tool_button_w,
+                h: tool_button_h,
+            };
+            let active = tool == *tool_kind;
+            let hovered = match tool_kind {
+                SkillTreeEditorTool::Select => ui_tree.is_hovered(UI_SKILLTREE_TOOL_SELECT),
+                SkillTreeEditorTool::Move => ui_tree.is_hovered(UI_SKILLTREE_TOOL_MOVE),
+                SkillTreeEditorTool::AddCell => ui_tree.is_hovered(UI_SKILLTREE_TOOL_ADD_CELL),
+                SkillTreeEditorTool::RemoveCell => ui_tree.is_hovered(UI_SKILLTREE_TOOL_REMOVE_CELL),
+                SkillTreeEditorTool::ConnectPrereqs => ui_tree.is_hovered(UI_SKILLTREE_TOOL_LINK),
+            };
+            draw_tool_button(frame, width, height, rect, label, hovered, active);
+
+            match tool_kind {
+                SkillTreeEditorTool::Select => tool_select_button = rect,
+                SkillTreeEditorTool::Move => tool_move_button = rect,
+                SkillTreeEditorTool::AddCell => tool_add_cell_button = rect,
+                SkillTreeEditorTool::RemoveCell => tool_remove_cell_button = rect,
+                SkillTreeEditorTool::ConnectPrereqs => tool_connect_button = rect,
+            }
+        }
+
+        ui_tree.ensure_button(
+            UI_SKILLTREE_TOOL_SELECT,
+            tool_select_button,
+            Some(ACTION_SKILLTREE_TOOL_SELECT),
+        );
+        ui_tree.add_child(UI_SKILLTREE_TOOLBAR, UI_SKILLTREE_TOOL_SELECT);
+        ui_tree.ensure_button(
+            UI_SKILLTREE_TOOL_MOVE,
+            tool_move_button,
+            Some(ACTION_SKILLTREE_TOOL_MOVE),
+        );
+        ui_tree.add_child(UI_SKILLTREE_TOOLBAR, UI_SKILLTREE_TOOL_MOVE);
+        ui_tree.ensure_button(
+            UI_SKILLTREE_TOOL_ADD_CELL,
+            tool_add_cell_button,
+            Some(ACTION_SKILLTREE_TOOL_ADD_CELL),
+        );
+        ui_tree.add_child(UI_SKILLTREE_TOOLBAR, UI_SKILLTREE_TOOL_ADD_CELL);
+        ui_tree.ensure_button(
+            UI_SKILLTREE_TOOL_REMOVE_CELL,
+            tool_remove_cell_button,
+            Some(ACTION_SKILLTREE_TOOL_REMOVE_CELL),
+        );
+        ui_tree.add_child(UI_SKILLTREE_TOOLBAR, UI_SKILLTREE_TOOL_REMOVE_CELL);
+        ui_tree.ensure_button(
+            UI_SKILLTREE_TOOL_LINK,
+            tool_connect_button,
+            Some(ACTION_SKILLTREE_TOOL_LINK),
+        );
+        ui_tree.add_child(UI_SKILLTREE_TOOLBAR, UI_SKILLTREE_TOOL_LINK);
     } else {
+        ui_tree.set_visible(UI_SKILLTREE_TOOL_SELECT, false);
+        ui_tree.set_visible(UI_SKILLTREE_TOOL_MOVE, false);
+        ui_tree.set_visible(UI_SKILLTREE_TOOL_ADD_CELL, false);
+        ui_tree.set_visible(UI_SKILLTREE_TOOL_REMOVE_CELL, false);
+        ui_tree.set_visible(UI_SKILLTREE_TOOL_LINK, false);
         draw_text(
             frame,
             width,
@@ -899,6 +607,28 @@ fn draw_skilltree_impl(
         }
     }
 
+    let mut node_boxes: HashMap<&str, NodeScreenBox> = HashMap::new();
+    for node in &def.nodes {
+        if let Some(bbox) = node_screen_bbox(
+            node,
+            grid_cam_min_x,
+            grid_cam_min_y,
+            grid_rows,
+            grid_cell_i32,
+            grid_cell,
+            grid_view_x0,
+            grid_view_y0,
+            grid_view_x1,
+            grid_view_y1,
+            grid_pan_px_x,
+            grid_pan_px_y,
+        ) {
+            node_boxes.insert(node.id.as_str(), bbox);
+        }
+    }
+
+    draw_skilltree_links(frame, width, height, def, &node_boxes);
+
     // Draw nodes as polyblocks.
     let unlocked: std::collections::HashSet<&str> =
         progress.unlocked.iter().map(|s| s.as_str()).collect();
@@ -944,11 +674,6 @@ fn draw_skilltree_impl(
             border = [245, 245, 255, 255];
         }
 
-        let mut bbox_min_x: Option<u32> = None;
-        let mut bbox_min_y: Option<u32> = None;
-        let mut bbox_max_x: u32 = 0;
-        let mut bbox_max_y: u32 = 0;
-
         for rel in &node.shape {
             let wx = node.pos.x + rel.x;
             let wy = node.pos.y + rel.y;
@@ -982,23 +707,24 @@ fn draw_skilltree_impl(
             {
                 draw_rect_outline(frame, width, height, px as u32, py as u32, grid_cell, grid_cell, border);
             }
-
-            let px0 = px.max(0) as u32;
-            let py0 = py.max(0) as u32;
-            bbox_min_x = Some(bbox_min_x.map(|v| v.min(px0)).unwrap_or(px0));
-            bbox_min_y = Some(bbox_min_y.map(|v| v.min(py0)).unwrap_or(py0));
-            bbox_max_x = bbox_max_x.max(px0.saturating_add(grid_cell));
-            bbox_max_y = bbox_max_y.max(py0.saturating_add(grid_cell));
         }
 
         // Label + cost.
-        if let (Some(min_x), Some(min_y)) = (bbox_min_x, bbox_min_y) {
-            let label_x = min_x.saturating_add(6);
-            let label_y = min_y.saturating_add(6);
+        if let Some(bbox) = node_boxes.get(node.id.as_str()) {
+            let label_x = bbox.min_x.saturating_add(6);
+            let label_y = bbox.min_y.saturating_add(6);
             draw_text(frame, width, height, label_x, label_y, &node.name, COLOR_PAUSE_MENU_TEXT);
             if node.cost > 0 {
                 let cost = format!("${}", node.cost);
-                draw_text(frame, width, height, label_x, label_y.saturating_add(18), &cost, COLOR_PAUSE_MENU_TEXT);
+                draw_text(
+                    frame,
+                    width,
+                    height,
+                    label_x,
+                    label_y.saturating_add(18),
+                    &cost,
+                    COLOR_PAUSE_MENU_TEXT,
+                );
             }
         }
     }
@@ -1017,30 +743,45 @@ fn draw_skilltree_impl(
         }
     }
 
-    let button_size = ui::Size::new(240, 44).clamp_max(content.size());
-    let start_ui = content.place(button_size, ui::Anchor::BottomCenter);
-    let start_new_game_button = Rect {
-        x: start_ui.x,
-        y: start_ui.y,
-        w: start_ui.w,
-        h: start_ui.h,
-    };
+    let start_new_game_button = if editor_enabled {
+        ui_tree.set_visible(UI_SKILLTREE_START_RUN, false);
+        Rect::default()
+    } else {
+        let button_size = ui::Size::new(240, 44).clamp_max(content.size());
+        let start_ui = content.place(button_size, ui::Anchor::BottomCenter);
+        let start_new_game_button = Rect {
+            x: start_ui.x,
+            y: start_ui.y,
+            w: start_ui.w,
+            h: start_ui.h,
+        };
 
-    let hovered = cursor
-        .map(|(x, y)| start_new_game_button.contains(x, y))
-        .unwrap_or(false);
-    draw_button(
-        frame,
-        width,
-        height,
-        start_new_game_button,
-        "START NEW RUN",
-        hovered,
-    );
+        ui_tree.ensure_button(
+            UI_SKILLTREE_START_RUN,
+            start_new_game_button,
+            Some(ACTION_SKILLTREE_START_RUN),
+        );
+        ui_tree.add_child(UI_SKILLTREE_CONTAINER, UI_SKILLTREE_START_RUN);
+        let hovered = ui_tree.is_hovered(UI_SKILLTREE_START_RUN);
+        draw_button(
+            frame,
+            width,
+            height,
+            start_new_game_button,
+            "START NEW RUN",
+            hovered,
+        );
+        start_new_game_button
+    };
 
     SkillTreeLayout {
         panel,
         start_new_game_button,
+        tool_select_button,
+        tool_move_button,
+        tool_add_cell_button,
+        tool_remove_cell_button,
+        tool_connect_button,
         grid,
         grid_origin_x,
         grid_origin_y,
@@ -1310,6 +1051,43 @@ fn draw_button(
     );
 }
 
+fn draw_tool_button(
+    frame: &mut dyn Renderer2d,
+    width: u32,
+    height: u32,
+    rect: Rect,
+    label: &str,
+    hovered: bool,
+    active: bool,
+) {
+    let (mut fill, mut border) = button_colors(hovered);
+    if active {
+        fill = brighten_color(fill, 0.18);
+        border = [245, 245, 255, 255];
+    }
+    fill_rect(frame, width, height, rect.x, rect.y, rect.w, rect.h, fill);
+    draw_rect_outline(frame, width, height, rect.x, rect.y, rect.w, rect.h, border);
+    draw_text(
+        frame,
+        width,
+        height,
+        rect.x.saturating_add(12),
+        rect.y.saturating_add(rect.h / 2).saturating_sub(6),
+        label,
+        COLOR_PAUSE_MENU_TEXT,
+    );
+}
+
+fn skilltree_tool_label(tool: SkillTreeEditorTool) -> &'static str {
+    match tool {
+        SkillTreeEditorTool::Select => "SELECT",
+        SkillTreeEditorTool::Move => "MOVE",
+        SkillTreeEditorTool::AddCell => "ADD CELL",
+        SkillTreeEditorTool::RemoveCell => "REMOVE CELL",
+        SkillTreeEditorTool::ConnectPrereqs => "LINK",
+    }
+}
+
 fn fill_rect(
     frame: &mut dyn Renderer2d,
     _width: u32,
@@ -1398,5 +1176,224 @@ fn draw_text_scaled(
     scale: u32,
 ) {
     frame.draw_text_scaled(x, y, text, color, scale);
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NodeScreenBox {
+    min_x: u32,
+    min_y: u32,
+    max_x: u32,
+    max_y: u32,
+}
+
+impl NodeScreenBox {
+    fn center_i32(&self) -> (i32, i32) {
+        let cx = self.min_x.saturating_add(self.max_x).saturating_div(2) as i32;
+        let cy = self.min_y.saturating_add(self.max_y).saturating_div(2) as i32;
+        (cx, cy)
+    }
+}
+
+fn node_screen_bbox(
+    node: &crate::skilltree::SkillNodeDef,
+    grid_cam_min_x: i32,
+    grid_cam_min_y: i32,
+    grid_rows: u32,
+    grid_cell_i32: i32,
+    grid_cell: u32,
+    grid_view_x0: i32,
+    grid_view_y0: i32,
+    grid_view_x1: i32,
+    grid_view_y1: i32,
+    grid_pan_px_x: i32,
+    grid_pan_px_y: i32,
+) -> Option<NodeScreenBox> {
+    let mut bbox_min_x: Option<u32> = None;
+    let mut bbox_min_y: Option<u32> = None;
+    let mut bbox_max_x: u32 = 0;
+    let mut bbox_max_y: u32 = 0;
+
+    for rel in &node.shape {
+        let wx = node.pos.x + rel.x;
+        let wy = node.pos.y + rel.y;
+        let col = wx - grid_cam_min_x;
+        let row_from_bottom = wy - grid_cam_min_y;
+        let row_from_top = grid_rows as i32 - 1 - row_from_bottom;
+
+        let px = grid_view_x0
+            .saturating_add(col.saturating_mul(grid_cell_i32))
+            .saturating_add(grid_pan_px_x);
+        let py = grid_view_y0
+            .saturating_add(row_from_top.saturating_mul(grid_cell_i32))
+            .saturating_add(grid_pan_px_y);
+
+        let cell_x1 = px.saturating_add(grid_cell_i32);
+        let cell_y1 = py.saturating_add(grid_cell_i32);
+        let overlaps = cell_x1 > grid_view_x0
+            && px < grid_view_x1
+            && cell_y1 > grid_view_y0
+            && py < grid_view_y1;
+        if !overlaps {
+            continue;
+        }
+
+        let px0 = px.max(0) as u32;
+        let py0 = py.max(0) as u32;
+        bbox_min_x = Some(bbox_min_x.map(|v| v.min(px0)).unwrap_or(px0));
+        bbox_min_y = Some(bbox_min_y.map(|v| v.min(py0)).unwrap_or(py0));
+        bbox_max_x = bbox_max_x.max(px0.saturating_add(grid_cell));
+        bbox_max_y = bbox_max_y.max(py0.saturating_add(grid_cell));
+    }
+
+    Some(NodeScreenBox {
+        min_x: bbox_min_x?,
+        min_y: bbox_min_y?,
+        max_x: bbox_max_x,
+        max_y: bbox_max_y,
+    })
+}
+
+fn draw_skilltree_links(
+    frame: &mut dyn Renderer2d,
+    width: u32,
+    height: u32,
+    def: &SkillTreeDef,
+    node_boxes: &HashMap<&str, NodeScreenBox>,
+) {
+    for node in &def.nodes {
+        let Some(target_box) = node_boxes.get(node.id.as_str()) else {
+            continue;
+        };
+        let target_center = target_box.center_i32();
+        for req in &node.requires {
+            let Some(source_box) = node_boxes.get(req.as_str()) else {
+                continue;
+            };
+            let source_center = source_box.center_i32();
+            if source_center == target_center {
+                continue;
+            }
+            draw_arrow(
+                frame,
+                width,
+                height,
+                source_center,
+                target_center,
+                COLOR_SKILLTREE_LINK,
+                SKILLTREE_LINK_THICKNESS,
+            );
+        }
+    }
+}
+
+fn draw_arrow(
+    frame: &mut dyn Renderer2d,
+    width: u32,
+    height: u32,
+    from: (i32, i32),
+    to: (i32, i32),
+    color: [u8; 4],
+    thickness: u32,
+) {
+    let dx = (to.0 - from.0) as f32;
+    let dy = (to.1 - from.1) as f32;
+    let len = (dx * dx + dy * dy).sqrt();
+    if len <= 1.0 {
+        return;
+    }
+
+    let ux = dx / len;
+    let uy = dy / len;
+    let tip_x = to.0 as f32;
+    let tip_y = to.1 as f32;
+    let base_x = tip_x - ux * SKILLTREE_ARROW_LENGTH;
+    let base_y = tip_y - uy * SKILLTREE_ARROW_LENGTH;
+    let perp_x = -uy;
+    let perp_y = ux;
+    let left_x = base_x + perp_x * SKILLTREE_ARROW_WIDTH;
+    let left_y = base_y + perp_y * SKILLTREE_ARROW_WIDTH;
+    let right_x = base_x - perp_x * SKILLTREE_ARROW_WIDTH;
+    let right_y = base_y - perp_y * SKILLTREE_ARROW_WIDTH;
+
+    draw_line_i32(
+        frame,
+        width,
+        height,
+        from.0,
+        from.1,
+        base_x.round() as i32,
+        base_y.round() as i32,
+        color,
+        thickness,
+    );
+    draw_line_i32(
+        frame,
+        width,
+        height,
+        tip_x.round() as i32,
+        tip_y.round() as i32,
+        left_x.round() as i32,
+        left_y.round() as i32,
+        color,
+        thickness,
+    );
+    draw_line_i32(
+        frame,
+        width,
+        height,
+        tip_x.round() as i32,
+        tip_y.round() as i32,
+        right_x.round() as i32,
+        right_y.round() as i32,
+        color,
+        thickness,
+    );
+}
+
+fn draw_line_i32(
+    frame: &mut dyn Renderer2d,
+    width: u32,
+    height: u32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    color: [u8; 4],
+    thickness: u32,
+) {
+    let mut x0 = x0;
+    let mut y0 = y0;
+    let dx = (x1 - x0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let dy = -(y1 - y0).abs();
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    let half = (thickness / 2) as i32;
+    let t = thickness.max(1);
+
+    loop {
+        fill_rect_i32(
+            frame,
+            width,
+            height,
+            x0 - half,
+            y0 - half,
+            t,
+            t,
+            color,
+        );
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
+        }
+    }
 }
 

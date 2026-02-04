@@ -1,4 +1,6 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GameView {
     MainMenu,
     Tetris { paused: bool },
@@ -12,7 +14,7 @@ impl Default for GameView {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GameViewEvent {
     StartGame,
     OpenSkillTree,
@@ -22,7 +24,7 @@ pub enum GameViewEvent {
     GameOver,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GameViewEffect {
     None,
     ResetTetris,

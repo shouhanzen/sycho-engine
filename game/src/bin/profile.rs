@@ -182,7 +182,7 @@ fn main() {
 
         let draw_start = Instant::now();
         let mut gfx = CpuRenderer::new(surface.frame_mut(), SurfaceSize::new(width, height));
-        draw_tetris(&mut gfx, width, height, runner.state());
+        draw_tetris(&mut gfx, width, height, runner.state().tetris());
         let draw_dt = draw_start.elapsed();
 
         if i >= warmup {
