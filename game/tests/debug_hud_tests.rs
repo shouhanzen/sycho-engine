@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use game::debug::{draw_text, DebugHud};
+use engine::graphics::{CpuRenderer, Renderer2d};
+use engine::surface::SurfaceSize;
+use game::debug::DebugHud;
 
 #[test]
 fn draw_text_writes_some_pixels() {
@@ -9,7 +11,8 @@ fn draw_text_writes_some_pixels() {
     let mut frame = vec![0u8; (width * height * 4) as usize];
 
     let color = [255u8, 255u8, 255u8, 255u8];
-    draw_text(&mut frame, width, height, 0, 0, "FPS", color);
+    let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
+    gfx.draw_text(0, 0, "FPS", color);
 
     let any_text_pixel = frame.chunks_exact(4).any(|px| px == color);
     assert!(any_text_pixel, "expected draw_text to paint at least one pixel");
@@ -24,8 +27,10 @@ fn draw_text_renders_distinct_glyphs_for_distinct_chars() {
     let mut frame_a = vec![0u8; (width * height * 4) as usize];
     let mut frame_b = vec![0u8; (width * height * 4) as usize];
 
-    draw_text(&mut frame_a, width, height, 0, 0, "A", color);
-    draw_text(&mut frame_b, width, height, 0, 0, "B", color);
+    let mut gfx_a = CpuRenderer::new(&mut frame_a, SurfaceSize::new(width, height));
+    gfx_a.draw_text(0, 0, "A", color);
+    let mut gfx_b = CpuRenderer::new(&mut frame_b, SurfaceSize::new(width, height));
+    gfx_b.draw_text(0, 0, "B", color);
 
     assert_ne!(
         frame_a, frame_b,
@@ -39,15 +44,8 @@ fn draw_text_clips_without_panicking() {
     let height = 8u32;
     let mut frame = vec![0u8; (width * height * 4) as usize];
 
-    draw_text(
-        &mut frame,
-        width,
-        height,
-        width.saturating_sub(1),
-        height.saturating_sub(1),
-        "A",
-        [255, 0, 0, 255],
-    );
+    let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
+    gfx.draw_text(width.saturating_sub(1), height.saturating_sub(1), "A", [255, 0, 0, 255]);
 }
 
 #[test]

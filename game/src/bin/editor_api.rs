@@ -1,6 +1,8 @@
 use std::{
     env,
     net::SocketAddr,
+    path::PathBuf,
+    process::Command,
     sync::{Arc, Mutex},
 };
 
@@ -10,9 +12,12 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use serde::Serialize;
 use tower_http::cors::{Any, CorsLayer};
 
-use engine::editor::{EditorManifest, EditorSnapshot, EditorTimeline, FramesRequest, StepRequest};
+use engine::editor::{
+    EditorManifest, EditorSnapshot, EditorTimeline, FramesRequest, SeekRequest, StepRequest,
+};
 use game::editor_api::{EditorApiError, EditorSession};
 
 #[derive(Clone)]
@@ -28,12 +33,15 @@ fn router(state: AppState) -> Router {
 
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/game/status", get(game_status))
+        .route("/api/game/launch", post(game_launch))
         .route("/api/manifest", get(manifest))
         .route("/api/agent/state", get(agent_state))
         .route("/api/agent/timeline", get(agent_timeline))
         .route("/api/agent/step", post(agent_step))
         .route("/api/agent/rewind", post(agent_rewind))
         .route("/api/agent/forward", post(agent_forward))
+        .route("/api/agent/seek", post(agent_seek))
         .route("/api/agent/reset", post(agent_reset))
         .with_state(state)
         .layer(cors)
@@ -60,6 +68,96 @@ where
 
 async fn health() -> &'static str {
     "ok"
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GameStatusResponse {
+    running: bool,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GameLaunchResponse {
+    ok: bool,
+    detail: String,
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("game crate should live under the repo root")
+        .to_path_buf()
+}
+
+fn output_detail(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout,
+        (true, false) => stderr,
+        (false, false) => format!("{stdout}\n{stderr}"),
+    }
+}
+
+fn resolve_bash_bin() -> String {
+    if let Ok(bash) = env::var("BASH") {
+        let trimmed = bash.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    if cfg!(windows) {
+        if let Ok(shell) = env::var("SHELL") {
+            let trimmed = shell.trim();
+            if !trimmed.is_empty() && trimmed.to_ascii_lowercase().contains("bash") {
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    "bash".to_string()
+}
+
+fn run_go_sh(args: &str) -> Result<std::process::Output, String> {
+    let root = repo_root();
+    let output = Command::new(resolve_bash_bin())
+        .arg("-lc")
+        .arg(format!("./go.sh {args}"))
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("failed to run go.sh via bash: {e}"))?;
+    Ok(output)
+}
+
+async fn game_status() -> Json<GameStatusResponse> {
+    match run_go_sh("--status --game") {
+        Ok(output) => Json(GameStatusResponse {
+            running: output.status.success(),
+            detail: output_detail(&output),
+        }),
+        Err(err) => Json(GameStatusResponse {
+            running: false,
+            detail: err,
+        }),
+    }
+}
+
+async fn game_launch() -> Json<GameLaunchResponse> {
+    match run_go_sh("--start --game --detach") {
+        Ok(output) => Json(GameLaunchResponse {
+            ok: output.status.success(),
+            detail: output_detail(&output),
+        }),
+        Err(err) => Json(GameLaunchResponse {
+            ok: false,
+            detail: err,
+        }),
+    }
 }
 
 async fn manifest(State(state): State<AppState>) -> Json<EditorManifest> {
@@ -137,6 +235,20 @@ async fn agent_forward(
             .lock()
             .expect("editor api session lock should be available");
         session.forward(payload.frames)
+    };
+    Json(snapshot)
+}
+
+async fn agent_seek(
+    State(state): State<AppState>,
+    Json(payload): Json<SeekRequest>,
+) -> Json<EditorSnapshot> {
+    let snapshot = {
+        let mut session = state
+            .session
+            .lock()
+            .expect("editor api session lock should be available");
+        session.seek(payload.frame)
     };
     Json(snapshot)
 }

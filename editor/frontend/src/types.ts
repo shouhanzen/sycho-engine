@@ -31,6 +31,7 @@ export interface EditorStat {
 
 export interface EditorSnapshot {
   frame: number;
+  state: unknown;
   stats: EditorStat[];
   grid: EditorGrid | null;
 }

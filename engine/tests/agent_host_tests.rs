@@ -61,3 +61,35 @@ fn agent_host_returns_history() {
         _ => panic!("expected history response"),
     }
 }
+
+#[test]
+fn agent_host_seek_moves_cursor_to_requested_frame() {
+    let mut host = AgentHost::new(Additive);
+    host.handle(AgentCommand::Step(1));
+    host.handle(AgentCommand::Step(2));
+    host.handle(AgentCommand::Step(3));
+
+    let response = host.handle(AgentCommand::Seek { frame: 1 });
+    match response {
+        AgentResponse::State { frame, state } => {
+            assert_eq!(frame, 1);
+            assert_eq!(state, 1);
+        }
+        _ => panic!("expected state response"),
+    }
+}
+
+#[test]
+fn agent_host_seek_clamps_to_end_of_history() {
+    let mut host = AgentHost::new(Additive);
+    host.handle(AgentCommand::Step(5));
+
+    let response = host.handle(AgentCommand::Seek { frame: 999 });
+    match response {
+        AgentResponse::State { frame, state } => {
+            assert_eq!(frame, 1);
+            assert_eq!(state, 5);
+        }
+        _ => panic!("expected state response"),
+    }
+}

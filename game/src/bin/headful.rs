@@ -9,7 +9,8 @@ use std::{
 
 use engine::{HeadlessRunner, TimeMachine};
 use engine::profiling::{Profiler, StepTimings};
-use engine::surface::{Surface, SurfaceSize};
+use engine::pixels_renderer::{PixelsRenderer2d, RenderBackend2d};
+use engine::surface::SurfaceSize;
 use pixels::{Pixels, PixelsBuilder, SurfaceTexture};
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
 use winit::{
@@ -19,8 +20,7 @@ use winit::{
     window::WindowBuilder,
 };
 
-use game::debug::{draw_text, DebugHud};
-use game::gpu_renderer::{BufferMode, GpuTetrisRenderer};
+use game::debug::DebugHud;
 use game::playtest::{InputAction, TetrisLogic};
 use game::round_timer::RoundTimer;
 use game::sfx::{ACTION_SFX_VOLUME, LINE_CLEAR_SFX_VOLUME, MOVE_PIECE_SFX_VOLUME, MUSIC_VOLUME};
@@ -314,73 +314,6 @@ struct StepCapture {
 impl Profiler for StepCapture {
     fn on_step(&mut self, frame: usize, timings: StepTimings) {
         self.last = Some((frame, timings));
-    }
-}
-
-struct PixelsSurface {
-    pixels: Pixels,
-    size: SurfaceSize,
-    buffer_mode: BufferMode,
-}
-
-impl PixelsSurface {
-    fn new(pixels: Pixels, size: SurfaceSize) -> Self {
-        Self {
-            pixels,
-            size,
-            buffer_mode: BufferMode::CpuMatchesSurface,
-        }
-    }
-
-    fn pixels(&self) -> &Pixels {
-        &self.pixels
-    }
-
-    fn buffer_mode(&self) -> BufferMode {
-        self.buffer_mode
-    }
-
-    fn set_buffer_mode(&mut self, mode: BufferMode) -> Result<(), pixels::Error> {
-        if mode == self.buffer_mode {
-            return Ok(());
-        }
-
-        match mode {
-            BufferMode::CpuMatchesSurface => {
-                self.pixels.resize_buffer(self.size.width, self.size.height)?;
-            }
-            BufferMode::GpuTiny => {
-                self.pixels.resize_buffer(1, 1)?;
-            }
-        }
-
-        self.buffer_mode = mode;
-        Ok(())
-    }
-}
-
-impl Surface for PixelsSurface {
-    type Error = pixels::Error;
-
-    fn size(&self) -> SurfaceSize {
-        self.size
-    }
-
-    fn frame_mut(&mut self) -> &mut [u8] {
-        self.pixels.frame_mut()
-    }
-
-    fn resize(&mut self, size: SurfaceSize) -> Result<(), Self::Error> {
-        self.size = size;
-        self.pixels.resize_surface(size.width, size.height)?;
-        if self.buffer_mode == BufferMode::CpuMatchesSurface {
-            self.pixels.resize_buffer(size.width, size.height)?;
-        }
-        Ok(())
-    }
-
-    fn present(&mut self) -> Result<(), Self::Error> {
-        self.pixels.render()
     }
 }
 
@@ -702,14 +635,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         build_pixels(None)?
     };
-    let mut surface = PixelsSurface::new(pixels, initial_surface_size);
 
     // Default to GPU rendering (opt-out via ROLLOUT_HEADFUL_GPU=0).
     let gpu_enabled = env_bool("ROLLOUT_HEADFUL_GPU").unwrap_or(true);
-    let mut gpu_renderer = gpu_enabled.then(|| {
-        let p = surface.pixels();
-        GpuTetrisRenderer::new(&p.context().device, p.surface_texture_format())
-    });
+    let backend = if gpu_enabled {
+        RenderBackend2d::Gpu
+    } else {
+        RenderBackend2d::Cpu
+    };
+    let mut renderer = PixelsRenderer2d::new(pixels, initial_surface_size, backend)?;
 
     let logic = TetrisLogic::new(0, Piece::all());
     let mut runner = if let Some(path) = replay_path.as_ref() {
@@ -872,12 +806,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 WindowEvent::Resized(size) => {
                     if size.width > 0 && size.height > 0 {
-                        let _ = surface.resize(SurfaceSize::new(size.width, size.height));
+                        let _ = renderer.resize(SurfaceSize::new(size.width, size.height));
                     }
                 }
                 WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
                     if new_inner_size.width > 0 && new_inner_size.height > 0 {
-                        let _ = surface.resize(SurfaceSize::new(new_inner_size.width, new_inner_size.height));
+                        let _ = renderer.resize(SurfaceSize::new(new_inner_size.width, new_inner_size.height));
                     }
                 }
                 WindowEvent::KeyboardInput {
@@ -1165,144 +1099,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let state = runner.state();
                 let board_dt = board_start.elapsed();
 
-                let size = surface.size();
-                let want_gpu = gpu_enabled;
-                let (draw_start, draw_dt, overlay_start, overlay_dt, present_start, present_dt) = if want_gpu {
-                    if surface.buffer_mode() != BufferMode::GpuTiny {
-                        if let Err(e) = surface.set_buffer_mode(BufferMode::GpuTiny) {
-                            eprintln!("failed switching pixels buffer to GPU mode: {e}");
-                            *control_flow = ControlFlow::Exit;
-                            return;
-                        }
-                    }
+                let size = renderer.size();
 
-                    let Some(gpu) = gpu_renderer.as_mut() else {
-                        eprintln!("gpu renderer requested but not initialized");
-                        *control_flow = ControlFlow::Exit;
-                        return;
-                    };
-
-                    // Update UI layouts for hit-testing without CPU-rendering full frames.
-                    let mut scratch = [0u8; 4];
-                    match view {
-                        GameView::MainMenu => {
-                            last_main_menu = draw_main_menu(&mut scratch, size.width, size.height);
-                            last_pause_menu = PauseMenuLayout::default();
-                            last_skilltree = SkillTreeLayout::default();
-                            last_game_over_menu = GameOverMenuLayout::default();
-                        }
-                        GameView::SkillTree => {
-                            last_main_menu = MainMenuLayout::default();
-                            last_pause_menu = PauseMenuLayout::default();
-                            last_skilltree = draw_skilltree(&mut scratch, size.width, size.height);
-                            last_game_over_menu = GameOverMenuLayout::default();
-                        }
-                        GameView::Tetris { paused: true } => {
-                            last_main_menu = MainMenuLayout::default();
-                            last_pause_menu = draw_pause_menu(&mut scratch, size.width, size.height);
-                            last_skilltree = SkillTreeLayout::default();
-                            last_game_over_menu = GameOverMenuLayout::default();
-                        }
-                        GameView::Tetris { paused: false } => {
-                            last_main_menu = MainMenuLayout::default();
-                            last_pause_menu = PauseMenuLayout::default();
-                            last_skilltree = SkillTreeLayout::default();
-                            last_game_over_menu = GameOverMenuLayout::default();
-                        }
-                        GameView::GameOver => {
-                            last_main_menu = MainMenuLayout::default();
-                            last_pause_menu = PauseMenuLayout::default();
-                            last_skilltree = SkillTreeLayout::default();
-                            last_game_over_menu =
-                                draw_game_over_menu(&mut scratch, size.width, size.height);
-                        }
-                    }
-
-                    let timer_text = if view.is_tetris() && !replay_mode {
-                        let remaining_s = round_timer.remaining().as_secs_f32();
-                        Some(format!("TIME {remaining_s:>4.1}"))
-                    } else {
-                        None
-                    };
-
-                    let draw_start = Instant::now();
-                    gpu.begin_frame();
-                    last_layout = match view {
-                        // Skilltree is its own scene: do not render the Tetris world beneath it.
-                        GameView::SkillTree => {
-                                gpu.push_skilltree(size.width, size.height, last_skilltree, Some((mouse_x, mouse_y)));
-                            UiLayout::default()
-                        }
-                        // Main menu is its own scene: do not render the Tetris world beneath it.
-                        GameView::MainMenu => UiLayout::default(),
-                        _ => {
-                            if view.is_tetris() {
-                                gpu.push_tetris(
-                                    size.width,
-                                    size.height,
-                                    state,
-                                    timer_text.as_deref(),
-                                        Some((mouse_x, mouse_y)),
-                                )
-                            } else {
-                                gpu.push_tetris_world(size.width, size.height, state)
-                            }
-                        }
-                    };
-                    let draw_dt = draw_start.elapsed();
-
-                    let overlay_start = Instant::now();
-                    match view {
-                        GameView::MainMenu => {
-                            gpu.push_main_menu(size.width, size.height, last_main_menu, Some((mouse_x, mouse_y)))
-                        }
-                        GameView::SkillTree => {}
-                        GameView::Tetris { paused: true } => {
-                            gpu.push_pause_menu(size.width, size.height, last_pause_menu, Some((mouse_x, mouse_y)))
-                        }
-                        GameView::GameOver => {
-                            gpu.push_game_over_menu(size.width, size.height, last_game_over_menu, Some((mouse_x, mouse_y)))
-                        }
-                        GameView::Tetris { paused: false } => {}
-                    }
-
-                    if debug_hud.is_enabled() {
-                        let lines = debug_hud.lines();
-                        gpu.push_debug_hud(size.width, size.height, &lines);
-                    }
-
-                    let overlay_dt = overlay_start.elapsed();
-
-                    let present_start = Instant::now();
-                    if let Err(e) = surface.pixels().render_with(|encoder, render_target, ctx| {
-                        gpu.render(encoder, render_target, ctx, size.width, size.height);
-                        Ok(())
-                    }) {
-                        eprintln!("gpu present failed: {e}");
-                        *control_flow = ControlFlow::Exit;
-                    }
-                    let present_dt = present_start.elapsed();
-
-                    (draw_start, draw_dt, overlay_start, overlay_dt, present_start, present_dt)
-                } else {
-                    if surface.buffer_mode() != BufferMode::CpuMatchesSurface {
-                        if let Err(e) = surface.set_buffer_mode(BufferMode::CpuMatchesSurface) {
-                            eprintln!("failed switching pixels buffer to CPU mode: {e}");
-                            *control_flow = ControlFlow::Exit;
-                            return;
-                        }
-                    }
-
+                let (draw_start, draw_dt, overlay_start, overlay_dt) = match renderer.draw_frame(|gfx| {
                     let draw_start = Instant::now();
                     if matches!(view, GameView::SkillTree | GameView::MainMenu) {
                         // SkillTree and MainMenu are their own scenes; do not render the Tetris world beneath them.
                         last_layout = UiLayout::default();
                     } else {
                         let tetris_layout =
-                            draw_tetris_world(surface.frame_mut(), size.width, size.height, state);
+                            draw_tetris_world(gfx, size.width, size.height, state);
                         if view.is_tetris() {
                             draw_tetris_hud_with_cursor(
-                                surface.frame_mut(),
+                                gfx,
                                 size.width,
                                 size.height,
                                 state,
@@ -1316,18 +1125,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Round timer HUD: show remaining time near the existing score/lines HUD.
                     if view.is_tetris() && !replay_mode {
                         let hud_x = last_layout.pause_button.x.saturating_sub(180);
-                        let hud_y = last_layout.pause_button.y.saturating_add(6).saturating_add(28);
+                        let hud_y = last_layout
+                            .pause_button
+                            .y
+                            .saturating_add(6)
+                            .saturating_add(28);
                         let remaining_s = round_timer.remaining().as_secs_f32();
                         let timer_text = format!("TIME {remaining_s:>4.1}");
-                        draw_text(
-                            surface.frame_mut(),
-                            size.width,
-                            size.height,
-                            hud_x,
-                            hud_y,
-                            &timer_text,
-                            [235, 235, 245, 255],
-                        );
+                        gfx.draw_text(hud_x, hud_y, &timer_text, [235, 235, 245, 255]);
                     }
 
                     let draw_dt = draw_start.elapsed();
@@ -1335,8 +1140,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let overlay_start = Instant::now();
                     match view {
                         GameView::MainMenu => {
-                            last_main_menu =
-                                draw_main_menu_with_cursor(surface.frame_mut(), size.width, size.height, Some((mouse_x, mouse_y)));
+                            last_main_menu = draw_main_menu_with_cursor(
+                                gfx,
+                                size.width,
+                                size.height,
+                                Some((mouse_x, mouse_y)),
+                            );
                             last_pause_menu = PauseMenuLayout::default();
                             last_skilltree = SkillTreeLayout::default();
                             last_game_over_menu = GameOverMenuLayout::default();
@@ -1344,14 +1153,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         GameView::SkillTree => {
                             last_main_menu = MainMenuLayout::default();
                             last_pause_menu = PauseMenuLayout::default();
-                            last_skilltree =
-                                draw_skilltree_with_cursor(surface.frame_mut(), size.width, size.height, Some((mouse_x, mouse_y)));
+                            last_skilltree = draw_skilltree_with_cursor(
+                                gfx,
+                                size.width,
+                                size.height,
+                                Some((mouse_x, mouse_y)),
+                            );
                             last_game_over_menu = GameOverMenuLayout::default();
                         }
                         GameView::Tetris { paused: true } => {
                             last_main_menu = MainMenuLayout::default();
-                            last_pause_menu =
-                                draw_pause_menu_with_cursor(surface.frame_mut(), size.width, size.height, Some((mouse_x, mouse_y)));
+                            last_pause_menu = draw_pause_menu_with_cursor(
+                                gfx,
+                                size.width,
+                                size.height,
+                                Some((mouse_x, mouse_y)),
+                            );
                             last_skilltree = SkillTreeLayout::default();
                             last_game_over_menu = GameOverMenuLayout::default();
                         }
@@ -1366,24 +1183,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             last_pause_menu = PauseMenuLayout::default();
                             last_skilltree = SkillTreeLayout::default();
                             last_game_over_menu = draw_game_over_menu_with_cursor(
-                                surface.frame_mut(),
+                                gfx,
                                 size.width,
                                 size.height,
                                 Some((mouse_x, mouse_y)),
                             );
                         }
                     }
-                    debug_hud.draw_overlay(surface.frame_mut(), size.width, size.height);
+                    debug_hud.draw_overlay(gfx, size.width, size.height);
                     let overlay_dt = overlay_start.elapsed();
 
-                    let present_start = Instant::now();
-                    if surface.present().is_err() {
+                    (draw_start, draw_dt, overlay_start, overlay_dt)
+                }) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("draw failed: {e}");
                         *control_flow = ControlFlow::Exit;
+                        return;
                     }
-                    let present_dt = present_start.elapsed();
-
-                    (draw_start, draw_dt, overlay_start, overlay_dt, present_start, present_dt)
                 };
+
+                let present_start = Instant::now();
+                if let Err(e) = renderer.present() {
+                    eprintln!("present failed: {e}");
+                    *control_flow = ControlFlow::Exit;
+                    return;
+                }
+                let present_dt = present_start.elapsed();
 
                 let frame_total_dt = frame_start.elapsed();
                 debug_hud.on_frame(
@@ -1411,7 +1237,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
 
                     if trace.captured_frames >= trace.target_frames {
-                        let size = surface.size();
+                        let size = renderer.size();
                         match trace.write(size) {
                             Ok(path) => {
                                 println!("trace written: {}", path.display());

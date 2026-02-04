@@ -82,6 +82,14 @@ export function fetchManifest(): Promise<EditorManifest> {
   return request("/api/manifest");
 }
 
+export function fetchGameStatus(): Promise<{ running: boolean; detail: string }> {
+  return request("/api/game/status");
+}
+
+export function launchGame(): Promise<{ ok: boolean; detail: string }> {
+  return request("/api/game/launch", { method: "POST" });
+}
+
 export function fetchState(): Promise<EditorSnapshot> {
   return request("/api/agent/state");
 }
@@ -108,6 +116,13 @@ export function forward(frames: number): Promise<EditorSnapshot> {
   return request("/api/agent/forward", {
     method: "POST",
     body: JSON.stringify({ frames }),
+  });
+}
+
+export function seek(frame: number): Promise<EditorSnapshot> {
+  return request("/api/agent/seek", {
+    method: "POST",
+    body: JSON.stringify({ frame }),
   });
 }
 

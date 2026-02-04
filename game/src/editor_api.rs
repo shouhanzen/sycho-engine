@@ -99,6 +99,10 @@ impl EditorSession {
         snapshot_from_response(self.host.handle(AgentCommand::Forward { frames }))
     }
 
+    pub fn seek(&mut self, frame: usize) -> EditorSnapshot {
+        snapshot_from_response(self.host.handle(AgentCommand::Seek { frame }))
+    }
+
     pub fn reset(&mut self) -> EditorSnapshot {
         snapshot_from_response(self.host.handle(AgentCommand::Reset))
     }
@@ -130,6 +134,7 @@ fn snapshot_from_response(response: AgentResponse<TetrisCore>) -> EditorSnapshot
 
 fn snapshot_from_state(frame: usize, state: &TetrisCore) -> EditorSnapshot {
     let pos = state.current_piece_pos();
+    let state_json = serde_json::to_value(state).expect("tetris core should be json-serializable");
 
     let stats = vec![
         stat("score", state.score()),
@@ -151,6 +156,7 @@ fn snapshot_from_state(frame: usize, state: &TetrisCore) -> EditorSnapshot {
 
     EditorSnapshot {
         frame,
+        state: state_json,
         stats,
         grid: Some(grid),
     }
@@ -222,6 +228,25 @@ mod tests {
         assert_eq!(timeline.history_len, 3);
         assert!(timeline.can_rewind);
         assert!(!timeline.can_forward);
+    }
+
+    #[test]
+    fn snapshot_includes_raw_state_json() {
+        let mut session = EditorSession::new(0);
+        let snapshot = session.state();
+        assert!(!snapshot.state.is_null());
+    }
+
+    #[test]
+    fn seek_moves_cursor_to_requested_frame() {
+        let mut session = EditorSession::new(0);
+        session.step("noop").unwrap();
+        session.step("noop").unwrap();
+        assert_eq!(session.timeline().frame, 2);
+
+        let snapshot = session.seek(0);
+        assert_eq!(snapshot.frame, 0);
+        assert_eq!(session.timeline().frame, 0);
     }
 
     #[test]

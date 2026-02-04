@@ -55,10 +55,11 @@ pub struct EditorTimeline {
     pub can_forward: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct EditorSnapshot {
     pub frame: usize,
+    pub state: serde_json::Value,
     pub stats: Vec<EditorStat>,
     pub grid: Option<EditorGrid>,
 }
@@ -73,5 +74,11 @@ pub struct StepRequest {
 #[serde(rename_all = "camelCase")]
 pub struct FramesRequest {
     pub frames: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SeekRequest {
+    pub frame: usize,
 }
 

@@ -2,6 +2,7 @@ use std::time::{Duration, Instant};
 
 use engine::profiling::{Profiler, StepTimings};
 use engine::surface::{RgbaBufferSurface, Surface, SurfaceSize};
+use engine::graphics::CpuRenderer;
 use engine::HeadlessRunner;
 
 use game::playtest::{InputAction, TetrisLogic};
@@ -180,7 +181,8 @@ fn main() {
         runner.step_profiled(InputAction::Noop, &mut steps);
 
         let draw_start = Instant::now();
-        draw_tetris(surface.frame_mut(), width, height, runner.state());
+        let mut gfx = CpuRenderer::new(surface.frame_mut(), SurfaceSize::new(width, height));
+        draw_tetris(&mut gfx, width, height, runner.state());
         let draw_dt = draw_start.elapsed();
 
         if i >= warmup {

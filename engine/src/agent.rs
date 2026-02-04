@@ -8,6 +8,7 @@ pub enum AgentCommand<I> {
     GetHistory,
     Rewind { frames: usize },
     Forward { frames: usize },
+    Seek { frame: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +68,13 @@ where
             }
             AgentCommand::Forward { frames } => {
                 let frame = self.runner.forward(frames);
+                AgentResponse::State {
+                    frame,
+                    state: self.runner.state().clone(),
+                }
+            }
+            AgentCommand::Seek { frame } => {
+                let frame = self.runner.seek(frame);
                 AgentResponse::State {
                     frame,
                     state: self.runner.state().clone(),

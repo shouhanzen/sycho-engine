@@ -1,4 +1,6 @@
 use engine::render::{color_for_cell, CELL_SIZE};
+use engine::graphics::CpuRenderer;
+use engine::surface::SurfaceSize;
 
 use game::tetris_core::{Piece, TetrisCore, Vec2i, BOARD_HEIGHT};
 use game::tetris_ui::{
@@ -16,7 +18,8 @@ fn draw_tetris_renders_hold_panel_outside_board_area() {
     core.set_available_pieces(Piece::all());
     core.initialize_game();
 
-    let layout = draw_tetris(&mut frame, width, height, &core);
+    let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
+    let layout = draw_tetris(&mut gfx, width, height, &core);
     assert!(layout.hold_panel.w > 0 && layout.hold_panel.h > 0);
     assert!(layout.hold_panel.x < width && layout.hold_panel.y < height);
 
@@ -41,7 +44,8 @@ fn draw_tetris_renders_ghost_piece_at_hard_drop_position() {
 
     assert_eq!(core.ghost_piece_pos(), Some(Vec2i::new(4, 1)));
 
-    let layout = draw_tetris(&mut frame, width, height, &core);
+    let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
+    let layout = draw_tetris(&mut gfx, width, height, &core);
 
     let bg = color_for_cell(0);
     let piece_color = color_for_cell(2);
@@ -86,7 +90,8 @@ fn draw_tetris_renders_pause_button_in_bounds() {
     core.set_available_pieces(Piece::all());
     core.initialize_game();
 
-    let layout = draw_tetris(&mut frame, width, height, &core);
+    let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
+    let layout = draw_tetris(&mut gfx, width, height, &core);
     assert!(layout.pause_button.w > 0 && layout.pause_button.h > 0);
     assert!(layout.pause_button.x < width && layout.pause_button.y < height);
 
@@ -112,7 +117,8 @@ fn draw_pause_menu_draws_a_panel_and_resume_button() {
         px.copy_from_slice(&bg);
     }
 
-    let layout = draw_pause_menu(&mut frame, width, height);
+    let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
+    let layout = draw_pause_menu(&mut gfx, width, height);
     assert!(layout.panel.w > 0 && layout.panel.h > 0);
     assert!(layout.resume_button.w > 0 && layout.resume_button.h > 0);
     assert!(layout.end_run_button.w > 0 && layout.end_run_button.h > 0);
@@ -136,7 +142,8 @@ fn draw_main_menu_draws_a_panel_and_buttons() {
         px.copy_from_slice(&bg);
     }
 
-    let layout = draw_main_menu(&mut frame, width, height);
+    let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
+    let layout = draw_main_menu(&mut gfx, width, height);
     assert!(layout.panel.w > 0 && layout.panel.h > 0);
     assert!(layout.start_button.w > 0 && layout.start_button.h > 0);
     assert!(layout.quit_button.w > 0 && layout.quit_button.h > 0);
@@ -188,7 +195,8 @@ fn draw_main_menu_brightens_start_button_on_hover() {
     for px in frame_normal.chunks_exact_mut(4) {
         px.copy_from_slice(&bg);
     }
-    let layout = draw_main_menu(&mut frame_normal, width, height);
+    let mut gfx_normal = CpuRenderer::new(&mut frame_normal, SurfaceSize::new(width, height));
+    let layout = draw_main_menu(&mut gfx_normal, width, height);
 
     let hover_x = layout.start_button.x.saturating_add(2);
     let hover_y = layout.start_button.y.saturating_add(2);
@@ -200,8 +208,8 @@ fn draw_main_menu_brightens_start_button_on_hover() {
     for px in frame_hover.chunks_exact_mut(4) {
         px.copy_from_slice(&bg);
     }
-    let _layout_hover =
-        draw_main_menu_with_cursor(&mut frame_hover, width, height, Some((hover_x, hover_y)));
+    let mut gfx_hover = CpuRenderer::new(&mut frame_hover, SurfaceSize::new(width, height));
+    let _layout_hover = draw_main_menu_with_cursor(&mut gfx_hover, width, height, Some((hover_x, hover_y)));
     let mut hover_px = [0u8; 4];
     hover_px.copy_from_slice(&frame_hover[idx..idx + 4]);
 
@@ -234,7 +242,8 @@ fn draw_main_menu_clears_the_tetris_board_underneath() {
     core.set_cell(0, 0, 2);
     core.set_cell(0, BOARD_HEIGHT - 1, 2);
 
-    let tetris_layout = draw_tetris(&mut frame, width, height, &core);
+    let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
+    let tetris_layout = draw_tetris(&mut gfx, width, height, &core);
 
     // Sample a pixel inside the bottom-left painted board cell.
     let cell_x = 0u32;
@@ -249,7 +258,8 @@ fn draw_main_menu_clears_the_tetris_board_underneath() {
         "expected the painted board cell pixel to be present before opening main menu"
     );
 
-    draw_main_menu(&mut frame, width, height);
+    let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
+    draw_main_menu(&mut gfx, width, height);
     assert_eq!(
         &frame[idx..idx + 4],
         &bg,
@@ -268,7 +278,8 @@ fn draw_game_over_menu_draws_a_panel_and_buttons() {
         px.copy_from_slice(&bg);
     }
 
-    let layout = draw_game_over_menu(&mut frame, width, height);
+    let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
+    let layout = draw_game_over_menu(&mut gfx, width, height);
     assert!(layout.panel.w > 0 && layout.panel.h > 0);
     assert!(layout.restart_button.w > 0 && layout.restart_button.h > 0);
     assert!(layout.skilltree_button.w > 0 && layout.skilltree_button.h > 0);
@@ -295,7 +306,8 @@ fn draw_skilltree_draws_a_panel_and_start_new_game_button() {
     core.set_available_pieces(vec![Piece::O]);
     core.initialize_game();
     core.set_current_piece_for_test(Piece::O, Vec2i::new(4, 10), 0);
-    let tetris_layout = draw_tetris(&mut frame, width, height, &core);
+    let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
+    let tetris_layout = draw_tetris(&mut gfx, width, height, &core);
 
     let piece_color = color_for_cell(2);
     let cell_x = 4u32;
@@ -310,7 +322,8 @@ fn draw_skilltree_draws_a_panel_and_start_new_game_button() {
         "expected the active piece pixel to be present before opening skilltree"
     );
 
-    let layout = draw_skilltree(&mut frame, width, height);
+    let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
+    let layout = draw_skilltree(&mut gfx, width, height);
     assert!(layout.panel.w > 0 && layout.panel.h > 0);
     assert!(layout.start_new_game_button.w > 0 && layout.start_new_game_button.h > 0);
 

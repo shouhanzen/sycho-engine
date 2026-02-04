@@ -1,7 +1,7 @@
+use engine::graphics::Renderer2d;
 use engine::render::{color_for_cell, draw_board, CELL_SIZE};
 use engine::ui as ui;
 
-use crate::debug::{draw_text, draw_text_scaled};
 use crate::tetris_core::{piece_board_offset, piece_grid, piece_type, Piece, TetrisCore, Vec2i};
 
 const COLOR_PANEL_BG: [u8; 4] = [16, 16, 22, 255];
@@ -783,7 +783,7 @@ enum PieceDrawStyle {
 }
 
 fn draw_ghost_and_active_piece(
-    frame: &mut [u8],
+    frame: &mut dyn Renderer2d,
     width: u32,
     height: u32,
     board_rect: Rect,
@@ -828,7 +828,7 @@ fn draw_ghost_and_active_piece(
 }
 
 fn draw_piece_on_board(
-    frame: &mut [u8],
+    frame: &mut dyn Renderer2d,
     width: u32,
     height: u32,
     board_rect: Rect,
@@ -880,7 +880,7 @@ fn draw_piece_on_board(
 }
 
 fn draw_hold_panel(
-    frame: &mut [u8],
+    frame: &mut dyn Renderer2d,
     width: u32,
     height: u32,
     rect: Rect,
@@ -904,7 +904,13 @@ fn draw_hold_panel(
     draw_piece_preview(frame, width, height, preview_x, preview_y, held_piece, can_hold);
 }
 
-fn draw_next_panel(frame: &mut [u8], width: u32, height: u32, rect: Rect, next_queue: &[Piece]) {
+fn draw_next_panel(
+    frame: &mut dyn Renderer2d,
+    width: u32,
+    height: u32,
+    rect: Rect,
+    next_queue: &[Piece],
+) {
     if rect.w == 0 || rect.h == 0 {
         return;
     }
@@ -934,7 +940,7 @@ fn draw_next_panel(frame: &mut [u8], width: u32, height: u32, rect: Rect, next_q
 }
 
 fn draw_piece_preview(
-    frame: &mut [u8],
+    frame: &mut dyn Renderer2d,
     width: u32,
     height: u32,
     x: u32,
@@ -1006,7 +1012,14 @@ fn button_colors(hovered: bool) -> ([u8; 4], [u8; 4]) {
     }
 }
 
-fn draw_button(frame: &mut [u8], width: u32, height: u32, rect: Rect, label: &str, hovered: bool) {
+fn draw_button(
+    frame: &mut dyn Renderer2d,
+    width: u32,
+    height: u32,
+    rect: Rect,
+    label: &str,
+    hovered: bool,
+) {
     let (fill, border) = button_colors(hovered);
     fill_rect(frame, width, height, rect.x, rect.y, rect.w, rect.h, fill);
     draw_rect_outline(frame, width, height, rect.x, rect.y, rect.w, rect.h, border);
@@ -1022,62 +1035,22 @@ fn draw_button(frame: &mut [u8], width: u32, height: u32, rect: Rect, label: &st
 }
 
 fn fill_rect(
-    frame: &mut [u8],
-    width: u32,
-    height: u32,
+    frame: &mut dyn Renderer2d,
+    _width: u32,
+    _height: u32,
     x: u32,
     y: u32,
     w: u32,
     h: u32,
     color: [u8; 4],
 ) {
-    let max_x = (x + w).min(width);
-    let max_y = (y + h).min(height);
-
-    if x >= max_x || y >= max_y {
-        return;
-    }
-
-    let width = width as usize;
-    let height = height as usize;
-    let expected_len = width
-        .checked_mul(height)
-        .and_then(|v| v.checked_mul(4))
-        .unwrap_or(0);
-    if expected_len == 0 || frame.len() < expected_len {
-        return;
-    }
-
-    let row_pixels = (max_x - x) as usize;
-    let row_bytes = row_pixels.checked_mul(4).unwrap_or(0);
-    if row_bytes == 0 {
-        return;
-    }
-
-    let stride = width.checked_mul(4).unwrap_or(0);
-    let mut row_start = (y as usize)
-        .checked_mul(stride)
-        .and_then(|v| v.checked_add((x as usize).checked_mul(4)?))
-        .unwrap_or(0);
-
-    let [r, g, b, a] = color;
-    for _ in y..max_y {
-        let row_end = row_start + row_bytes;
-        let row = &mut frame[row_start..row_end];
-        for px in row.chunks_exact_mut(4) {
-            px[0] = r;
-            px[1] = g;
-            px[2] = b;
-            px[3] = a;
-        }
-        row_start += stride;
-    }
+    frame.fill_rect(Rect::new(x, y, w, h), color);
 }
 
 fn blend_rect(
-    frame: &mut [u8],
-    width: u32,
-    height: u32,
+    frame: &mut dyn Renderer2d,
+    _width: u32,
+    _height: u32,
     x: u32,
     y: u32,
     w: u32,
@@ -1085,94 +1058,44 @@ fn blend_rect(
     color: [u8; 4],
     alpha: u8,
 ) {
-    if alpha == 0 {
-        return;
-    }
-    if alpha == 255 {
-        fill_rect(frame, width, height, x, y, w, h, color);
-        return;
-    }
-
-    let max_x = (x + w).min(width);
-    let max_y = (y + h).min(height);
-    if x >= max_x || y >= max_y {
-        return;
-    }
-
-    let width = width as usize;
-    let height = height as usize;
-    let expected_len = width
-        .checked_mul(height)
-        .and_then(|v| v.checked_mul(4))
-        .unwrap_or(0);
-    if expected_len == 0 || frame.len() < expected_len {
-        return;
-    }
-
-    let row_pixels = (max_x - x) as usize;
-    let row_bytes = row_pixels.checked_mul(4).unwrap_or(0);
-    if row_bytes == 0 {
-        return;
-    }
-
-    let a = alpha as u32;
-    let inv = 255u32 - a;
-    let stride = width.checked_mul(4).unwrap_or(0);
-    let mut row_start = (y as usize)
-        .checked_mul(stride)
-        .and_then(|v| v.checked_add((x as usize).checked_mul(4)?))
-        .unwrap_or(0);
-
-    for _ in y..max_y {
-        let row_end = row_start + row_bytes;
-        let row = &mut frame[row_start..row_end];
-        for px in row.chunks_exact_mut(4) {
-            let r0 = px[0] as u32;
-            let g0 = px[1] as u32;
-            let b0 = px[2] as u32;
-
-            px[0] = ((r0 * inv + (color[0] as u32) * a + 127) / 255) as u8;
-            px[1] = ((g0 * inv + (color[1] as u32) * a + 127) / 255) as u8;
-            px[2] = ((b0 * inv + (color[2] as u32) * a + 127) / 255) as u8;
-            px[3] = 255;
-        }
-        row_start += stride;
-    }
+    frame.blend_rect(Rect::new(x, y, w, h), color, alpha);
 }
 
 fn draw_rect_outline(
-    frame: &mut [u8],
-    width: u32,
-    height: u32,
+    frame: &mut dyn Renderer2d,
+    _width: u32,
+    _height: u32,
     x: u32,
     y: u32,
     w: u32,
     h: u32,
     color: [u8; 4],
 ) {
-    if w == 0 || h == 0 {
-        return;
-    }
+    frame.rect_outline(Rect::new(x, y, w, h), color);
+}
 
-    let x1 = x.saturating_add(w).min(width);
-    let y1 = y.saturating_add(h).min(height);
-    if x >= x1 || y >= y1 {
-        return;
-    }
+fn draw_text(
+    frame: &mut dyn Renderer2d,
+    _width: u32,
+    _height: u32,
+    x: u32,
+    y: u32,
+    text: &str,
+    color: [u8; 4],
+) {
+    frame.draw_text(x, y, text, color);
+}
 
-    let w = x1 - x;
-    let h = y1 - y;
-
-    // Top / bottom edges.
-    fill_rect(frame, width, height, x, y, w, 1, color);
-    if h > 1 {
-        fill_rect(frame, width, height, x, y1.saturating_sub(1), w, 1, color);
-    }
-
-    // Left / right edges.
-    fill_rect(frame, width, height, x, y, 1, h, color);
-    if w > 1 {
-        fill_rect(frame, width, height, x1.saturating_sub(1), y, 1, h, color);
-    }
+fn draw_text_scaled(
+    frame: &mut dyn Renderer2d,
+    _width: u32,
+    _height: u32,
+    x: u32,
+    y: u32,
+    text: &str,
+    color: [u8; 4],
+    scale: u32,
+) {
+    frame.draw_text_scaled(x, y, text, color, scale);
 }
 
