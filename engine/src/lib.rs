@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod app;
 pub mod editor;
 pub mod render;
 pub mod surface;
@@ -7,6 +8,7 @@ pub mod regression;
 pub mod profiling;
 pub mod ui;
 pub mod ui_tree;
+pub mod view_tree;
 pub mod graphics;
 pub mod pixels_renderer;
 

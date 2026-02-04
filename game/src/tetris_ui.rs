@@ -190,6 +190,27 @@ pub fn draw_tetris_hud_with_ui(
     layout: UiLayout,
     ui_tree: &mut UiTree,
 ) {
+    let pause_hovered = ui_tree.is_hovered(UI_TETRIS_PAUSE);
+    draw_tetris_hud_with_ui_and_pause_hover(
+        frame,
+        width,
+        height,
+        state,
+        layout,
+        ui_tree,
+        pause_hovered,
+    );
+}
+
+pub fn draw_tetris_hud_with_ui_and_pause_hover(
+    frame: &mut dyn Renderer2d,
+    width: u32,
+    height: u32,
+    state: &TetrisCore,
+    layout: UiLayout,
+    ui_tree: &mut UiTree,
+    pause_hovered: bool,
+) {
     draw_hold_panel(
         frame,
         width,
@@ -211,7 +232,45 @@ pub fn draw_tetris_hud_with_ui(
     ui_tree.ensure_button(UI_TETRIS_HOLD, layout.hold_panel, Some(ACTION_TETRIS_HOLD));
     ui_tree.add_child(UI_TETRIS_HUD_CONTAINER, UI_TETRIS_HOLD);
 
-    let pause_hovered = ui_tree.is_hovered(UI_TETRIS_PAUSE);
+    draw_pause_button(frame, width, height, layout.pause_button, pause_hovered);
+
+    // Simple HUD: score + lines, placed near the top-right (left of the pause button).
+    let hud_x = layout.pause_button.x.saturating_sub(180);
+    let hud_y = layout.pause_button.y.saturating_add(6);
+    let score_text = format!("SCORE {}", state.score());
+    let lines_text = format!("LINES {}", state.lines_cleared());
+    draw_text(frame, width, height, hud_x, hud_y, &score_text, COLOR_PAUSE_ICON);
+    draw_text(
+        frame,
+        width,
+        height,
+        hud_x,
+        hud_y.saturating_add(14),
+        &lines_text,
+        COLOR_PAUSE_ICON,
+    );
+}
+
+pub fn draw_tetris_hud_view(
+    frame: &mut dyn Renderer2d,
+    width: u32,
+    height: u32,
+    state: &TetrisCore,
+    layout: UiLayout,
+    mouse_pos: Option<(u32, u32)>,
+) {
+    let pause_hovered = mouse_pos
+        .map(|(mx, my)| layout.pause_button.contains(mx, my))
+        .unwrap_or(false);
+    draw_hold_panel(
+        frame,
+        width,
+        height,
+        layout.hold_panel,
+        state.held_piece(),
+        state.can_hold(),
+    );
+    draw_next_panel(frame, width, height, layout.next_panel, state.next_queue());
     draw_pause_button(frame, width, height, layout.pause_button, pause_hovered);
 
     // Simple HUD: score + lines, placed near the top-right (left of the pause button).
@@ -305,6 +364,17 @@ pub fn draw_skilltree_runtime_with_ui(
     ui_tree: &mut UiTree,
     runtime: &SkillTreeRuntime,
 ) -> SkillTreeLayout {
+    draw_skilltree_runtime_with_ui_and_mouse(frame, width, height, ui_tree, runtime, None)
+}
+
+pub fn draw_skilltree_runtime_with_ui_and_mouse(
+    frame: &mut dyn Renderer2d,
+    width: u32,
+    height: u32,
+    ui_tree: &mut UiTree,
+    runtime: &SkillTreeRuntime,
+    mouse_pos: Option<(u32, u32)>,
+) -> SkillTreeLayout {
     draw_skilltree_impl(
         frame,
         width,
@@ -313,6 +383,7 @@ pub fn draw_skilltree_runtime_with_ui(
         Some(runtime),
         &runtime.def,
         &runtime.progress,
+        mouse_pos,
     )
 }
 
@@ -326,7 +397,7 @@ pub fn draw_skilltree_with_ui(
     // `draw_skilltree_runtime_with_ui` instead.
     let def = SkillTreeDef::default();
     let progress = SkillTreeProgress::default();
-    draw_skilltree_impl(frame, width, height, ui_tree, None, &def, &progress)
+    draw_skilltree_impl(frame, width, height, ui_tree, None, &def, &progress, None)
 }
 
 fn draw_skilltree_impl(
@@ -337,6 +408,7 @@ fn draw_skilltree_impl(
     runtime: Option<&SkillTreeRuntime>,
     def: &SkillTreeDef,
     progress: &SkillTreeProgress,
+    mouse_pos: Option<(u32, u32)>,
 ) -> SkillTreeLayout {
     // Skilltree is its own scene: clear the frame so the Tetris board is not visible.
     fill_rect(frame, width, height, 0, 0, width, height, color_for_cell(0));
@@ -454,12 +526,16 @@ fn draw_skilltree_impl(
                 h: tool_button_h,
             };
             let active = tool == *tool_kind;
-            let hovered = match tool_kind {
-                SkillTreeEditorTool::Select => ui_tree.is_hovered(UI_SKILLTREE_TOOL_SELECT),
-                SkillTreeEditorTool::Move => ui_tree.is_hovered(UI_SKILLTREE_TOOL_MOVE),
-                SkillTreeEditorTool::AddCell => ui_tree.is_hovered(UI_SKILLTREE_TOOL_ADD_CELL),
-                SkillTreeEditorTool::RemoveCell => ui_tree.is_hovered(UI_SKILLTREE_TOOL_REMOVE_CELL),
-                SkillTreeEditorTool::ConnectPrereqs => ui_tree.is_hovered(UI_SKILLTREE_TOOL_LINK),
+            let hovered = if let Some((mx, my)) = mouse_pos {
+                rect.contains(mx, my)
+            } else {
+                match tool_kind {
+                    SkillTreeEditorTool::Select => ui_tree.is_hovered(UI_SKILLTREE_TOOL_SELECT),
+                    SkillTreeEditorTool::Move => ui_tree.is_hovered(UI_SKILLTREE_TOOL_MOVE),
+                    SkillTreeEditorTool::AddCell => ui_tree.is_hovered(UI_SKILLTREE_TOOL_ADD_CELL),
+                    SkillTreeEditorTool::RemoveCell => ui_tree.is_hovered(UI_SKILLTREE_TOOL_REMOVE_CELL),
+                    SkillTreeEditorTool::ConnectPrereqs => ui_tree.is_hovered(UI_SKILLTREE_TOOL_LINK),
+                }
             };
             draw_tool_button(frame, width, height, rect, label, hovered, active);
 

@@ -3,7 +3,9 @@
 //! This module is intentionally small and dependency-free: it provides a `Rect` type plus
 //! a few helpers for common 2D layout tasks (padding/insets + anchored placement).
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rect {
     pub x: u32,
     pub y: u32,
