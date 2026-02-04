@@ -173,6 +173,20 @@ pub trait GameLogic {
     fn step(&self, state: &Self::State, input: Self::Input) -> Self::State;
 }
 
+pub trait RecordableState {
+    fn recording_frame(&self) -> usize;
+    fn save_recording(&self, path: &Path) -> io::Result<()>;
+}
+
+pub trait ReplayableState: Sized {
+    fn replay_frame(&self) -> usize;
+    fn replay_len(&self) -> usize;
+    fn replay_seek(&mut self, frame: usize);
+    fn replay_forward(&mut self, frames: usize);
+    fn replay_rewind(&mut self, frames: usize);
+    fn replay_load(&self, path: &Path) -> io::Result<Self>;
+}
+
 #[derive(Debug)]
 pub struct HeadlessRunner<G: GameLogic> {
     game: G,
@@ -315,6 +329,51 @@ impl<G: GameLogic> HeadlessRunner<G> {
         self.state = self.timemachine.state().clone();
         self.absolute_frame = frame.saturating_mul(self.timemachine.record_every_n_frames());
         frame
+    }
+}
+
+impl<G> RecordableState for HeadlessRunner<G>
+where
+    G: GameLogic,
+    G::State: Serialize,
+{
+    fn recording_frame(&self) -> usize {
+        self.frame()
+    }
+
+    fn save_recording(&self, path: &Path) -> io::Result<()> {
+        self.timemachine.save_json_file(path)
+    }
+}
+
+impl<G> ReplayableState for HeadlessRunner<G>
+where
+    G: GameLogic + Clone,
+    G::State: Serialize + DeserializeOwned,
+{
+    fn replay_frame(&self) -> usize {
+        self.frame()
+    }
+
+    fn replay_len(&self) -> usize {
+        self.history().len()
+    }
+
+    fn replay_seek(&mut self, frame: usize) {
+        let _ = self.seek(frame);
+    }
+
+    fn replay_forward(&mut self, frames: usize) {
+        let _ = self.forward(frames);
+    }
+
+    fn replay_rewind(&mut self, frames: usize) {
+        let _ = self.rewind(frames);
+    }
+
+    fn replay_load(&self, path: &Path) -> io::Result<Self> {
+        let tm = TimeMachine::<G::State>::load_json_file(path)?;
+        Ok(HeadlessRunner::from_timemachine(self.game.clone(), tm))
     }
 }
 

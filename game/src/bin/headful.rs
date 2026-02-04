@@ -1,18 +1,27 @@
 use std::{
     cell::Cell,
-    fs,
-    io::{self, Write},
+    io,
     io::Cursor,
     path::PathBuf,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use engine::{HeadlessRunner, TimeMachine};
-use engine::app::{AppConfig, AppContext, GameApp, InputFrame, run_game};
+use engine::HeadlessRunner;
+use engine::app::{
+    AppConfig,
+    AppContext,
+    GameApp,
+    InputFrame,
+    RecordingConfig,
+    ProfileConfig,
+    ReplayConfig,
+    run_game,
+    run_game_with_recording,
+    run_game_with_profile,
+    run_game_with_replay,
+};
 use engine::editor::{EditorSnapshot, EditorTimeline};
-use engine::profiling::{Profiler, StepTimings};
 use engine::pixels_renderer::PixelsRenderer2d;
-use engine::surface::SurfaceSize;
 use engine::ui_tree::{UiEvent, UiInput, UiTree};
 use engine::view_tree::hit_test_actions;
 use pixels::{Pixels, PixelsBuilder, SurfaceTexture};
@@ -47,11 +56,7 @@ use game::view_tree::{
 };
 
 struct HeadfulApp {
-    replay_mode: bool,
-    replay_path: Option<PathBuf>,
-    record_path: Option<PathBuf>,
     profiling: bool,
-    profile_frames: usize,
     base_logic: TetrisLogic,
     base_round_limit: Duration,
     base_gravity_interval: Duration,
@@ -71,15 +76,8 @@ struct HeadfulApp {
     target_fps: u32,
     frame_interval: Duration,
     next_redraw: Instant,
-    trace: Option<TraceCapture>,
-    step_capture: StepCapture,
-    replay_playing: bool,
-    replay_fps: u32,
-    replay_next_step: Instant,
-    recording_saved: Cell<bool>,
     remote_editor_api: Option<RemoteServer>,
     last_frame_dt: Duration,
-    last_engine_total_dt: Duration,
     exit_requested: bool,
     mouse_release_was_drag: bool,
     consume_next_mouse_up: bool,
@@ -105,7 +103,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(path) = replay_path.as_ref() {
         println!("replay: {}", path.display());
-        println!("controls: Space play/pause, Left/Right step, Home/End jump, Up/Down speed, Esc quit");
     }
 
     let profile_frames = env_usize("ROLLOUT_HEADFUL_PROFILE_FRAMES").unwrap_or(0);
@@ -135,27 +132,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let base_logic = TetrisLogic::new(0, Piece::all());
-    let app = HeadfulApp::new(
-        replay_mode,
-        replay_path,
-        record_path,
-        profiling,
-        profile_frames,
-        base_logic,
-        DEFAULT_ROUND_LIMIT,
-        DEFAULT_GRAVITY_INTERVAL,
-    );
+    let app = HeadfulApp::new(profiling, base_logic, DEFAULT_ROUND_LIMIT, DEFAULT_GRAVITY_INTERVAL);
 
-    run_game(config, app)
+    if let Some(path) = replay_path {
+        run_game_with_replay(
+            config,
+            app,
+            ReplayConfig {
+                path,
+                fps: 15,
+            },
+        )
+    } else if let Some(path) = record_path {
+        run_game_with_recording(config, app, RecordingConfig { path })
+    } else if profile_frames > 0 {
+        run_game_with_profile(
+            config,
+            app,
+            ProfileConfig {
+                target_frames: profile_frames,
+            },
+        )
+    } else {
+        run_game(config, app)
+    }
 }
 
 impl HeadfulApp {
     fn new(
-        replay_mode: bool,
-        replay_path: Option<PathBuf>,
-        record_path: Option<PathBuf>,
         profiling: bool,
-        profile_frames: usize,
         base_logic: TetrisLogic,
         base_round_limit: Duration,
         base_gravity_interval: Duration,
@@ -163,7 +168,7 @@ impl HeadfulApp {
         let sfx = Sfx::new().ok();
         let target_fps: u32 = 60;
         let frame_interval = Duration::from_secs_f64(1.0 / (target_fps as f64));
-        let mut remote_editor_api = match env_u16("ROLLOUT_HEADFUL_EDITOR_PORT").unwrap_or(0) {
+        let remote_editor_api = match env_u16("ROLLOUT_HEADFUL_EDITOR_PORT").unwrap_or(0) {
             0 => None,
             port => match RemoteServer::start(port) {
                 Ok(server) => {
@@ -178,16 +183,8 @@ impl HeadfulApp {
                 }
             },
         };
-        if replay_mode {
-            remote_editor_api = None;
-        }
-
         Self {
-            replay_mode,
-            replay_path,
-            record_path,
             profiling,
-            profile_frames,
             base_logic,
             base_round_limit,
             base_gravity_interval,
@@ -207,15 +204,8 @@ impl HeadfulApp {
             target_fps,
             frame_interval,
             next_redraw: Instant::now(),
-            trace: profiling.then(|| TraceCapture::new(profile_frames)),
-            step_capture: StepCapture::default(),
-            replay_playing: replay_mode,
-            replay_fps: 15,
-            replay_next_step: Instant::now(),
-            recording_saved: Cell::new(false),
             remote_editor_api,
             last_frame_dt: Duration::ZERO,
-            last_engine_total_dt: Duration::ZERO,
             exit_requested: false,
             mouse_release_was_drag: false,
             consume_next_mouse_up: false,
@@ -230,29 +220,20 @@ impl GameApp for HeadfulApp {
     type Effect = ();
 
     fn init_state(&mut self, _ctx: &mut AppContext) -> Self::State {
-        let mut runner = if let Some(path) = self.replay_path.as_ref() {
-            let tm = TimeMachine::<GameState>::load_json_file(path).expect("replay load failed");
-            let mut runner = HeadlessRunner::from_timemachine(self.base_logic.clone(), tm);
-            runner.seek(0);
-            runner
-        } else {
-            HeadlessRunner::new(self.base_logic.clone())
-        };
+        let mut runner = HeadlessRunner::new(self.base_logic.clone());
         if let Some(record_every) = env_usize("ROLLOUT_RECORD_EVERY_N_FRAMES") {
             runner.set_record_every_n_frames(record_every.max(1));
         }
-        if !self.replay_mode {
-            let state = runner.state_mut();
-            state.view = if self.profiling {
-                GameView::Tetris { paused: false }
-            } else {
-                GameView::MainMenu
-            };
-            state.skilltree = SkillTreeRuntime::load_default();
-            state.round_timer = RoundTimer::new(self.base_round_limit);
-            state.gravity_interval = self.base_gravity_interval;
-            state.gravity_elapsed = Duration::ZERO;
-        }
+        let state = runner.state_mut();
+        state.view = if self.profiling {
+            GameView::Tetris { paused: false }
+        } else {
+            GameView::MainMenu
+        };
+        state.skilltree = SkillTreeRuntime::load_default();
+        state.round_timer = RoundTimer::new(self.base_round_limit);
+        state.gravity_interval = self.base_gravity_interval;
+        state.gravity_elapsed = Duration::ZERO;
         self.render_state = Some(runner.state().clone());
         runner
     }
@@ -345,25 +326,10 @@ impl GameApp for HeadfulApp {
             }
         }
 
-        if self.replay_mode {
-            if self.replay_playing && now >= self.replay_next_step {
-                let max_frame = state.history().len().saturating_sub(1);
-                if state.frame() < max_frame {
-                    state.forward(1);
-                } else {
-                    self.replay_playing = false;
-                }
-                let interval = Duration::from_secs_f64(1.0 / (self.replay_fps.max(1) as f64));
-                self.replay_next_step = now + interval;
-            }
-        }
-
-        if self.trace.is_none() && !self.replay_mode {
-            let view = state.state().view;
-            if view.is_tetris_playing() {
-                if let Some(action) = self.horizontal_repeat.next_repeat_action(now) {
-                    apply_action(state, self.sfx.as_ref(), &mut self.debug_hud, action);
-                }
+        let view = state.state().view;
+        if view.is_tetris_playing() {
+            if let Some(action) = self.horizontal_repeat.next_repeat_action(now) {
+                apply_action(state, self.sfx.as_ref(), &mut self.debug_hud, action);
             }
         }
 
@@ -374,7 +340,7 @@ impl GameApp for HeadfulApp {
         }
 
         let mut ui_handled = false;
-        if !self.replay_mode && input.mouse_up && allow_ui {
+        if input.mouse_up && allow_ui {
             if let Some(action) = actions.first().copied() {
                 match action {
                     GameUiAction::StartGame => {
@@ -565,7 +531,7 @@ impl GameApp for HeadfulApp {
             }
         }
 
-        if !self.replay_mode && input.mouse_up && allow_ui && !ui_handled {
+        if input.mouse_up && allow_ui && !ui_handled {
             let ui_events = self.ui_tree.process_input(UiInput {
                 mouse_pos: Some((self.mouse_x, self.mouse_y)),
                 mouse_down: input.mouse_down,
@@ -610,7 +576,7 @@ impl GameApp for HeadfulApp {
             }
         }
 
-        if !self.replay_mode && input.mouse_up && allow_ui && !ui_handled {
+        if input.mouse_up && allow_ui && !ui_handled {
             let view = state.state().view;
             if matches!(view, GameView::SkillTree) && !self.mouse_release_was_drag {
                 let skilltree_editor_enabled = state.state().skilltree.editor.enabled;
@@ -745,7 +711,7 @@ impl GameApp for HeadfulApp {
             self.mouse_release_was_drag = false;
         }
 
-        if !self.profiling && !self.replay_mode {
+        if !self.profiling {
             let mut trigger_game_over = false;
             {
                 let state = state.state_mut();
@@ -768,26 +734,24 @@ impl GameApp for HeadfulApp {
             }
         }
 
-        if self.trace.is_none() && !self.replay_mode {
-            let mut gravity_steps = 0usize;
-            {
-                let state = state.state_mut();
-                if state.view.is_tetris_playing() {
-                    state.gravity_elapsed = state.gravity_elapsed.saturating_add(dt);
-                    while state.gravity_elapsed >= state.gravity_interval {
-                        state.gravity_elapsed =
-                            state.gravity_elapsed.saturating_sub(state.gravity_interval);
-                        gravity_steps = gravity_steps.saturating_add(1);
-                    }
-                } else {
-                    state.gravity_elapsed = Duration::ZERO;
+        let mut gravity_steps = 0usize;
+        {
+            let state = state.state_mut();
+            if state.view.is_tetris_playing() {
+                state.gravity_elapsed = state.gravity_elapsed.saturating_add(dt);
+                while state.gravity_elapsed >= state.gravity_interval {
+                    state.gravity_elapsed =
+                        state.gravity_elapsed.saturating_sub(state.gravity_interval);
+                    gravity_steps = gravity_steps.saturating_add(1);
                 }
+            } else {
+                state.gravity_elapsed = Duration::ZERO;
             }
-            for _ in 0..gravity_steps {
-                let gravity_start = Instant::now();
-                state.step_profiled(InputAction::SoftDrop, &mut self.debug_hud);
-                self.debug_hud.record_gravity(gravity_start.elapsed());
-            }
+        }
+        for _ in 0..gravity_steps {
+            let gravity_start = Instant::now();
+            state.step_profiled(InputAction::SoftDrop, &mut self.debug_hud);
+            self.debug_hud.record_gravity(gravity_start.elapsed());
         }
 
         let view = state.state().view;
@@ -938,27 +902,6 @@ impl GameApp for HeadfulApp {
             );
         }
 
-        self.last_engine_total_dt = Duration::ZERO;
-        if let Some(trace) = self.trace.as_mut() {
-            let engine_total_start = Instant::now();
-            state.step_profiled(InputAction::Noop, &mut self.step_capture);
-            if let Some((frame, timings)) = self.step_capture.last.take() {
-                self.last_engine_total_dt = timings.total;
-                self.debug_hud.on_step(frame, timings);
-                trace.record("engine.step", engine_total_start, timings.step);
-                trace.record("engine.record", engine_total_start + timings.step, timings.record);
-                trace.record("engine.total", engine_total_start, timings.total);
-            }
-        }
-
-        if let Some(path) = self.record_path.as_ref() {
-            if !self.recording_saved.get() && state.frame() > 0 {
-                let _ = state.timemachine().save_json_file(path);
-                self.recording_saved.set(true);
-                println!("recording saved: {}", path.display());
-            }
-        }
-
         self.render_state = Some(state.state().clone());
         Vec::new()
     }
@@ -1001,7 +944,7 @@ impl GameApp for HeadfulApp {
             self.last_layout = tetris_layout;
         }
 
-        if view.is_tetris() && !self.replay_mode {
+        if view.is_tetris() {
             let hud_x = self.last_layout.pause_button.x.saturating_sub(180);
             let hud_y = self
                 .last_layout
@@ -1087,32 +1030,6 @@ impl GameApp for HeadfulApp {
             frame_total_dt,
         );
 
-        if let Some(trace) = self.trace.as_mut() {
-            trace.record("render.draw_tetris", draw_start, draw_dt);
-            trace.record("render.debug_overlay", overlay_start, overlay_dt);
-            trace.record("render.present", present_start, present_dt);
-            trace.record("frame.total", frame_start, frame_total_dt);
-
-            trace.record_frame_samples(
-                self.last_engine_total_dt,
-                draw_dt,
-                overlay_dt,
-                present_dt,
-                frame_total_dt,
-            );
-
-            if trace.captured_frames >= trace.target_frames {
-                let size = renderer.size();
-                match trace.write(size) {
-                    Ok(path) => {
-                        println!("trace written: {}", path.display());
-                        trace.print_summary();
-                    }
-                    Err(e) => eprintln!("failed writing trace: {e}"),
-                }
-                self.exit_requested = true;
-            }
-        }
     }
 
     fn handle_event(
@@ -1205,9 +1122,6 @@ impl GameApp for HeadfulApp {
                     });
                 }
                 WindowEvent::MouseWheel { delta, .. } => {
-                    if self.replay_mode {
-                        return true;
-                    }
                     let view = runner.state().view;
                     if !matches!(view, GameView::SkillTree) {
                         return false;
@@ -1223,9 +1137,6 @@ impl GameApp for HeadfulApp {
                     button: MouseButton::Left,
                     ..
                 } => {
-                    if self.replay_mode {
-                        return true;
-                    }
                     let size = ctx.renderer.size();
                     if self
                         .debug_hud
@@ -1258,9 +1169,6 @@ impl GameApp for HeadfulApp {
                     button: MouseButton::Left,
                     ..
                 } => {
-                    if self.replay_mode {
-                        return true;
-                    }
                     self.mouse_release_was_drag = self.skilltree_cam_input.drag_started;
                     self.skilltree_cam_input.left_down = false;
                     self.skilltree_cam_input.drag_started = false;
@@ -1276,46 +1184,6 @@ impl GameApp for HeadfulApp {
                     ..
                 } => match key_state {
                     ElementState::Pressed => {
-                        let now = Instant::now();
-                        if self.replay_mode {
-                            match *key {
-                                VirtualKeyCode::Escape => {
-                                    *control_flow = ControlFlow::Exit;
-                                }
-                                VirtualKeyCode::Space => {
-                                    self.replay_playing = !self.replay_playing;
-                                    self.replay_next_step = now;
-                                }
-                                VirtualKeyCode::Left => {
-                                    runner.rewind(1);
-                                    self.replay_playing = false;
-                                }
-                                VirtualKeyCode::Right => {
-                                    runner.forward(1);
-                                    self.replay_playing = false;
-                                }
-                                VirtualKeyCode::Home => {
-                                    runner.seek(0);
-                                    self.replay_playing = false;
-                                }
-                                VirtualKeyCode::End => {
-                                    let last = runner.history().len().saturating_sub(1);
-                                    runner.seek(last);
-                                    self.replay_playing = false;
-                                }
-                                VirtualKeyCode::Up => {
-                                    self.replay_fps = self.replay_fps.saturating_mul(2).min(240).max(1);
-                                    self.replay_next_step = now;
-                                }
-                                VirtualKeyCode::Down => {
-                                    self.replay_fps = (self.replay_fps / 2).max(1);
-                                    self.replay_next_step = now;
-                                }
-                                _ => {}
-                            }
-                            return true;
-                        }
-
                         if *key == VirtualKeyCode::F3 {
                             self.debug_hud.toggle();
                         }
@@ -1562,9 +1430,6 @@ impl GameApp for HeadfulApp {
                         return true;
                     }
                     ElementState::Released => {
-                        if self.replay_mode {
-                            return true;
-                        }
                         let view = runner.state().view;
                         if !view.is_tetris() {
                             return true;
@@ -1596,19 +1461,6 @@ impl GameApp for HeadfulApp {
                     remote.shutdown();
                 }
 
-                if !self.recording_saved.get() {
-                    if let Some(path) = self.record_path.as_ref() {
-                        match runner.timemachine().save_json_file(path) {
-                            Ok(()) => {
-                                println!("state recording saved: {}", path.display());
-                            }
-                            Err(e) => {
-                                eprintln!("failed saving state recording to {}: {e}", path.display());
-                            }
-                        }
-                        self.recording_saved.set(true);
-                    }
-                }
                 return true;
             }
             _ => {}
@@ -1923,171 +1775,7 @@ fn parse_headful_cli() -> io::Result<HeadfulCli> {
     Ok(cli)
 }
 
-#[derive(Debug, Default, Clone)]
-struct DurationAgg {
-    n: usize,
-    sum: Duration,
-    max: Duration,
-}
-
-impl DurationAgg {
-    fn push(&mut self, d: Duration) {
-        self.n = self.n.saturating_add(1);
-        self.sum = self.sum.saturating_add(d);
-        if d > self.max {
-            self.max = d;
-        }
-    }
-
-    fn avg_ms(&self) -> f64 {
-        if self.n == 0 {
-            return 0.0;
-        }
-        (self.sum.as_secs_f64() * 1000.0) / (self.n as f64)
-    }
-
-    fn max_ms(&self) -> f64 {
-        self.max.as_secs_f64() * 1000.0
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
-struct TraceEvent {
-    name: &'static str,
-    ts_us: u64,
-    dur_us: u64,
-}
-
-#[derive(Debug)]
-struct TraceCapture {
-    target_frames: usize,
-    captured_frames: usize,
-    start: Instant,
-    events: Vec<TraceEvent>,
-
-    engine_total: DurationAgg,
-    draw: DurationAgg,
-    overlay: DurationAgg,
-    present: DurationAgg,
-    frame_total: DurationAgg,
-}
-
-impl TraceCapture {
-    fn new(target_frames: usize) -> Self {
-        let target_frames = target_frames.max(1);
-        Self {
-            target_frames,
-            captured_frames: 0,
-            start: Instant::now(),
-            events: Vec::with_capacity(target_frames.saturating_mul(8)),
-            engine_total: DurationAgg::default(),
-            draw: DurationAgg::default(),
-            overlay: DurationAgg::default(),
-            present: DurationAgg::default(),
-            frame_total: DurationAgg::default(),
-        }
-    }
-
-    fn ts_us(&self, t: Instant) -> u64 {
-        t.duration_since(self.start).as_micros() as u64
-    }
-
-    fn record(&mut self, name: &'static str, start: Instant, dur: Duration) {
-        self.events.push(TraceEvent {
-            name,
-            ts_us: self.ts_us(start),
-            dur_us: dur.as_micros() as u64,
-        });
-    }
-
-    fn record_frame_samples(&mut self, engine: Duration, draw: Duration, overlay: Duration, present: Duration, frame: Duration) {
-        self.engine_total.push(engine);
-        self.draw.push(draw);
-        self.overlay.push(overlay);
-        self.present.push(present);
-        self.frame_total.push(frame);
-        self.captured_frames = self.captured_frames.saturating_add(1);
-    }
-
-    fn default_trace_dir() -> PathBuf {
-        // `CARGO_MANIFEST_DIR` is `.../rollout_engine/game`; the workspace `target/` lives at `..`.
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("target")
-            .join("perf_traces")
-    }
-
-    fn write(&self, size: SurfaceSize) -> io::Result<PathBuf> {
-        let dir = Self::default_trace_dir();
-        fs::create_dir_all(&dir)?;
-
-        let epoch_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let file_name = format!(
-            "perf_trace_{epoch_ms}_{}x{}_{}f.json",
-            size.width, size.height, self.captured_frames
-        );
-        let path = dir.join(file_name);
-
-        let mut f = fs::File::create(&path)?;
-        writeln!(f, "{{\"traceEvents\":[")?;
-        for (i, e) in self.events.iter().enumerate() {
-            if i > 0 {
-                writeln!(f, ",")?;
-            }
-            write!(
-                f,
-                "  {{\"name\":\"{}\",\"ph\":\"X\",\"ts\":{},\"dur\":{},\"pid\":1,\"tid\":1}}",
-                e.name, e.ts_us, e.dur_us
-            )?;
-        }
-        writeln!(f, "\n]}}")?;
-        Ok(path)
-    }
-
-    fn print_summary(&self) {
-        println!("headful profile summary (ms; lower is better)");
-        println!(
-            "engine(avg/max)  {:>7.3} / {:>7.3}",
-            self.engine_total.avg_ms(),
-            self.engine_total.max_ms()
-        );
-        println!(
-            "draw  (avg/max)  {:>7.3} / {:>7.3}",
-            self.draw.avg_ms(),
-            self.draw.max_ms()
-        );
-        println!(
-            "overlay(avg/max) {:>7.3} / {:>7.3}",
-            self.overlay.avg_ms(),
-            self.overlay.max_ms()
-        );
-        println!(
-            "present(avg/max) {:>7.3} / {:>7.3}",
-            self.present.avg_ms(),
-            self.present.max_ms()
-        );
-        println!(
-            "frame (avg/max)  {:>7.3} / {:>7.3}",
-            self.frame_total.avg_ms(),
-            self.frame_total.max_ms()
-        );
-    }
-}
-
-#[derive(Debug, Default)]
-struct StepCapture {
-    last: Option<(usize, StepTimings)>,
-}
-
-impl Profiler for StepCapture {
-    fn on_step(&mut self, frame: usize, timings: StepTimings) {
-        self.last = Some((frame, timings));
-    }
-}
-
 #[derive(Debug, Clone)]
 struct BgMusic {
     sample_rate: u32,
