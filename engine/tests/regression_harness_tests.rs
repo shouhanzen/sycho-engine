@@ -53,6 +53,11 @@ impl GameLogic for GridGame {
 
 #[test]
 fn engine_regression_harness_record_replay_video_roundtrips() {
+    if !engine::regression::env_flag("ROLLOUT_REGRESSION_VIDEO") {
+        eprintln!("skipping: set ROLLOUT_REGRESSION_VIDEO=1 to enable video regression tests");
+        return;
+    }
+
     if !Mp4Recorder::ffmpeg_available() {
         eprintln!("skipping: ffmpeg not found on PATH");
         return;

@@ -4,7 +4,7 @@ use engine::surface::SurfaceSize;
 
 #[test]
 fn color_mapping_is_stable() {
-    assert_eq!(color_for_cell(0), [10, 10, 14, 255]);
+    assert_eq!(color_for_cell(0), [0, 0, 0, 255]);
     assert_eq!(color_for_cell(1), [0, 229, 255, 255]);
     assert_eq!(color_for_cell(2), [255, 215, 0, 255]);
 }
@@ -59,7 +59,7 @@ fn draw_board_centers_board_in_larger_buffer() {
     let window_bottom_left_index = ((height - 1) * width * 4) as usize;
     assert_eq!(
         &frame[window_bottom_left_index..window_bottom_left_index + 4],
-        &[10, 10, 14, 255]
+        &[0, 0, 0, 255]
     );
 }
 

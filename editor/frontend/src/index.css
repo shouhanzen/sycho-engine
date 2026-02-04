@@ -215,6 +215,13 @@ pre {
   gap: 12px;
 }
 
+.timeline-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+}
+
 .timeline-cursor {
   color: #c5c9d3;
 }
@@ -224,6 +231,21 @@ pre {
   align-items: center;
   gap: 12px;
   margin-top: 8px;
+}
+
+.hint {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #11141a;
+  border: 1px solid #2d313d;
+  color: #c5c9d3;
+  font-size: 0.9rem;
+  line-height: 1.35;
+}
+
+.hint strong {
+  color: #f6f7f9;
 }
 
 .timeline-seek input[type="range"] {

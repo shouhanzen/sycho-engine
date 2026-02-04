@@ -146,6 +146,9 @@ fn draw_main_menu_draws_a_panel_and_buttons() {
     let layout = draw_main_menu(&mut gfx, width, height);
     assert!(layout.panel.w > 0 && layout.panel.h > 0);
     assert!(layout.start_button.w > 0 && layout.start_button.h > 0);
+    assert!(
+        layout.skilltree_editor_button.w > 0 && layout.skilltree_editor_button.h > 0
+    );
     assert!(layout.quit_button.w > 0 && layout.quit_button.h > 0);
 
     let idx = ((layout.panel.y * width + layout.panel.x) * 4) as usize;

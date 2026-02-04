@@ -1,4 +1,4 @@
-use engine::agent::{AgentCommand, AgentHost, AgentResponse}; // PATCH_TEST
+use engine::agent::{AgentCommand, AgentHost, AgentResponse};
 use engine::editor::{
     EditorAction, EditorGrid, EditorManifest, EditorPaletteEntry, EditorSnapshot, EditorStat,
     EditorTimeline, GridOrigin,
@@ -108,7 +108,7 @@ impl EditorSession {
     }
 }
 
-fn action_from_id(id: &str) -> Option<InputAction> {
+pub fn action_from_id(id: &str) -> Option<InputAction> {
     match id {
         "moveLeft" => Some(InputAction::MoveLeft),
         "moveRight" => Some(InputAction::MoveRight),
@@ -132,7 +132,7 @@ fn snapshot_from_response(response: AgentResponse<TetrisCore>) -> EditorSnapshot
     }
 }
 
-fn snapshot_from_state(frame: usize, state: &TetrisCore) -> EditorSnapshot {
+pub fn snapshot_from_state(frame: usize, state: &TetrisCore) -> EditorSnapshot {
     let pos = state.current_piece_pos();
     let state_json = serde_json::to_value(state).expect("tetris core should be json-serializable");
 

@@ -16,6 +16,7 @@ impl Default for GameView {
 pub enum GameViewEvent {
     StartGame,
     OpenSkillTree,
+    OpenSkillTreeEditor,
     Back,
     TogglePause,
     GameOver,
@@ -36,6 +37,9 @@ impl GameView {
         match (self, event) {
             (GameView::MainMenu, GameViewEvent::StartGame) => {
                 (GameView::Tetris { paused: false }, GameViewEffect::ResetTetris)
+            }
+            (GameView::MainMenu, GameViewEvent::OpenSkillTreeEditor) => {
+                (GameView::SkillTree, GameViewEffect::None)
             }
 
             (GameView::SkillTree, GameViewEvent::Back) => (GameView::MainMenu, GameViewEffect::None),
@@ -98,6 +102,14 @@ mod tests {
         assert_eq!(
             GameView::MainMenu.handle(GameViewEvent::OpenSkillTree),
             (GameView::MainMenu, GameViewEffect::None)
+        );
+    }
+
+    #[test]
+    fn open_skilltree_editor_from_main_menu_enters_skilltree() {
+        assert_eq!(
+            GameView::MainMenu.handle(GameViewEvent::OpenSkillTreeEditor),
+            (GameView::SkillTree, GameViewEffect::None)
         );
     }
 

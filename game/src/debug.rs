@@ -65,6 +65,7 @@ fn duration_ms(d: Duration) -> f64 {
 #[derive(Debug, Clone)]
 pub struct DebugHud {
     enabled: bool,
+    minimized: bool,
 
     pending_input: Duration,
     pending_gravity: Duration,
@@ -87,6 +88,7 @@ impl DebugHud {
         let window = 120;
         Self {
             enabled: true,
+            minimized: false,
             pending_input: Duration::ZERO,
             pending_gravity: Duration::ZERO,
             last_input_at: None,
@@ -109,6 +111,14 @@ impl DebugHud {
 
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    pub fn toggle_minimized(&mut self) {
+        self.minimized = !self.minimized;
+    }
+
+    pub fn is_minimized(&self) -> bool {
+        self.minimized
     }
 
     pub fn record_input(&mut self, dt: Duration) {
@@ -199,12 +209,18 @@ impl DebugHud {
         ]
     }
 
-    pub fn draw_overlay(&self, gfx: &mut dyn Renderer2d, width: u32, height: u32) {
-        if !self.enabled {
-            return;
+    pub fn overlay_lines(&self) -> Vec<String> {
+        if self.minimized {
+            return vec!["DEBUG [+]".to_string()];
         }
 
-        let lines = self.lines();
+        let mut lines = Vec::with_capacity(self.lines().len() + 1);
+        lines.push("DEBUG [-]".to_string());
+        lines.extend(self.lines());
+        lines
+    }
+
+    fn panel_rect_for_lines(width: u32, height: u32, lines: &[String]) -> (Rect, u32) {
         let max_chars = lines.iter().map(|l| l.len() as u32).max().unwrap_or(0);
 
         let pad = 6u32 * FONT_SCALE;
@@ -216,15 +232,44 @@ impl DebugHud {
         let x0 = 10u32;
         let y0 = 10u32;
 
-        let panel = Rect::new(x0, y0, panel_w, panel_h);
+        (Rect::new(x0, y0, panel_w, panel_h), pad)
+    }
+
+    fn header_rect_for_panel(panel: Rect, pad: u32) -> Rect {
+        let header_h = (pad + LINE_ADVANCE_Y).min(panel.h);
+        Rect::new(panel.x, panel.y, panel.w, header_h)
+    }
+
+    pub fn handle_click(&mut self, x: u32, y: u32, width: u32, height: u32) -> bool {
+        if !self.enabled {
+            return false;
+        }
+
+        let lines = self.overlay_lines();
+        let (panel, pad) = Self::panel_rect_for_lines(width, height, &lines);
+        let header = Self::header_rect_for_panel(panel, pad);
+        if header.contains(x, y) {
+            self.toggle_minimized();
+            return true;
+        }
+        false
+    }
+
+    pub fn draw_overlay(&self, gfx: &mut dyn Renderer2d, width: u32, height: u32) {
+        if !self.enabled {
+            return;
+        }
+
+        let lines = self.overlay_lines();
+        let (panel, pad) = Self::panel_rect_for_lines(width, height, &lines);
         gfx.fill_rect(panel, COLOR_PANEL_BG);
         gfx.rect_outline(panel, COLOR_PANEL_BORDER);
 
-        let mut y = y0 + pad;
+        let mut y = panel.y + pad;
         for line in &lines {
-            gfx.draw_text(x0 + pad, y, line, COLOR_TEXT);
+            gfx.draw_text(panel.x + pad, y, line, COLOR_TEXT);
             y = y.saturating_add(LINE_ADVANCE_Y);
-            if y >= y0 + panel_h {
+            if y >= panel.y + panel.h {
                 break;
             }
         }

@@ -33,6 +33,16 @@ export function getApiBase(): string {
   return "http://127.0.0.1:4000";
 }
 
+function apiUrl(path: string): string {
+  // In dev, when the API base is supplied via Vite env, prefer same-origin requests and rely on
+  // Vite's `/api` proxy. This avoids CSP/CORS pitfalls inside Tauri while keeping prod behavior
+  // (explicit base URL + user-configurable local storage).
+  if (import.meta.env.DEV && envApiBase()) {
+    return path;
+  }
+  return `${getApiBase()}${path}`;
+}
+
 export function setApiBase(base: string): void {
   const env = envApiBase();
   if (env) {
@@ -48,7 +58,7 @@ export function setApiBase(base: string): void {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${getApiBase()}${path}`, {
+  const response = await fetch(apiUrl(path), {
     headers: {
       "Content-Type": "application/json",
     },
@@ -64,7 +74,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export function fetchHealth(): Promise<{ status: string }> {
-  return fetch(`${getApiBase()}/api/health`)
+  return fetch(apiUrl("/api/health"))
     .then(async (response) => {
       if (!response.ok) {
         const message = await response.text();

@@ -602,3 +602,65 @@ where
     })
 }
 
+
+
+/// Engine-level regression helper (hash-only, no ffmpeg dependency):
+/// - run a scenario live, saving a `TimeMachine` JSON recording
+/// - load the JSON recording, replay it, and compute render hashes for every state
+/// - assert the live and replay render hashes match
+///
+/// The caller provides a `scenario` closure that mutates the runner (e.g. steps inputs)
+/// and a `render` function that fills an RGBA frame for a given state.
+pub fn record_state_then_replay_and_compare_render_hashes_with<G, Scenario, Render>(
+    name: &str,
+    out_dir: impl AsRef<Path>,
+    game: G,
+    scenario: Scenario,
+    width: u32,
+    height: u32,
+    mut render: Render,
+) -> io::Result<RecordReplayHashArtifacts>
+where
+    G: GameLogic + Clone,
+    G::State: Serialize + DeserializeOwned,
+    Scenario: FnOnce(&mut HeadlessRunner<G>),
+    Render: FnMut(&G::State, &mut [u8], u32, u32),
+{
+    let out_dir = out_dir.as_ref();
+    fs::create_dir_all(out_dir)?;
+
+    let base = sanitize_filename(name);
+    let state_json = out_dir.join(format!("{base}.json"));
+
+    // Live record.
+    let mut live_runner = HeadlessRunner::new(game.clone());
+    scenario(&mut live_runner);
+    live_runner.timemachine().save_json_file(&state_json)?;
+
+    // Replay from disk.
+    let tm = TimeMachine::<G::State>::load_json_file(&state_json)?;
+    let replay_runner = HeadlessRunner::from_timemachine(game, tm);
+
+    let live_hashes =
+        render_frame_hashes_for_timemachine(live_runner.timemachine(), width, height, &mut render);
+    let replay_hashes =
+        render_frame_hashes_for_timemachine(replay_runner.timemachine(), width, height, &mut render);
+
+    compare_render_hashes_and_maybe_dump(
+        name,
+        out_dir,
+        width,
+        height,
+        live_runner.timemachine(),
+        replay_runner.timemachine(),
+        &live_hashes,
+        &replay_hashes,
+        &mut render,
+    )?;
+
+    Ok(RecordReplayHashArtifacts {
+        state_json,
+        live_hashes,
+        replay_hashes,
+    })
+}

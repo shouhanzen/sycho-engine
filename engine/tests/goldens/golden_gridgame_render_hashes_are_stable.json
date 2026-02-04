@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "name": "golden_gridgame_render_hashes_are_stable",
+  "width": 96,
+  "height": 96,
+  "hash_alg": "sha256",
+  "hashes": [
+    "a166b32ef186e169f3a3754e9714fa52e223b41991b223199e02a585a1798129",
+    "b39cfead4a923411fc22ca7e6919bd55285219fd7f605d26c04d035c3378dea7",
+    "cfa6b8583e76a97e0df32cfb48bd98df1e0163e17226d7c7c0fac8afa1c74e31",
+    "e159c2f67652a377c0817217facd267eef360a1fecc53de5ed1c303734c9fc84",
+    "7a4a5c123b0fc11bf91c2509a668c4be15dd259c04e1ddf87582ae3c9b859d41"
+  ]
+}

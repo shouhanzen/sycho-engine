@@ -1,0 +1,160 @@
+{
+  "version": 1,
+  "nodes": [
+    {
+      "id": "start",
+      "name": "START",
+      "pos": {
+        "x": 0,
+        "y": 0
+      },
+      "shape": [
+        {
+          "x": 0,
+          "y": 0
+        }
+      ],
+      "color": 3,
+      "cost": 0,
+      "requires": [],
+      "effect": {
+        "type": "none"
+      }
+    },
+    {
+      "id": "moreScore1",
+      "name": "+SCORE",
+      "pos": {
+        "x": -6,
+        "y": 2
+      },
+      "shape": [
+        {
+          "x": 0,
+          "y": 0
+        },
+        {
+          "x": 1,
+          "y": 0
+        },
+        {
+          "x": 2,
+          "y": 0
+        },
+        {
+          "x": 1,
+          "y": 1
+        }
+      ],
+      "color": 6,
+      "cost": 25,
+      "requires": [
+        "start"
+      ],
+      "effect": {
+        "type": "addScoreBonus",
+        "bonus": 100
+      }
+    },
+    {
+      "id": "moreTime1",
+      "name": "+TIME",
+      "pos": {
+        "x": 0,
+        "y": 3
+      },
+      "shape": [
+        {
+          "x": 0,
+          "y": 0
+        },
+        {
+          "x": 0,
+          "y": 1
+        },
+        {
+          "x": 1,
+          "y": 0
+        },
+        {
+          "x": 2,
+          "y": 0
+        }
+      ],
+      "color": 2,
+      "cost": 25,
+      "requires": [
+        "start"
+      ],
+      "effect": {
+        "type": "addRoundTimeSeconds",
+        "seconds": 5
+      }
+    },
+    {
+      "id": "moreSpeed1",
+      "name": "+SPEED",
+      "pos": {
+        "x": 6,
+        "y": 2
+      },
+      "shape": [
+        {
+          "x": 0,
+          "y": 0
+        },
+        {
+          "x": 1,
+          "y": 0
+        },
+        {
+          "x": 2,
+          "y": 0
+        },
+        {
+          "x": 0,
+          "y": 2
+        },
+        {
+          "x": 2,
+          "y": 2
+        }
+      ],
+      "color": 4,
+      "cost": 25,
+      "requires": [
+        "start"
+      ],
+      "effect": {
+        "type": "fasterGravity",
+        "percent": 10
+      }
+    },
+    {
+      "id": "weirdDisconnected",
+      "name": "ODD",
+      "pos": {
+        "x": 0,
+        "y": 8
+      },
+      "shape": [
+        {
+          "x": 0,
+          "y": 0
+        },
+        {
+          "x": 2,
+          "y": 0
+        }
+      ],
+      "color": 5,
+      "cost": 10,
+      "requires": [
+        "moreTime1"
+      ],
+      "effect": {
+        "type": "none"
+      }
+    }
+  ]
+}

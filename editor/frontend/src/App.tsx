@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   fetchGameStatus,
@@ -53,28 +53,50 @@ export default function App() {
 
   const [seekFrame, setSeekFrame] = useState<number>(0);
 
+  const autoRetryAttempt = useRef(0);
+  const autoRetryTimer = useRef<number | null>(null);
+  const stepInFlight = useRef(false);
+  const pollInFlight = useRef(false);
+  const scrubbingRef = useRef(false);
+
   const boardText = useMemo(() => formatGrid(snapshot), [snapshot]);
   const stateText = useMemo(() => formatJson(snapshot?.state), [snapshot]);
+
+  const gameRunning = gameStatus?.running === true;
 
   const refresh = useCallback(async () => {
     setBusy(true);
     setError(null);
     try {
-      const [healthResponse, mf, state, tl, gs] = await Promise.all([
+      const [healthResponse, mf, gs] = await Promise.all([
         fetchHealth(),
         fetchManifest(),
-        fetchState(),
-        fetchTimeline(),
         fetchGameStatus().catch(() => null),
       ]);
       setHealth(healthResponse.status);
       setManifest(mf);
-      setSnapshot(state);
-      setTimeline(tl);
       if (gs) {
         setGameStatus(gs);
       }
-      setSeekFrame(tl.frame);
+
+      if (gs?.running) {
+        const [stateRes, tlRes] = await Promise.allSettled([fetchState(), fetchTimeline()]);
+        if (stateRes.status === "fulfilled") {
+          setSnapshot(stateRes.value);
+        }
+        if (tlRes.status === "fulfilled") {
+          setTimeline(tlRes.value);
+          if (!scrubbingRef.current) {
+            setSeekFrame(tlRes.value.frame);
+          }
+        }
+      } else {
+        setSnapshot(null);
+        setTimeline(null);
+        if (!scrubbingRef.current) {
+          setSeekFrame(0);
+        }
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unknown error");
       setHealth("error");
@@ -87,12 +109,81 @@ export default function App() {
     void refresh();
   }, [refresh]);
 
+  useEffect(() => {
+    if (!gameRunning) {
+      return;
+    }
+
+    const pollMs = 200;
+    const timer = window.setInterval(() => {
+      if (pollInFlight.current || scrubbingRef.current) {
+        return;
+      }
+      pollInFlight.current = true;
+      void (async () => {
+        const [stateRes, tlRes] = await Promise.allSettled([fetchState(), fetchTimeline()]);
+        if (stateRes.status === "fulfilled") {
+          setSnapshot(stateRes.value);
+        }
+        if (tlRes.status === "fulfilled") {
+          setTimeline(tlRes.value);
+          setSeekFrame(tlRes.value.frame);
+        }
+      })().finally(() => {
+        pollInFlight.current = false;
+      });
+    }, pollMs);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [gameRunning]);
+
+  useEffect(() => {
+    if (health === "ok") {
+      autoRetryAttempt.current = 0;
+      if (autoRetryTimer.current !== null) {
+        window.clearTimeout(autoRetryTimer.current);
+        autoRetryTimer.current = null;
+      }
+      return;
+    }
+
+    // Only auto-retry when we couldn't reach the API (common on cold start while the backend compiles).
+    if (busy || health !== "error") {
+      return;
+    }
+
+    if (autoRetryAttempt.current >= 20) {
+      return;
+    }
+
+    const attempt = autoRetryAttempt.current;
+    const delayMs = Math.min(2000, 200 * 2 ** attempt);
+
+    autoRetryTimer.current = window.setTimeout(() => {
+      autoRetryAttempt.current = attempt + 1;
+      void refresh();
+    }, delayMs);
+
+    return () => {
+      if (autoRetryTimer.current !== null) {
+        window.clearTimeout(autoRetryTimer.current);
+        autoRetryTimer.current = null;
+      }
+    };
+  }, [busy, health, refresh]);
+
   const handleConnect = async () => {
     setApiBase(apiBaseInput.trim());
     await refresh();
   };
 
-  const handleStep = async (actionId: string) => {
+  const handleStep = useCallback(async (actionId: string) => {
+    if (stepInFlight.current) {
+      return;
+    }
+    stepInFlight.current = true;
     setBusy(true);
     setError(null);
     try {
@@ -104,9 +195,10 @@ export default function App() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unknown error");
     } finally {
+      stepInFlight.current = false;
       setBusy(false);
     }
-  };
+  }, []);
 
   const handleSeek = async (frame: number) => {
     setBusy(true);
@@ -177,10 +269,7 @@ export default function App() {
     setError(null);
     try {
       const launched = await launchGame();
-      const gs = await fetchGameStatus().catch(() => null);
-      if (gs) {
-        setGameStatus(gs);
-      }
+      await refresh();
       if (!launched.ok) {
         setError(launched.detail || "Launch failed");
       }
@@ -225,12 +314,12 @@ export default function App() {
 
         <div className="header-actions">
           <button onClick={handleLaunchGame} disabled={busy}>
-            Launch Game
+            Launch Headful Game
           </button>
           <button onClick={refresh} disabled={busy}>
             Refresh
           </button>
-          <button onClick={handleReset} disabled={busy}>
+          <button onClick={handleReset} disabled={busy || !gameRunning}>
             Reset
           </button>
         </div>
@@ -252,7 +341,7 @@ export default function App() {
                 <button
                   key={action.id}
                   onClick={() => handleStep(action.id)}
-                  disabled={busy}
+                  disabled={busy || !gameRunning}
                 >
                   {action.label}
                 </button>
@@ -301,6 +390,20 @@ export default function App() {
             </div>
           </div>
 
+          {!gameRunning ? (
+            <div className="hint">
+              Game not running. Click <strong>Launch Headful Game</strong> to start and attach the
+              timeline.
+            </div>
+          ) : !timeline ? (
+            <div className="hint">Waiting for the game timeline (the game may still be starting)...</div>
+          ) : timeline.historyLen <= 1 ? (
+            <div className="hint">
+              No history yet. Play in the game window (or use the <strong>Actions</strong> buttons)
+              to record frames.
+            </div>
+          ) : null}
+
           <div className="timeline-seek">
             <input
               type="range"
@@ -308,11 +411,33 @@ export default function App() {
               max={maxFrame}
               value={seekFrameClamped}
               onChange={(e) => setSeekFrame(Number(e.target.value))}
-              disabled={busy || !timeline}
+              onPointerDown={() => {
+                scrubbingRef.current = true;
+              }}
+              onPointerUp={() => {
+                scrubbingRef.current = false;
+                if (!timeline || busy) {
+                  return;
+                }
+                if (seekFrameClamped === timeline.frame) {
+                  return;
+                }
+                void handleSeek(seekFrameClamped);
+              }}
+              onKeyUp={() => {
+                if (!timeline || busy) {
+                  return;
+                }
+                if (seekFrameClamped === timeline.frame) {
+                  return;
+                }
+                void handleSeek(seekFrameClamped);
+              }}
+              disabled={busy || !timeline || !gameRunning}
             />
             <button
               onClick={() => handleSeek(seekFrameClamped)}
-              disabled={busy || !timeline || seekFrameClamped === timeline?.frame}
+              disabled={busy || !timeline || !gameRunning || seekFrameClamped === timeline?.frame}
             >
               Seek
             </button>

@@ -410,7 +410,7 @@ fn fs_main(input: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-const DEFAULT_CLEAR_COLOR: Color = [10, 10, 14, 255];
+const DEFAULT_CLEAR_COLOR: Color = [0, 0, 0, 255];
 
 /// GPU renderer that records instanced rects and renders them via `pixels.render_with(...)`.
 pub struct GpuRenderer2d {

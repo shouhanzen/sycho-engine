@@ -1,6 +1,6 @@
 pub const CELL_SIZE: u32 = 24;
 
-const COLOR_BACKGROUND: [u8; 4] = [10, 10, 14, 255];
+const COLOR_BACKGROUND: [u8; 4] = [0, 0, 0, 255];
 const COLOR_BOARD_OUTLINE: [u8; 4] = [28, 28, 38, 255];
 const COLOR_GRID_DOT: [u8; 4] = [18, 18, 24, 255];
 const COLOR_I: [u8; 4] = [0, 229, 255, 255];

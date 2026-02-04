@@ -247,6 +247,10 @@ impl TetrisCore {
         self.score
     }
 
+    pub fn add_score(&mut self, bonus: u32) {
+        self.score = self.score.saturating_add(bonus);
+    }
+
     pub fn is_game_over(&self) -> bool {
         self.game_over
     }

@@ -4,14 +4,14 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Game (default)
-GAME_PID_FILE="$ROOT_DIR/.go.pid"
-GAME_LOG_FILE="$ROOT_DIR/.go.log"
+GAME_PID_FILE="${ROLLOUT_GO_GAME_PID_FILE:-$ROOT_DIR/.go.pid}"
+GAME_LOG_FILE="${ROLLOUT_GO_GAME_LOG_FILE:-$ROOT_DIR/.go.log}"
 
 # Editor (engine editor API + Tauri app)
-EDITOR_API_PID_FILE="$ROOT_DIR/.go.editor-api.pid"
-EDITOR_API_LOG_FILE="$ROOT_DIR/.go.editor-api.log"
-EDITOR_APP_PID_FILE="$ROOT_DIR/.go.editor-app.pid"
-EDITOR_APP_LOG_FILE="$ROOT_DIR/.go.editor-app.log"
+EDITOR_API_PID_FILE="${ROLLOUT_GO_EDITOR_API_PID_FILE:-$ROOT_DIR/.go.editor-api.pid}"
+EDITOR_API_LOG_FILE="${ROLLOUT_GO_EDITOR_API_LOG_FILE:-$ROOT_DIR/.go.editor-api.log}"
+EDITOR_APP_PID_FILE="${ROLLOUT_GO_EDITOR_APP_PID_FILE:-$ROOT_DIR/.go.editor-app.pid}"
+EDITOR_APP_LOG_FILE="${ROLLOUT_GO_EDITOR_APP_LOG_FILE:-$ROOT_DIR/.go.editor-app.log}"
 
 usage() {
   cat <<'EOF'
@@ -42,6 +42,13 @@ Recording / Replay (headful game only):
 
 Build:
   --release      Use release profile for cargo commands (faster runtime, slower compile).
+
+Build cache (multi-worktree):
+  sccache          If `sccache` is on PATH, go.sh auto-enables it for cargo builds/tests.
+                  Disable with: ROLLOUT_DISABLE_SCCACHE=1
+  shared target/   Set ROLLOUT_SHARED_TARGET_DIR=1 to set CARGO_TARGET_DIR to a shared per-repo dir
+                  (reuses build artifacts across worktrees; concurrent cargo invocations will block on a file lock).
+                  Override with: CARGO_TARGET_DIR=/path/to/target
 
 Editor:
   API:  cargo run -p game --bin editor_api   (default http://127.0.0.1:4000; override via ROLLOUT_EDITOR_API_ADDR / ROLLOUT_EDITOR_API_PORT)
@@ -181,6 +188,75 @@ ensure_pid_alive_or_dump_logs() {
 
 is_uint() {
   [[ "${1:-}" =~ ^[0-9]+$ ]]
+}
+
+is_truthy() {
+  local v="${1:-}"
+  v="$(printf "%s" "$v" | tr '[:upper:]' '[:lower:]')"
+  [[ "$v" == "1" || "$v" == "true" || "$v" == "yes" || "$v" == "on" ]]
+}
+
+to_native_path() {
+  local p="$1"
+  if command -v cygpath >/dev/null 2>&1; then
+    # Windows: prefer a native-ish path (C:/...) for child processes like cargo.exe / sccache.exe.
+    cygpath -m "$p"
+  else
+    echo "$p"
+  fi
+}
+
+common_repo_root() {
+  command -v git >/dev/null 2>&1 || return 1
+
+  local common_dir
+  common_dir="$(git -C "$ROOT_DIR" rev-parse --git-common-dir 2>/dev/null)" || return 1
+
+  # `--git-common-dir` may be relative to the current directory.
+  local common_abs
+  common_abs="$(cd "$ROOT_DIR" && cd "$common_dir" && pwd)" || return 1
+
+  local root
+  root="$(cd "$common_abs/.." && pwd)" || return 1
+  echo "$root"
+}
+
+setup_build_cache() {
+  # Optional: reuse Cargo artifacts across worktrees by using a shared target dir.
+  # Opt-in because Cargo will serialize concurrent builds via a target-dir lock.
+  if [[ -z "${CARGO_TARGET_DIR:-}" ]] && is_truthy "${ROLLOUT_SHARED_TARGET_DIR:-0}"; then
+    local common_root
+    common_root="$(common_repo_root 2>/dev/null || true)"
+    if [[ -n "$common_root" ]]; then
+      export CARGO_TARGET_DIR
+      CARGO_TARGET_DIR="$(to_native_path "$common_root/.cache/cargo-target")"
+    else
+      export CARGO_TARGET_DIR
+      CARGO_TARGET_DIR="$(to_native_path "$ROOT_DIR/.cache/cargo-target")"
+    fi
+  fi
+
+  # Optional: enable sccache if installed (shared compiler cache across worktrees).
+  if is_truthy "${ROLLOUT_DISABLE_SCCACHE:-0}"; then
+    return 0
+  fi
+  if [[ -n "${RUSTC_WRAPPER:-}" || -n "${CARGO_BUILD_RUSTC_WRAPPER:-}" ]]; then
+    return 0
+  fi
+  if command -v sccache >/dev/null 2>&1; then
+    export RUSTC_WRAPPER="sccache"
+    if [[ -z "${SCCACHE_DIR:-}" ]]; then
+      local common_root
+      common_root="$(common_repo_root 2>/dev/null || true)"
+      if [[ -n "$common_root" ]]; then
+        export SCCACHE_DIR
+        SCCACHE_DIR="$(to_native_path "$common_root/.cache/sccache")"
+      else
+        export SCCACHE_DIR
+        SCCACHE_DIR="$(to_native_path "$ROOT_DIR/.cache/sccache")"
+      fi
+    fi
+  fi
 }
 
 kill_listeners_on_port() {

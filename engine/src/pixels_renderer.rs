@@ -9,6 +9,14 @@ pub enum RenderBackend2d {
     Gpu,
 }
 
+fn env_bool(name: &str) -> Option<bool> {
+    std::env::var(name).ok().and_then(|v| match v.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    })
+}
+
 /// Headful renderer built on `pixels`, with a pluggable CPU/GPU 2D backend.
 ///
 /// The rest of the game should be renderer-agnostic: it draws via `Renderer2d`, and this type
@@ -21,6 +29,20 @@ pub struct PixelsRenderer2d {
 }
 
 impl PixelsRenderer2d {
+    /// Picks a backend once at startup, based on environment.
+    ///
+    /// - `ROLLOUT_HEADFUL_GPU=0` forces CPU rendering.
+    /// - Any other value (or unset) defaults to GPU rendering.
+    pub fn new_auto(pixels: Pixels, size: SurfaceSize) -> Result<Self, pixels::Error> {
+        let gpu_enabled = env_bool("ROLLOUT_HEADFUL_GPU").unwrap_or(true);
+        let backend = if gpu_enabled {
+            RenderBackend2d::Gpu
+        } else {
+            RenderBackend2d::Cpu
+        };
+        Self::new(pixels, size, backend)
+    }
+
     pub fn new(mut pixels: Pixels, size: SurfaceSize, backend: RenderBackend2d) -> Result<Self, pixels::Error> {
         let gpu = match backend {
             RenderBackend2d::Cpu => {

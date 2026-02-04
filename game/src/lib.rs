@@ -7,3 +7,5 @@ pub mod sfx;
 pub mod tetris_ui;
 pub mod view;
 pub mod round_timer;
+pub mod skilltree;
+pub mod headful_editor_api;
