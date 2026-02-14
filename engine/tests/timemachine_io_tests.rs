@@ -37,4 +37,3 @@ fn timemachine_save_and_load_roundtrips_history_and_frame() {
 
     let _ = fs::remove_file(out);
 }
-

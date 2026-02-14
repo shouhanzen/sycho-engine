@@ -62,7 +62,9 @@ fn horizontal_repeat_ignores_os_repeat_pressed_events_and_repeats_on_timer() {
 
     // And again at the interval.
     assert_eq!(
-        repeat.next_repeat_action(t0 + HorizontalRepeat::REPEAT_DELAY + HorizontalRepeat::REPEAT_INTERVAL),
+        repeat.next_repeat_action(
+            t0 + HorizontalRepeat::REPEAT_DELAY + HorizontalRepeat::REPEAT_INTERVAL
+        ),
         Some(InputAction::MoveLeft)
     );
 }

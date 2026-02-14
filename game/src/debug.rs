@@ -285,4 +285,3 @@ impl Profiler for DebugHud {
         self.engine_record_dt.push(timings.record);
     }
 }
-

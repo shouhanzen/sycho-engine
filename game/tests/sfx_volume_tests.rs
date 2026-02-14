@@ -28,4 +28,3 @@ fn sfx_volumes_are_in_valid_range() {
         assert!(v <= 1.0, "{name} volume must be <= 1.0, got {v}");
     }
 }
-

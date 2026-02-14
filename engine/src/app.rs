@@ -1,12 +1,17 @@
+use std::collections::HashSet;
+use std::env;
 use std::error::Error;
 use std::fs;
+use std::hash::Hash;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pixels::{Pixels, PixelsBuilder, SurfaceTexture};
 use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, Event, KeyboardInput, MouseButton, VirtualKeyCode, WindowEvent};
+use winit::event::{
+    ElementState, Event, KeyboardInput, MouseButton, MouseScrollDelta, VirtualKeyCode, WindowEvent,
+};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{Window, WindowBuilder};
 
@@ -14,7 +19,7 @@ use crate::graphics::Renderer2d;
 use crate::pixels_renderer::PixelsRenderer2d;
 use crate::surface::SurfaceSize;
 use crate::ui_tree::UiInput;
-use crate::view_tree::{hit_test_actions, ViewTree};
+use crate::view_tree::{ViewTree, hit_test_actions};
 use crate::{RecordableState, ReplayableState};
 
 pub struct AppConfig {
@@ -41,17 +46,248 @@ pub struct ProfileConfig {
     pub target_frames: usize,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct CaptureCli {
+    pub help: bool,
+    pub record_path: Option<PathBuf>,
+    pub replay_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunMode {
+    Normal,
+    Recording,
+    Replay,
+    Profile,
+}
+
+pub fn default_recording_path(app_tag: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("target")
+        .join("recordings")
+        .join(format!("{app_tag}_{nanos}.json"))
+}
+
+pub fn parse_capture_cli_with_default_path(
+    default_recording_path: impl Fn() -> PathBuf,
+) -> io::Result<CaptureCli> {
+    let mut cli = CaptureCli::default();
+    let mut args = env::args().skip(1).peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                cli.help = true;
+            }
+            "--record" => {
+                cli.record_path = Some(
+                    args.peek()
+                        .filter(|next| !next.starts_with('-'))
+                        .map_or_else(&default_recording_path, |p| PathBuf::from(p.clone())),
+                );
+                if args.peek().is_some_and(|next| !next.starts_with('-')) {
+                    let _ = args.next();
+                }
+            }
+            "--replay" => {
+                let Some(path) = args.next() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "--replay requires a path",
+                    ));
+                };
+                cli.replay_path = Some(PathBuf::from(path));
+            }
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("unknown argument: {other} (try --help)"),
+                ));
+            }
+        }
+    }
+
+    if cli.record_path.is_some() && cli.replay_path.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cannot combine --record and --replay",
+        ));
+    }
+
+    Ok(cli)
+}
+
 pub struct AppContext {
     pub window: Window,
     pub renderer: PixelsRenderer2d,
     pub surface_size: SurfaceSize,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone)]
 pub struct InputFrame {
     pub mouse_pos: Option<(u32, u32)>,
     pub mouse_down: bool,
     pub mouse_up: bool,
+    pub mouse_buttons_down: HashSet<MouseButton>,
+    pub mouse_buttons_pressed: HashSet<MouseButton>,
+    pub mouse_buttons_released: HashSet<MouseButton>,
+    pub keys_down: HashSet<VirtualKeyCode>,
+    pub keys_pressed: HashSet<VirtualKeyCode>,
+    pub keys_released: HashSet<VirtualKeyCode>,
+    pub scroll_x: f32,
+    pub scroll_y: f32,
+    pub window_focused: bool,
+}
+
+impl Default for InputFrame {
+    fn default() -> Self {
+        Self {
+            mouse_pos: None,
+            mouse_down: false,
+            mouse_up: false,
+            mouse_buttons_down: HashSet::new(),
+            mouse_buttons_pressed: HashSet::new(),
+            mouse_buttons_released: HashSet::new(),
+            keys_down: HashSet::new(),
+            keys_pressed: HashSet::new(),
+            keys_released: HashSet::new(),
+            scroll_x: 0.0,
+            scroll_y: 0.0,
+            // Avoid gating controls before the OS sends an initial focus event.
+            window_focused: true,
+        }
+    }
+}
+
+impl InputFrame {
+    fn apply_key_state(&mut self, key: VirtualKeyCode, state: ElementState) {
+        apply_button_transition(
+            &mut self.keys_down,
+            &mut self.keys_pressed,
+            &mut self.keys_released,
+            key,
+            state,
+        );
+    }
+
+    fn apply_mouse_button_state(&mut self, button: MouseButton, state: ElementState) {
+        let was_down = self.mouse_buttons_down.contains(&button);
+        apply_button_transition(
+            &mut self.mouse_buttons_down,
+            &mut self.mouse_buttons_pressed,
+            &mut self.mouse_buttons_released,
+            button,
+            state,
+        );
+
+        if button == MouseButton::Left {
+            if !was_down && matches!(state, ElementState::Pressed) {
+                self.mouse_down = true;
+            } else if was_down && matches!(state, ElementState::Released) {
+                self.mouse_up = true;
+            }
+        }
+    }
+
+    fn apply_scroll_delta(&mut self, delta: &MouseScrollDelta) {
+        match delta {
+            MouseScrollDelta::LineDelta(x, y) => {
+                self.scroll_x += *x;
+                self.scroll_y += *y;
+            }
+            MouseScrollDelta::PixelDelta(pos) => {
+                self.scroll_x += (pos.x as f32) / 120.0;
+                self.scroll_y += (pos.y as f32) / 120.0;
+            }
+        }
+    }
+
+    fn set_window_focus(&mut self, focused: bool) {
+        self.window_focused = focused;
+        if !focused {
+            self.keys_down.clear();
+            self.keys_pressed.clear();
+            self.keys_released.clear();
+            self.mouse_buttons_down.clear();
+            self.mouse_buttons_pressed.clear();
+            self.mouse_buttons_released.clear();
+            self.mouse_down = false;
+            self.mouse_up = false;
+        }
+    }
+
+    fn clear_frame_transients(&mut self) {
+        self.mouse_down = false;
+        self.mouse_up = false;
+        self.mouse_buttons_pressed.clear();
+        self.mouse_buttons_released.clear();
+        self.keys_pressed.clear();
+        self.keys_released.clear();
+        self.scroll_x = 0.0;
+        self.scroll_y = 0.0;
+    }
+}
+
+fn apply_button_transition<T>(
+    down: &mut HashSet<T>,
+    pressed: &mut HashSet<T>,
+    released: &mut HashSet<T>,
+    button: T,
+    state: ElementState,
+) where
+    T: Copy + Eq + Hash,
+{
+    match state {
+        ElementState::Pressed => {
+            if down.insert(button) {
+                pressed.insert(button);
+            }
+        }
+        ElementState::Released => {
+            if down.remove(&button) {
+                released.insert(button);
+            }
+        }
+    }
+}
+
+fn apply_window_event_to_input(input: &mut InputFrame, event: &WindowEvent) {
+    match event {
+        WindowEvent::CursorMoved { position, .. } => {
+            let new_x = position.x.max(0.0) as u32;
+            let new_y = position.y.max(0.0) as u32;
+            input.mouse_pos = Some((new_x, new_y));
+        }
+        WindowEvent::MouseInput {
+            state: mouse_state,
+            button,
+            ..
+        } => {
+            input.apply_mouse_button_state(*button, *mouse_state);
+        }
+        WindowEvent::KeyboardInput {
+            input:
+                KeyboardInput {
+                    state: key_state,
+                    virtual_keycode: Some(key),
+                    ..
+                },
+            ..
+        } => {
+            input.apply_key_state(*key, *key_state);
+        }
+        WindowEvent::MouseWheel { delta, .. } => {
+            input.apply_scroll_delta(delta);
+        }
+        WindowEvent::Focused(focused) => {
+            input.set_window_focus(*focused);
+        }
+        _ => {}
+    }
 }
 
 pub trait GameApp {
@@ -72,13 +308,11 @@ pub trait GameApp {
         _ctx: &mut AppContext,
     ) -> Vec<Self::Effect>;
 
-    fn render(
-        &mut self,
-        view: &ViewTree<Self::Action>,
-        renderer: &mut dyn Renderer2d,
-    );
+    fn render(&mut self, view: &ViewTree<Self::Action>, renderer: &mut dyn Renderer2d);
 
     fn handle_effects(&mut self, _effects: Vec<Self::Effect>, _ctx: &mut AppContext) {}
+
+    fn on_run_mode(&mut self, _mode: RunMode, _state: &mut Self::State, _ctx: &mut AppContext) {}
 
     fn handle_event(
         &mut self,
@@ -88,6 +322,8 @@ pub trait GameApp {
         _ctx: &mut AppContext,
         _control_flow: &mut ControlFlow,
     ) -> bool {
+        // Reserve this for non-input app events. Engine-owned keyboard/mouse state is provided
+        // via `InputFrame` during `update_state`.
         false
     }
 }
@@ -105,8 +341,10 @@ pub trait AppHandler {
     );
 }
 
-pub fn run_app<H: AppHandler + 'static>(config: AppConfig, mut handler: H) -> Result<(), Box<dyn Error>> {
-    let event_loop = EventLoop::new();
+fn create_app_context(
+    config: &AppConfig,
+    event_loop: &EventLoop<()>,
+) -> Result<AppContext, Box<dyn Error>> {
     let monitor_size = if config.clamp_to_monitor {
         event_loop.primary_monitor().map(|m| m.size())
     } else {
@@ -121,25 +359,27 @@ pub fn run_app<H: AppHandler + 'static>(config: AppConfig, mut handler: H) -> Re
         config.desired_size
     };
     let window = WindowBuilder::new()
-        .with_title(config.title)
+        .with_title(config.title.clone())
         .with_inner_size(initial_size)
-        .build(&event_loop)?;
+        .build(event_loop)?;
 
     let window_size = window.inner_size();
     let surface_size = SurfaceSize::new(window_size.width, window_size.height);
 
-    let build_pixels = |present_mode: Option<pixels::wgpu::PresentMode>| -> Result<Pixels, pixels::Error> {
-        let surface_texture = SurfaceTexture::new(surface_size.width, surface_size.height, &window);
-        let mut pixels_builder =
-            PixelsBuilder::new(surface_size.width, surface_size.height, surface_texture);
-        if let Some(vsync) = config.vsync {
-            pixels_builder = pixels_builder.enable_vsync(vsync);
-        }
-        if let Some(mode) = present_mode {
-            pixels_builder = pixels_builder.present_mode(mode);
-        }
-        pixels_builder.build()
-    };
+    let build_pixels =
+        |present_mode: Option<pixels::wgpu::PresentMode>| -> Result<Pixels, pixels::Error> {
+            let surface_texture =
+                SurfaceTexture::new(surface_size.width, surface_size.height, &window);
+            let mut pixels_builder =
+                PixelsBuilder::new(surface_size.width, surface_size.height, surface_texture);
+            if let Some(vsync) = config.vsync {
+                pixels_builder = pixels_builder.enable_vsync(vsync);
+            }
+            if let Some(mode) = present_mode {
+                pixels_builder = pixels_builder.present_mode(mode);
+            }
+            pixels_builder.build()
+        };
 
     let pixels = if let Some(mode) = config.present_mode {
         match std::panic::catch_unwind(|| build_pixels(Some(mode))) {
@@ -157,12 +397,19 @@ pub fn run_app<H: AppHandler + 'static>(config: AppConfig, mut handler: H) -> Re
     };
 
     let renderer = PixelsRenderer2d::new_auto(pixels, surface_size)?;
-
-    let mut ctx = AppContext {
+    Ok(AppContext {
         window,
         renderer,
         surface_size,
-    };
+    })
+}
+
+pub fn run_app<H: AppHandler + 'static>(
+    config: AppConfig,
+    mut handler: H,
+) -> Result<(), Box<dyn Error>> {
+    let event_loop = EventLoop::new();
+    let mut ctx = create_app_context(&config, &event_loop)?;
     handler.init(&mut ctx)?;
 
     event_loop.run(move |event, _, control_flow| {
@@ -178,68 +425,18 @@ pub fn run_game<G: GameApp + 'static>(
     mut game: G,
 ) -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new();
-    let monitor_size = if config.clamp_to_monitor {
-        event_loop.primary_monitor().map(|m| m.size())
-    } else {
-        None
-    };
-    let initial_size = if let Some(monitor) = monitor_size {
-        PhysicalSize::new(
-            config.desired_size.width.min(monitor.width),
-            config.desired_size.height.min(monitor.height),
-        )
-    } else {
-        config.desired_size
-    };
-    let window = WindowBuilder::new()
-        .with_title(config.title)
-        .with_inner_size(initial_size)
-        .build(&event_loop)?;
-
-    let window_size = window.inner_size();
-    let surface_size = SurfaceSize::new(window_size.width, window_size.height);
-
-    let build_pixels = |present_mode: Option<pixels::wgpu::PresentMode>| -> Result<Pixels, pixels::Error> {
-        let surface_texture = SurfaceTexture::new(surface_size.width, surface_size.height, &window);
-        let mut pixels_builder =
-            PixelsBuilder::new(surface_size.width, surface_size.height, surface_texture);
-        if let Some(vsync) = config.vsync {
-            pixels_builder = pixels_builder.enable_vsync(vsync);
-        }
-        if let Some(mode) = present_mode {
-            pixels_builder = pixels_builder.present_mode(mode);
-        }
-        pixels_builder.build()
-    };
-
-    let pixels = if let Some(mode) = config.present_mode {
-        match std::panic::catch_unwind(|| build_pixels(Some(mode))) {
-            Ok(res) => res?,
-            Err(_) => {
-                eprintln!(
-                    "warning: requested present mode {:?} was not supported; falling back",
-                    mode
-                );
-                build_pixels(None)?
-            }
-        }
-    } else {
-        build_pixels(None)?
-    };
-
-    let renderer = PixelsRenderer2d::new_auto(pixels, surface_size)?;
-
-    let mut ctx = AppContext {
-        window,
-        renderer,
-        surface_size,
-    };
+    let mut ctx = create_app_context(&config, &event_loop)?;
     let mut state = game.init_state(&mut ctx);
+    game.on_run_mode(RunMode::Normal, &mut state, &mut ctx);
     let mut input = InputFrame::default();
     let mut last_frame = Instant::now();
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Poll;
+
+        if let Event::WindowEvent { event, .. } = &event {
+            apply_window_event_to_input(&mut input, event);
+        }
 
         if game.handle_event(&event, &mut state, &mut input, &mut ctx, control_flow) {
             return;
@@ -258,23 +455,6 @@ pub fn run_game<G: GameApp + 'static>(
                     }
                     ctx.window.request_redraw();
                 }
-                WindowEvent::CursorMoved { position, .. } => {
-                    let new_x = position.x.max(0.0) as u32;
-                    let new_y = position.y.max(0.0) as u32;
-                    input.mouse_pos = Some((new_x, new_y));
-                }
-                WindowEvent::MouseInput { state: mouse_state, button, .. } => {
-                    if *button == MouseButton::Left {
-                        match mouse_state {
-                            ElementState::Pressed => {
-                                input.mouse_down = true;
-                            }
-                            ElementState::Released => {
-                                input.mouse_up = true;
-                            }
-                        }
-                    }
-                }
                 _ => {}
             },
             Event::RedrawRequested(_) => {
@@ -282,16 +462,17 @@ pub fn run_game<G: GameApp + 'static>(
                 let dt = now.saturating_duration_since(last_frame);
                 last_frame = now;
 
+                let frame_input = input.clone();
                 let view_for_input = game.build_view(&state, &ctx);
                 let actions = hit_test_actions(
                     &view_for_input,
                     UiInput {
-                        mouse_pos: input.mouse_pos,
-                        mouse_down: input.mouse_down,
-                        mouse_up: input.mouse_up,
+                        mouse_pos: frame_input.mouse_pos,
+                        mouse_down: frame_input.mouse_down,
+                        mouse_up: frame_input.mouse_up,
                     },
                 );
-                let effects = game.update_state(&mut state, input, dt, &actions, &mut ctx);
+                let effects = game.update_state(&mut state, frame_input, dt, &actions, &mut ctx);
 
                 let view_for_render = game.build_view(&state, &ctx);
                 let draw_res = ctx.renderer.draw_frame(|gfx| {
@@ -305,8 +486,7 @@ pub fn run_game<G: GameApp + 'static>(
                 }
 
                 game.handle_effects(effects, &mut ctx);
-                input.mouse_down = false;
-                input.mouse_up = false;
+                input.clear_frame_transients();
             }
             Event::MainEventsCleared => {
                 ctx.window.request_redraw();
@@ -329,69 +509,19 @@ where
     G::State: RecordableState,
 {
     let event_loop = EventLoop::new();
-    let monitor_size = if config.clamp_to_monitor {
-        event_loop.primary_monitor().map(|m| m.size())
-    } else {
-        None
-    };
-    let initial_size = if let Some(monitor) = monitor_size {
-        PhysicalSize::new(
-            config.desired_size.width.min(monitor.width),
-            config.desired_size.height.min(monitor.height),
-        )
-    } else {
-        config.desired_size
-    };
-    let window = WindowBuilder::new()
-        .with_title(config.title)
-        .with_inner_size(initial_size)
-        .build(&event_loop)?;
-
-    let window_size = window.inner_size();
-    let surface_size = SurfaceSize::new(window_size.width, window_size.height);
-
-    let build_pixels = |present_mode: Option<pixels::wgpu::PresentMode>| -> Result<Pixels, pixels::Error> {
-        let surface_texture = SurfaceTexture::new(surface_size.width, surface_size.height, &window);
-        let mut pixels_builder =
-            PixelsBuilder::new(surface_size.width, surface_size.height, surface_texture);
-        if let Some(vsync) = config.vsync {
-            pixels_builder = pixels_builder.enable_vsync(vsync);
-        }
-        if let Some(mode) = present_mode {
-            pixels_builder = pixels_builder.present_mode(mode);
-        }
-        pixels_builder.build()
-    };
-
-    let pixels = if let Some(mode) = config.present_mode {
-        match std::panic::catch_unwind(|| build_pixels(Some(mode))) {
-            Ok(res) => res?,
-            Err(_) => {
-                eprintln!(
-                    "warning: requested present mode {:?} was not supported; falling back",
-                    mode
-                );
-                build_pixels(None)?
-            }
-        }
-    } else {
-        build_pixels(None)?
-    };
-
-    let renderer = PixelsRenderer2d::new_auto(pixels, surface_size)?;
-
-    let mut ctx = AppContext {
-        window,
-        renderer,
-        surface_size,
-    };
+    let mut ctx = create_app_context(&config, &event_loop)?;
     let mut state = game.init_state(&mut ctx);
+    game.on_run_mode(RunMode::Recording, &mut state, &mut ctx);
     let mut input = InputFrame::default();
     let mut last_frame = Instant::now();
     let mut recording_saved = false;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Poll;
+
+        if let Event::WindowEvent { event, .. } = &event {
+            apply_window_event_to_input(&mut input, event);
+        }
 
         if game.handle_event(&event, &mut state, &mut input, &mut ctx, control_flow) {
             return;
@@ -419,23 +549,6 @@ where
                     }
                     ctx.window.request_redraw();
                 }
-                WindowEvent::CursorMoved { position, .. } => {
-                    let new_x = position.x.max(0.0) as u32;
-                    let new_y = position.y.max(0.0) as u32;
-                    input.mouse_pos = Some((new_x, new_y));
-                }
-                WindowEvent::MouseInput { state: mouse_state, button, .. } => {
-                    if *button == MouseButton::Left {
-                        match mouse_state {
-                            ElementState::Pressed => {
-                                input.mouse_down = true;
-                            }
-                            ElementState::Released => {
-                                input.mouse_up = true;
-                            }
-                        }
-                    }
-                }
                 _ => {}
             },
             Event::RedrawRequested(_) => {
@@ -443,16 +556,17 @@ where
                 let dt = now.saturating_duration_since(last_frame);
                 last_frame = now;
 
+                let frame_input = input.clone();
                 let view_for_input = game.build_view(&state, &ctx);
                 let actions = hit_test_actions(
                     &view_for_input,
                     UiInput {
-                        mouse_pos: input.mouse_pos,
-                        mouse_down: input.mouse_down,
-                        mouse_up: input.mouse_up,
+                        mouse_pos: frame_input.mouse_pos,
+                        mouse_down: frame_input.mouse_down,
+                        mouse_up: frame_input.mouse_up,
                     },
                 );
-                let effects = game.update_state(&mut state, input, dt, &actions, &mut ctx);
+                let effects = game.update_state(&mut state, frame_input, dt, &actions, &mut ctx);
 
                 if !recording_saved && state.recording_frame() > 0 {
                     if let Err(err) = state.save_recording(&recording.path) {
@@ -478,8 +592,7 @@ where
                 }
 
                 game.handle_effects(effects, &mut ctx);
-                input.mouse_down = false;
-                input.mouse_up = false;
+                input.clear_frame_transients();
             }
             Event::MainEventsCleared => {
                 ctx.window.request_redraw();
@@ -515,67 +628,12 @@ where
     G::State: ReplayableState,
 {
     let event_loop = EventLoop::new();
-    let monitor_size = if config.clamp_to_monitor {
-        event_loop.primary_monitor().map(|m| m.size())
-    } else {
-        None
-    };
-    let initial_size = if let Some(monitor) = monitor_size {
-        PhysicalSize::new(
-            config.desired_size.width.min(monitor.width),
-            config.desired_size.height.min(monitor.height),
-        )
-    } else {
-        config.desired_size
-    };
-    let window = WindowBuilder::new()
-        .with_title(config.title)
-        .with_inner_size(initial_size)
-        .build(&event_loop)?;
-
-    let window_size = window.inner_size();
-    let surface_size = SurfaceSize::new(window_size.width, window_size.height);
-
-    let build_pixels =
-        |present_mode: Option<pixels::wgpu::PresentMode>| -> Result<Pixels, pixels::Error> {
-            let surface_texture = SurfaceTexture::new(surface_size.width, surface_size.height, &window);
-            let mut pixels_builder =
-                PixelsBuilder::new(surface_size.width, surface_size.height, surface_texture);
-            if let Some(vsync) = config.vsync {
-                pixels_builder = pixels_builder.enable_vsync(vsync);
-            }
-            if let Some(mode) = present_mode {
-                pixels_builder = pixels_builder.present_mode(mode);
-            }
-            pixels_builder.build()
-        };
-
-    let pixels = if let Some(mode) = config.present_mode {
-        match std::panic::catch_unwind(|| build_pixels(Some(mode))) {
-            Ok(res) => res?,
-            Err(_) => {
-                eprintln!(
-                    "warning: requested present mode {:?} was not supported; falling back",
-                    mode
-                );
-                build_pixels(None)?
-            }
-        }
-    } else {
-        build_pixels(None)?
-    };
-
-    let renderer = PixelsRenderer2d::new_auto(pixels, surface_size)?;
-
-    let mut ctx = AppContext {
-        window,
-        renderer,
-        surface_size,
-    };
+    let mut ctx = create_app_context(&config, &event_loop)?;
     let initial_state = game.init_state(&mut ctx);
     let mut state = initial_state
         .replay_load(&replay.path)
         .map_err(|err| -> Box<dyn Error> { err.into() })?;
+    game.on_run_mode(RunMode::Replay, &mut state, &mut ctx);
     let mut replay_playing = true;
     let mut replay_fps = replay.fps.max(1);
     let mut replay_next_step = Instant::now();
@@ -702,70 +760,19 @@ where
     G: GameApp + 'static,
 {
     let event_loop = EventLoop::new();
-    let monitor_size = if config.clamp_to_monitor {
-        event_loop.primary_monitor().map(|m| m.size())
-    } else {
-        None
-    };
-    let initial_size = if let Some(monitor) = monitor_size {
-        PhysicalSize::new(
-            config.desired_size.width.min(monitor.width),
-            config.desired_size.height.min(monitor.height),
-        )
-    } else {
-        config.desired_size
-    };
-    let window = WindowBuilder::new()
-        .with_title(config.title)
-        .with_inner_size(initial_size)
-        .build(&event_loop)?;
-
-    let window_size = window.inner_size();
-    let surface_size = SurfaceSize::new(window_size.width, window_size.height);
-
-    let build_pixels =
-        |present_mode: Option<pixels::wgpu::PresentMode>| -> Result<Pixels, pixels::Error> {
-            let surface_texture = SurfaceTexture::new(surface_size.width, surface_size.height, &window);
-            let mut pixels_builder =
-                PixelsBuilder::new(surface_size.width, surface_size.height, surface_texture);
-            if let Some(vsync) = config.vsync {
-                pixels_builder = pixels_builder.enable_vsync(vsync);
-            }
-            if let Some(mode) = present_mode {
-                pixels_builder = pixels_builder.present_mode(mode);
-            }
-            pixels_builder.build()
-        };
-
-    let pixels = if let Some(mode) = config.present_mode {
-        match std::panic::catch_unwind(|| build_pixels(Some(mode))) {
-            Ok(res) => res?,
-            Err(_) => {
-                eprintln!(
-                    "warning: requested present mode {:?} was not supported; falling back",
-                    mode
-                );
-                build_pixels(None)?
-            }
-        }
-    } else {
-        build_pixels(None)?
-    };
-
-    let renderer = PixelsRenderer2d::new_auto(pixels, surface_size)?;
-
-    let mut ctx = AppContext {
-        window,
-        renderer,
-        surface_size,
-    };
+    let mut ctx = create_app_context(&config, &event_loop)?;
     let mut state = game.init_state(&mut ctx);
+    game.on_run_mode(RunMode::Profile, &mut state, &mut ctx);
     let mut input = InputFrame::default();
     let mut last_frame = Instant::now();
     let mut trace = TraceCapture::new(profile.target_frames);
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Poll;
+
+        if let Event::WindowEvent { event, .. } = &event {
+            apply_window_event_to_input(&mut input, event);
+        }
 
         if game.handle_event(&event, &mut state, &mut input, &mut ctx, control_flow) {
             return;
@@ -784,23 +791,6 @@ where
                     }
                     ctx.window.request_redraw();
                 }
-                WindowEvent::CursorMoved { position, .. } => {
-                    let new_x = position.x.max(0.0) as u32;
-                    let new_y = position.y.max(0.0) as u32;
-                    input.mouse_pos = Some((new_x, new_y));
-                }
-                WindowEvent::MouseInput { state: mouse_state, button, .. } => {
-                    if *button == MouseButton::Left {
-                        match mouse_state {
-                            ElementState::Pressed => {
-                                input.mouse_down = true;
-                            }
-                            ElementState::Released => {
-                                input.mouse_up = true;
-                            }
-                        }
-                    }
-                }
                 _ => {}
             },
             Event::RedrawRequested(_) => {
@@ -810,16 +800,17 @@ where
 
                 let frame_start = Instant::now();
                 let update_start = Instant::now();
+                let frame_input = input.clone();
                 let view_for_input = game.build_view(&state, &ctx);
                 let actions = hit_test_actions(
                     &view_for_input,
                     UiInput {
-                        mouse_pos: input.mouse_pos,
-                        mouse_down: input.mouse_down,
-                        mouse_up: input.mouse_up,
+                        mouse_pos: frame_input.mouse_pos,
+                        mouse_down: frame_input.mouse_down,
+                        mouse_up: frame_input.mouse_up,
                     },
                 );
-                let effects = game.update_state(&mut state, input, dt, &actions, &mut ctx);
+                let effects = game.update_state(&mut state, frame_input, dt, &actions, &mut ctx);
                 let update_dt = update_start.elapsed();
                 trace.record("engine.update", update_start, update_dt);
 
@@ -846,8 +837,7 @@ where
                 trace.record_frame_samples(update_dt, draw_dt, present_dt, frame_total_dt);
 
                 game.handle_effects(effects, &mut ctx);
-                input.mouse_down = false;
-                input.mouse_up = false;
+                input.clear_frame_transients();
 
                 if trace.captured_frames >= trace.target_frames {
                     let size = ctx.renderer.size();
@@ -984,7 +974,7 @@ impl TraceCapture {
         let path = dir.join(file_name);
 
         let mut f = fs::File::create(&path)?;
-        writeln!(f, "{\"traceEvents\":[")?;
+        writeln!(f, "{{\"traceEvents\":[")?;
         for (i, e) in self.events.iter().enumerate() {
             if i > 0 {
                 writeln!(f, ",")?;
@@ -1021,5 +1011,78 @@ impl TraceCapture {
             self.frame_total.avg_ms(),
             self.frame_total.max_ms()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_transitions_are_frame_based() {
+        let mut input = InputFrame::default();
+
+        input.apply_key_state(VirtualKeyCode::A, ElementState::Pressed);
+        assert!(input.keys_down.contains(&VirtualKeyCode::A));
+        assert!(input.keys_pressed.contains(&VirtualKeyCode::A));
+        assert!(!input.keys_released.contains(&VirtualKeyCode::A));
+
+        input.clear_frame_transients();
+        assert!(input.keys_down.contains(&VirtualKeyCode::A));
+        assert!(!input.keys_pressed.contains(&VirtualKeyCode::A));
+
+        input.apply_key_state(VirtualKeyCode::A, ElementState::Released);
+        assert!(!input.keys_down.contains(&VirtualKeyCode::A));
+        assert!(input.keys_released.contains(&VirtualKeyCode::A));
+    }
+
+    #[test]
+    fn mouse_left_transitions_set_legacy_click_flags() {
+        let mut input = InputFrame::default();
+
+        input.apply_mouse_button_state(MouseButton::Left, ElementState::Pressed);
+        assert!(input.mouse_down);
+        assert!(input.mouse_buttons_down.contains(&MouseButton::Left));
+        assert!(input.mouse_buttons_pressed.contains(&MouseButton::Left));
+
+        input.clear_frame_transients();
+        assert!(!input.mouse_down);
+        assert!(input.mouse_buttons_down.contains(&MouseButton::Left));
+
+        input.apply_mouse_button_state(MouseButton::Left, ElementState::Released);
+        assert!(input.mouse_up);
+        assert!(!input.mouse_buttons_down.contains(&MouseButton::Left));
+        assert!(input.mouse_buttons_released.contains(&MouseButton::Left));
+    }
+
+    #[test]
+    fn scroll_accumulates_then_resets_between_frames() {
+        let mut input = InputFrame::default();
+
+        input.apply_scroll_delta(&MouseScrollDelta::LineDelta(1.0, -2.0));
+        input.apply_scroll_delta(&MouseScrollDelta::PixelDelta(
+            winit::dpi::PhysicalPosition::new(240.0, -120.0),
+        ));
+        assert!((input.scroll_x - 3.0).abs() < 0.0001);
+        assert!((input.scroll_y - -3.0).abs() < 0.0001);
+
+        input.clear_frame_transients();
+        assert!((input.scroll_x - 0.0).abs() < 0.0001);
+        assert!((input.scroll_y - 0.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn focus_loss_clears_held_inputs() {
+        let mut input = InputFrame::default();
+
+        input.apply_key_state(VirtualKeyCode::Space, ElementState::Pressed);
+        input.apply_mouse_button_state(MouseButton::Left, ElementState::Pressed);
+        input.set_window_focus(false);
+
+        assert!(!input.window_focused);
+        assert!(input.keys_down.is_empty());
+        assert!(input.mouse_buttons_down.is_empty());
+        assert!(!input.mouse_down);
+        assert!(!input.mouse_up);
     }
 }

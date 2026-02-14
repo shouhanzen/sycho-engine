@@ -10,11 +10,13 @@ pub enum RenderBackend2d {
 }
 
 fn env_bool(name: &str) -> Option<bool> {
-    std::env::var(name).ok().and_then(|v| match v.to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    })
+    std::env::var(name)
+        .ok()
+        .and_then(|v| match v.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
 }
 
 /// Headful renderer built on `pixels`, with a pluggable CPU/GPU 2D backend.
@@ -43,7 +45,11 @@ impl PixelsRenderer2d {
         Self::new(pixels, size, backend)
     }
 
-    pub fn new(mut pixels: Pixels, size: SurfaceSize, backend: RenderBackend2d) -> Result<Self, pixels::Error> {
+    pub fn new(
+        mut pixels: Pixels,
+        size: SurfaceSize,
+        backend: RenderBackend2d,
+    ) -> Result<Self, pixels::Error> {
         let gpu = match backend {
             RenderBackend2d::Cpu => {
                 pixels.resize_buffer(size.width, size.height)?;
@@ -51,7 +57,8 @@ impl PixelsRenderer2d {
             }
             RenderBackend2d::Gpu => {
                 pixels.resize_buffer(1, 1)?;
-                let gpu = GpuRenderer2d::new(&pixels.context().device, pixels.surface_texture_format());
+                let gpu =
+                    GpuRenderer2d::new(&pixels.context().device, pixels.surface_texture_format());
                 Some(gpu)
             }
         };
@@ -132,4 +139,3 @@ impl PixelsRenderer2d {
         }
     }
 }
-

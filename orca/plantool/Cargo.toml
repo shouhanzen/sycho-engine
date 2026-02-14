@@ -1,0 +1,11 @@
+[package]
+name = "plantool"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.101"
+chrono = { version = "0.4.43", features = ["serde"] }
+clap = { version = "4.5.58", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"

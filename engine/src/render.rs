@@ -32,9 +32,22 @@ pub fn draw_board(gfx: &mut dyn crate::graphics::Renderer2d, board: &[Vec<u8>]) 
 
     gfx.fill_rect(crate::ui::Rect::from_size(width, height), COLOR_BACKGROUND);
 
+    draw_board_cells(gfx, board);
+}
+
+/// Draw board outline, grid dots, and filled cells **without** clearing the frame first.
+///
+/// Use this when you want to composite the board on top of a previously-drawn background
+/// layer (e.g. tile background).  The full-clearing `draw_board` is still available for
+/// callers that don't need layered compositing.
+pub fn draw_board_cells(gfx: &mut dyn crate::graphics::Renderer2d, board: &[Vec<u8>]) {
     if board.is_empty() {
         return;
     }
+
+    let size = gfx.size();
+    let width = size.width;
+    let height = size.height;
 
     let board_height = board.len() as u32;
     let board_width = board[0].len() as u32;
@@ -68,10 +81,16 @@ pub fn draw_board(gfx: &mut dyn crate::graphics::Renderer2d, board: &[Vec<u8>]) 
                 let dot_size = 2u32;
                 let dot_x = pixel_x + (CELL_SIZE / 2).saturating_sub(dot_size / 2);
                 let dot_y = pixel_y + (CELL_SIZE / 2).saturating_sub(dot_size / 2);
-                gfx.fill_rect(crate::ui::Rect::new(dot_x, dot_y, dot_size, dot_size), COLOR_GRID_DOT);
+                gfx.fill_rect(
+                    crate::ui::Rect::new(dot_x, dot_y, dot_size, dot_size),
+                    COLOR_GRID_DOT,
+                );
             } else {
                 let color = color_for_cell(cell);
-                gfx.fill_rect(crate::ui::Rect::new(pixel_x, pixel_y, CELL_SIZE, CELL_SIZE), color);
+                gfx.fill_rect(
+                    crate::ui::Rect::new(pixel_x, pixel_y, CELL_SIZE, CELL_SIZE),
+                    color,
+                );
             }
         }
     }
@@ -102,7 +121,12 @@ fn draw_board_outline(
     // Bottom border
     if offset_y + board_pixel_height < height {
         gfx.fill_rect(
-            crate::ui::Rect::new(offset_x, offset_y + board_pixel_height, board_pixel_width, 1),
+            crate::ui::Rect::new(
+                offset_x,
+                offset_y + board_pixel_height,
+                board_pixel_width,
+                1,
+            ),
             COLOR_BOARD_OUTLINE,
         );
     }
@@ -118,7 +142,12 @@ fn draw_board_outline(
     // Right border
     if offset_x + board_pixel_width < width {
         gfx.fill_rect(
-            crate::ui::Rect::new(offset_x + board_pixel_width, offset_y, 1, board_pixel_height),
+            crate::ui::Rect::new(
+                offset_x + board_pixel_width,
+                offset_y,
+                1,
+                board_pixel_height,
+            ),
             COLOR_BOARD_OUTLINE,
         );
     }
@@ -144,9 +173,13 @@ fn draw_board_outline(
     }
     if offset_x + board_pixel_width < width && offset_y + board_pixel_height < height {
         gfx.fill_rect(
-            crate::ui::Rect::new(offset_x + board_pixel_width, offset_y + board_pixel_height, 1, 1),
+            crate::ui::Rect::new(
+                offset_x + board_pixel_width,
+                offset_y + board_pixel_height,
+                1,
+                1,
+            ),
             COLOR_BOARD_OUTLINE,
         );
     }
 }
-

@@ -14,4 +14,3 @@ pub struct StepTimings {
 pub trait Profiler {
     fn on_step(&mut self, _frame: usize, _timings: StepTimings) {}
 }
-

@@ -1,6 +1,6 @@
 use engine::GameLogic;
 use game::agent::{TetrisAction, TetrisGame};
-use game::tetris_core::{Piece, Vec2i, BOARD_HEIGHT};
+use game::tetris_core::{BOARD_HEIGHT, Piece, Vec2i};
 
 #[test]
 fn tetris_game_initializes_with_piece() {

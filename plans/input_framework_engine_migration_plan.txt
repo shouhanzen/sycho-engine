@@ -1,0 +1,100 @@
+Input Framework Engine-Level Migration Completion Plan
+======================================================
+
+Status
+- Current: IN_PROGRESS
+- Last Reviewed: 2026-02-14
+- Notes: Engine `InputFrame` is in place; migration is partial and `headful` still handles raw gameplay/view input events.
+
+Goal
+- Complete migration so engine-owned `InputFrame` is the only gameplay and UI input source.
+- Reduce `game/src/bin/headful.rs` `handle_event` to lifecycle and event-loop concerns only.
+- Preserve current control feel and deterministic behavior across run modes.
+
+Dependencies
+- This plan should complete before `plans/headful_modularization_plan.txt` to avoid extracting soon-to-be-removed raw input paths.
+
+Current Baseline
+- `engine/src/app.rs` already tracks keyboard, mouse buttons, wheel, and focus in `InputFrame`.
+- `game/src/bin/headful.rs` still processes raw keyboard/mouse event branches in `handle_event` for view transitions, gameplay actions, debug clicks, and skilltree drag.
+- `update_state` already consumes part of `InputFrame` (`mouse_pos`, `window_focused`, `scroll_y`, click release paths).
+
+Design Rules
+- Engine is the only place that translates raw `winit` input into frame state.
+- Game logic reads only from `InputFrame` inside `update_state`.
+- `handle_event` may handle lifecycle and control-surface behavior only (close request, redraw cadence, exit flow, non-input app events).
+- Preserve frame semantics:
+  - `*_down` = currently held
+  - `*_pressed` = transitioned this frame
+  - `*_released` = transitioned this frame
+
+Phase 1: Build Input Coverage Map
+- Inventory all input-related branches in `headful` `handle_event`:
+  - view transitions (menu, pause, game-over, skilltree)
+  - gameplay actions and horizontal repeat
+  - debug HUD click and hotkeys
+  - skilltree camera drag start/update/end
+- For each branch, define the target `InputFrame` trigger source (`keys_pressed`, `keys_down`, `mouse_buttons_pressed`, etc.).
+- Maintain a parity checklist so no old branch is deleted before a frame-based equivalent exists.
+
+Phase 2: Close Engine Input Gaps (If Needed)
+- Add only missing primitives to `InputFrame` if migration exposes true gaps:
+  - optional mouse-delta helper for drag math
+  - optional modifier helpers for key combos
+- Keep normal/recording/profile modes aligned on exactly the same input rollover behavior.
+- Document any added fields near `InputFrame`.
+
+Phase 3: Migrate Keyboard Behavior to `update_state`
+- Move all view transition key handling to `keys_pressed`.
+- Move gameplay action dispatch (`Rotate`, `Drop`, `Hold`, etc.) to `keys_pressed`.
+- Move horizontal hold/release state machine triggering to `keys_down` plus `keys_released`.
+- Keep pause and escape behavior identical to current UX.
+
+Phase 4: Migrate Mouse Behavior to `update_state`
+- Move debug HUD click interception to frame-based mouse state.
+- Move skilltree drag state machine from raw `CursorMoved` events to frame polling:
+  - begin on left `pressed` in viewport
+  - update while left `down` using latest mouse position
+  - finalize on left `released`
+- Preserve drag threshold math and `consume_next_mouse_up` behavior.
+
+Phase 5: Shrink `handle_event` to Lifecycle-Only
+- Remove raw input match arms (`KeyboardInput`, gameplay `MouseInput`, drag-specific `CursorMoved`) from `headful` `handle_event`.
+- Keep only:
+  - close requested and exit flow
+  - redraw cadence (`WaitUntil`, `RedrawRequested`, schedule next redraw)
+  - non-input lifecycle events that cannot be represented in `InputFrame`
+- Add a short contract comment near `handle_event`: no gameplay input handling in this method.
+
+Phase 6: Test and Verification
+- Engine tests in `engine/src/app.rs`:
+  - keyboard and mouse pressed/down/released transitions
+  - wheel accumulation and reset
+  - focus-loss clearing held state
+- Game tests:
+  - menu/pause/game-over key flow parity
+  - gameplay controls and horizontal repeat parity
+  - skilltree pan/zoom/click parity
+- Smoke verification in:
+  - normal headful run
+  - recording mode
+  - profile mode
+
+Phase 7: Cleanup and Docs
+- Remove obsolete raw-input imports and dead helper branches from `headful`.
+- Document final `GameApp::handle_event` contract in `engine/src/app.rs`.
+- Mark this plan complete with explicit verification notes.
+
+Acceptance Criteria
+- `update_state` is the only place gameplay/UI input decisions are made.
+- `handle_event` contains lifecycle logic only and no gameplay input dispatch.
+- Controls match current behavior for menu, gameplay, and skilltree interactions.
+- Recording and profile behavior remain consistent with normal run behavior.
+
+Risks and Mitigations
+- Risk: timing drift when moving drag updates from event-driven to frame-driven.
+  - Mitigation: preserve threshold math and add focused drag regressions.
+- Risk: key-repeat feel changes.
+  - Mitigation: keep repeat constants and state machine logic, change only trigger source.
+- Risk: overlap with headful modularization.
+  - Mitigation: complete this migration before large file extraction work.

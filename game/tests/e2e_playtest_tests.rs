@@ -1,13 +1,13 @@
 use engine::HeadlessRunner;
 use engine::graphics::CpuRenderer;
 use engine::recording::{Mp4Config, Mp4Recorder};
-use engine::regression::{record_state_and_video_then_replay_and_compare, VideoCaptureConfig};
-use engine::render::{draw_board, CELL_SIZE};
+use engine::regression::{VideoCaptureConfig, record_state_and_video_then_replay_and_compare};
+use engine::render::{CELL_SIZE, draw_board};
 use engine::surface::SurfaceSize;
 
 use game::playtest::{InputAction, TetrisLogic};
 use game::state::GameState;
-use game::tetris_core::{Piece, Vec2i, BOARD_HEIGHT, BOARD_WIDTH};
+use game::tetris_core::{BOARD_HEIGHT, BOARD_WIDTH, Piece, Vec2i};
 
 use std::fs;
 use std::path::PathBuf;
@@ -40,7 +40,9 @@ impl E2eMp4 {
         }
 
         let fps = env_u32("ROLLOUT_E2E_RECORD_FPS").unwrap_or(30);
-        let hold_frames = env_usize("ROLLOUT_E2E_RECORD_HOLD_FRAMES").unwrap_or(10).max(1);
+        let hold_frames = env_usize("ROLLOUT_E2E_RECORD_HOLD_FRAMES")
+            .unwrap_or(10)
+            .max(1);
 
         // Render just the board, with a 1-cell padding so the outline is visible.
         let padding_cells = 1u32;
@@ -111,7 +113,13 @@ fn env_usize(name: &str) -> Option<usize> {
 
 fn sanitize_filename(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -158,7 +166,10 @@ fn e2e_hard_drop_places_o_piece() {
 
     assert_eq!(snapshot.current_piece, Some(Piece::O));
     assert_eq!(snapshot.next_piece, Some(Piece::O));
-    assert_eq!(snapshot.current_piece_pos, Vec2i::new(4, BOARD_HEIGHT as i32));
+    assert_eq!(
+        snapshot.current_piece_pos,
+        Vec2i::new(4, BOARD_HEIGHT as i32)
+    );
     assert!(!snapshot.game_over);
 
     if let Some(r) = rec.take() {
@@ -184,7 +195,9 @@ fn e2e_state_recording_replay_video_matches_live_video() {
 
     let test_name = "e2e_state_recording_replay_video_matches_live_video";
     let fps = env_u32("ROLLOUT_E2E_RECORD_FPS").unwrap_or(30);
-    let hold_frames = env_usize("ROLLOUT_E2E_RECORD_HOLD_FRAMES").unwrap_or(10).max(1);
+    let hold_frames = env_usize("ROLLOUT_E2E_RECORD_HOLD_FRAMES")
+        .unwrap_or(10)
+        .max(1);
 
     // Render just the board, with a 1-cell padding so the outline is visible.
     let padding_cells = 1u32;

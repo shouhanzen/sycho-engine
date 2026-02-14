@@ -5,12 +5,12 @@ use std::{
 };
 
 use engine::{
+    GameLogic,
     graphics::CpuRenderer,
     recording::{Mp4Config, Mp4Recorder},
-    regression::{record_state_and_video_then_replay_and_compare, VideoCaptureConfig},
-    render::{draw_board, CELL_SIZE},
+    regression::{VideoCaptureConfig, record_state_and_video_then_replay_and_compare},
+    render::{CELL_SIZE, draw_board},
     surface::SurfaceSize,
-    GameLogic,
 };
 
 fn unique_temp_dir() -> PathBuf {
@@ -107,4 +107,3 @@ fn engine_regression_harness_record_replay_video_roundtrips() {
     let _ = fs::remove_file(artifacts.replay_mp4);
     let _ = fs::remove_dir_all(out_dir);
 }
-

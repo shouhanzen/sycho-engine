@@ -1,5 +1,5 @@
-use engine::agent::{AgentCommand, AgentHost, AgentResponse};
 use engine::GameLogic;
+use engine::agent::{AgentCommand, AgentHost, AgentResponse};
 
 #[derive(Clone)]
 struct Additive;

@@ -89,4 +89,3 @@ mod tests {
         assert!(!t.is_up());
     }
 }
-

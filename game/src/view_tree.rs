@@ -1,10 +1,10 @@
-use engine::ui as ui;
+use engine::ui;
 use engine::view_tree::{ButtonNode, RectNode, ViewNode, ViewTree};
 use serde::{Deserialize, Serialize};
 
 use crate::state::GameState;
-use crate::tetris_ui::compute_layout;
 use crate::tetris_ui::MAIN_MENU_TITLE;
+use crate::tetris_ui::compute_layout;
 use crate::view::GameView;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,14 +30,7 @@ pub fn build_menu_view_tree(view: GameView, width: u32, height: u32) -> ViewTree
     match view {
         GameView::MainMenu => {
             if let Some((start, skilltree, quit)) = main_menu_button_rects(width, height) {
-                push_button(
-                    &mut tree,
-                    1,
-                    start,
-                    "START",
-                    GameUiAction::StartGame,
-                    true,
-                );
+                push_button(&mut tree, 1, start, "START", GameUiAction::StartGame, true);
                 push_button(
                     &mut tree,
                     2,
@@ -51,14 +44,7 @@ pub fn build_menu_view_tree(view: GameView, width: u32, height: u32) -> ViewTree
         }
         GameView::Tetris { paused: true } => {
             if let Some((resume, end_run)) = pause_menu_button_rects(width, height) {
-                push_button(
-                    &mut tree,
-                    10,
-                    resume,
-                    "RESUME",
-                    GameUiAction::Resume,
-                    true,
-                );
+                push_button(&mut tree, 10, resume, "RESUME", GameUiAction::Resume, true);
                 push_button(
                     &mut tree,
                     11,
@@ -87,14 +73,7 @@ pub fn build_menu_view_tree(view: GameView, width: u32, height: u32) -> ViewTree
                     GameUiAction::OpenSkillTree,
                     true,
                 );
-                push_button(
-                    &mut tree,
-                    22,
-                    quit,
-                    "QUIT",
-                    GameUiAction::Quit,
-                    true,
-                );
+                push_button(&mut tree, 22, quit, "QUIT", GameUiAction::Quit, true);
             }
         }
         _ => {}
@@ -102,11 +81,7 @@ pub fn build_menu_view_tree(view: GameView, width: u32, height: u32) -> ViewTree
     tree
 }
 
-pub fn build_hud_view_tree(
-    state: &GameState,
-    width: u32,
-    height: u32,
-) -> ViewTree<GameUiAction> {
+pub fn build_hud_view_tree(state: &GameState, width: u32, height: u32) -> ViewTree<GameUiAction> {
     let mut tree = ViewTree::new();
     if !state.view.is_tetris() {
         return tree;
@@ -139,8 +114,12 @@ pub fn build_hud_view_tree(
         GameUiAction::HoldPiece,
         state.tetris.can_hold(),
     );
-    tree.push(ViewNode::Rect(RectNode { rect: layout.hold_panel }));
-    tree.push(ViewNode::Rect(RectNode { rect: layout.next_panel }));
+    tree.push(ViewNode::Rect(RectNode {
+        rect: layout.hold_panel,
+    }));
+    tree.push(ViewNode::Rect(RectNode {
+        rect: layout.next_panel,
+    }));
     tree
 }
 
@@ -228,7 +207,9 @@ fn main_menu_button_rects(width: u32, height: u32) -> Option<(ui::Rect, ui::Rect
         .saturating_add(title_h)
         .saturating_add(title_button_gap);
     let start_button = ui::Rect {
-        x: content.x.saturating_add(content.w.saturating_sub(button_size.w) / 2),
+        x: content
+            .x
+            .saturating_add(content.w.saturating_sub(button_size.w) / 2),
         y: buttons_y,
         w: button_size.w,
         h: button_size.h,

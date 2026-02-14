@@ -12,7 +12,9 @@ fn game_state_round_trip_preserves_state() {
 
     let mut state = GameState::new(core);
     state.view = GameView::SkillTree;
-    state.round_timer.tick_if_running(Duration::from_secs(3), true);
+    state
+        .round_timer
+        .tick_if_running(Duration::from_secs(3), true);
     state.gravity_interval = Duration::from_millis(400);
     state.gravity_elapsed = Duration::from_millis(120);
     state.skilltree.progress.money = 25;
@@ -25,6 +27,9 @@ fn game_state_round_trip_preserves_state() {
     assert_eq!(restored.round_timer, state.round_timer);
     assert_eq!(restored.gravity_interval, state.gravity_interval);
     assert_eq!(restored.gravity_elapsed, state.gravity_elapsed);
-    assert_eq!(restored.skilltree.to_snapshot(), state.skilltree.to_snapshot());
+    assert_eq!(
+        restored.skilltree.to_snapshot(),
+        state.skilltree.to_snapshot()
+    );
     assert!(restored.skilltree.is_unlocked("start"));
 }

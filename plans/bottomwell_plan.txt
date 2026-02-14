@@ -1,0 +1,82 @@
+Bottomwell Mechanic Plan
+========================
+
+Status
+- Current: NOT_STARTED
+- Last Reviewed: 2026-02-14
+- Notes: No bottomwell fields or row-generation/reveal helpers are present in `tetris_core` yet.
+
+Goal
+- Add an endless "bottomwell" where the board always keeps 3 earth/garbage rows at the bottom.
+- Every line clear reveals exactly 1 new earth line.
+- This forms the base loop for future mining upgrades and rewards.
+
+Design Rules
+- Board remains fixed at 10x20.
+- Bottomwell target is always 3 rows at y=0..2.
+- After clearing N lines, reveal N earth rows from below.
+- Keep deterministic generation by using run seed + depth index.
+
+Phase 1: Data Model
+- In `game/src/tetris_core.rs`, add:
+  - `bottomwell_enabled: bool`
+  - `bottomwell_rows: usize` (default 3)
+  - `earth_depth: u64` (how many earth rows revealed so far)
+- Add optional constants for new cell types:
+  - 8 = Garbage
+  - 9 = Stone
+  - 10 = Ore
+  - 11 = Coin
+
+Phase 2: Row Generation
+- Add `generate_earth_row(depth: u64) -> Vec<u8>`.
+- Start simple:
+  - Mostly garbage/stone cells
+  - 1-2 holes for playability
+  - Rare ore/coin cells at deeper depths
+- Keep this deterministic and fast.
+
+Phase 3: Reveal Pipeline
+- In line clear flow:
+  - Keep existing clear and score behavior.
+  - After clear resolves, call `reveal_earth_lines(cleared_count)`.
+- `reveal_earth_lines(n)` behavior:
+  - Insert generated row at board bottom.
+  - Remove one row from board top.
+  - Repeat N times.
+- Then call `ensure_bottomwell_floor()` to guarantee bottom 3 are non-empty.
+
+Phase 4: Initialization
+- On new game init:
+  - Initialize board as normal.
+  - Pre-fill bottom 3 rows using `generate_earth_row`.
+  - Spawn piece as current flow does.
+
+Phase 5: Rendering
+- In `engine/src/render.rs`:
+  - Add colors for new cell IDs (8-11).
+- Existing board rendering path already supports non-zero solid cells.
+
+Phase 6: Rewards Hook (minimal)
+- Add helper that counts removed ore/coin cells during line clear.
+- Convert to score/currency placeholder values.
+- Keep this simple now; full economy can be added later.
+
+Phase 7: Tests
+- Add tests in `game/src/tetris_core.rs` (and/or `game/src/playtest.rs`) for:
+  - bottom 3 rows exist after init
+  - clearing 1 line reveals 1 earth line
+  - clearing N lines reveals N lines
+  - board height always stays constant
+  - generation is deterministic by seed/depth
+
+Acceptance Criteria
+- Bottom 3 rows are always present and non-empty.
+- Clearing lines makes the board "dig deeper" one line per clear.
+- Board dimensions and piece controls remain stable.
+- Existing gameplay remains playable with bottomwell enabled.
+
+Future Extensions
+- Upgrade tree affects ore/coin odds, hole count, and hazard density.
+- Specialized tools/pieces for vertical digging.
+- Depth milestones and biome themes.

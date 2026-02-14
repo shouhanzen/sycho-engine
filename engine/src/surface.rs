@@ -80,4 +80,3 @@ impl Surface for RgbaBufferSurface {
         Ok(())
     }
 }
-

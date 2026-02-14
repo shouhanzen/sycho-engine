@@ -6,19 +6,20 @@ use std::{
 };
 
 use axum::{
+    Json, Router,
     extract::State,
     http::StatusCode,
     routing::{get, post},
-    Json, Router,
 };
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 use tower_http::cors::{Any, CorsLayer};
 
 use engine::editor::{
-    EditorAction, EditorManifest, EditorSnapshot, EditorTimeline, FramesRequest, SeekRequest,
-    StepRequest,
+    EditorManifest, EditorSnapshot, EditorTimeline, FramesRequest, SeekRequest, StepRequest,
 };
+
+use crate::editor_actions;
 
 #[derive(Debug)]
 pub enum RemoteCmd {
@@ -59,47 +60,7 @@ async fn health() -> &'static str {
 }
 
 fn default_manifest() -> EditorManifest {
-    EditorManifest {
-        title: "Tetree (Tetris)".to_string(),
-        actions: vec![
-            EditorAction {
-                id: "moveLeft".to_string(),
-                label: "Left".to_string(),
-            },
-            EditorAction {
-                id: "moveRight".to_string(),
-                label: "Right".to_string(),
-            },
-            EditorAction {
-                id: "softDrop".to_string(),
-                label: "Down".to_string(),
-            },
-            EditorAction {
-                id: "rotateCw".to_string(),
-                label: "Rotate CW".to_string(),
-            },
-            EditorAction {
-                id: "rotateCcw".to_string(),
-                label: "Rotate CCW".to_string(),
-            },
-            EditorAction {
-                id: "rotate180".to_string(),
-                label: "Rotate 180".to_string(),
-            },
-            EditorAction {
-                id: "hardDrop".to_string(),
-                label: "Hard Drop".to_string(),
-            },
-            EditorAction {
-                id: "hold".to_string(),
-                label: "Hold".to_string(),
-            },
-            EditorAction {
-                id: "noop".to_string(),
-                label: "Noop".to_string(),
-            },
-        ],
-    }
+    editor_actions::default_manifest()
 }
 
 async fn manifest() -> Json<EditorManifest> {
@@ -111,8 +72,12 @@ async fn send_cmd<T>(
     cmd: RemoteCmd,
     rx: oneshot::Receiver<T>,
 ) -> Result<T, (StatusCode, String)> {
-    tx.send(cmd)
-        .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "game command channel closed".to_string()))?;
+    tx.send(cmd).map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "game command channel closed".to_string(),
+        )
+    })?;
 
     match tokio::time::timeout(Duration::from_secs(2), rx).await {
         Ok(Ok(v)) => Ok(v),
@@ -124,7 +89,9 @@ async fn send_cmd<T>(
     }
 }
 
-async fn agent_state(State(state): State<RemoteState>) -> Result<Json<EditorSnapshot>, (StatusCode, String)> {
+async fn agent_state(
+    State(state): State<RemoteState>,
+) -> Result<Json<EditorSnapshot>, (StatusCode, String)> {
     let (tx, rx) = oneshot::channel();
     let snapshot = send_cmd(&state.tx, RemoteCmd::GetState { respond: tx }, rx).await?;
     Ok(Json(snapshot))
@@ -210,7 +177,9 @@ async fn agent_seek(
     Ok(Json(snapshot))
 }
 
-async fn agent_reset(State(state): State<RemoteState>) -> Result<Json<EditorSnapshot>, (StatusCode, String)> {
+async fn agent_reset(
+    State(state): State<RemoteState>,
+) -> Result<Json<EditorSnapshot>, (StatusCode, String)> {
     let (tx, rx) = oneshot::channel();
     let snapshot = send_cmd(&state.tx, RemoteCmd::Reset { respond: tx }, rx).await?;
     Ok(Json(snapshot))
@@ -291,4 +260,3 @@ impl RemoteServer {
         }
     }
 }
-

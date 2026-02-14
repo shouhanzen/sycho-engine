@@ -1,5 +1,5 @@
 use crate::{surface::SurfaceSize, ui::Rect};
-use pixels::{wgpu, PixelsContext};
+use pixels::{PixelsContext, wgpu};
 use wgpu::util::DeviceExt;
 
 pub type Color = [u8; 4];
@@ -230,7 +230,9 @@ impl Renderer2d for CpuRenderer<'_> {
                 _ => {}
             }
 
-            draw_char_cpu(self.frame, width, height, cursor_x, cursor_y, ch, color, scale);
+            draw_char_cpu(
+                self.frame, width, height, cursor_x, cursor_y, ch, color, scale,
+            );
             cursor_x = cursor_x.saturating_add(adv_x);
             if cursor_x >= width {
                 break;
@@ -578,11 +580,8 @@ impl GpuRenderer2d {
             .write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
         if !self.instances.is_empty() {
-            ctx.queue.write_buffer(
-                &self.instance_buf,
-                0,
-                bytemuck::cast_slice(&self.instances),
-            );
+            ctx.queue
+                .write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&self.instances));
         }
 
         let clear = wgpu::Color {
@@ -657,11 +656,7 @@ impl GpuRenderer2d {
                     continue;
                 }
                 let px0 = x.saturating_add(col.saturating_mul(scale));
-                self.push_rect_alpha(
-                    Rect::new(px0, py0, scale, scale),
-                    color,
-                    1.0,
-                );
+                self.push_rect_alpha(Rect::new(px0, py0, scale, scale), color, 1.0);
             }
         }
     }
@@ -701,14 +696,24 @@ impl Renderer2d for GpuRenderer2d {
         self.fill_rect(Rect::new(rect.x, rect.y, rect.w, 1), color);
         if rect.h > 1 {
             self.fill_rect(
-                Rect::new(rect.x, rect.y.saturating_add(rect.h).saturating_sub(1), rect.w, 1),
+                Rect::new(
+                    rect.x,
+                    rect.y.saturating_add(rect.h).saturating_sub(1),
+                    rect.w,
+                    1,
+                ),
                 color,
             );
         }
         self.fill_rect(Rect::new(rect.x, rect.y, 1, rect.h), color);
         if rect.w > 1 {
             self.fill_rect(
-                Rect::new(rect.x.saturating_add(rect.w).saturating_sub(1), rect.y, 1, rect.h),
+                Rect::new(
+                    rect.x.saturating_add(rect.w).saturating_sub(1),
+                    rect.y,
+                    1,
+                    rect.h,
+                ),
                 color,
             );
         }
@@ -740,4 +745,3 @@ impl Renderer2d for GpuRenderer2d {
         }
     }
 }
-

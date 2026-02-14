@@ -15,7 +15,10 @@ fn draw_text_writes_some_pixels() {
     gfx.draw_text(0, 0, "FPS", color);
 
     let any_text_pixel = frame.chunks_exact(4).any(|px| px == color);
-    assert!(any_text_pixel, "expected draw_text to paint at least one pixel");
+    assert!(
+        any_text_pixel,
+        "expected draw_text to paint at least one pixel"
+    );
 }
 
 #[test]
@@ -45,7 +48,12 @@ fn draw_text_clips_without_panicking() {
     let mut frame = vec![0u8; (width * height * 4) as usize];
 
     let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
-    gfx.draw_text(width.saturating_sub(1), height.saturating_sub(1), "A", [255, 0, 0, 255]);
+    gfx.draw_text(
+        width.saturating_sub(1),
+        height.saturating_sub(1),
+        "A",
+        [255, 0, 0, 255],
+    );
 }
 
 #[test]
@@ -108,7 +116,6 @@ fn debug_hud_emits_lines_with_expected_labels() {
         "expected a present line, got: {lines:?}"
     );
 }
-
 
 #[test]
 fn debug_hud_minimize_collapses_overlay_lines() {

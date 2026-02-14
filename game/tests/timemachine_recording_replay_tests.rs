@@ -16,7 +16,9 @@ fn unique_temp_json_path() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    std::env::temp_dir().join(format!("rollout_engine_test_tetris_timemachine_{nanos}.json"))
+    std::env::temp_dir().join(format!(
+        "rollout_engine_test_tetris_timemachine_{nanos}.json"
+    ))
 }
 
 #[test]
@@ -56,4 +58,3 @@ fn tetris_timemachine_can_be_saved_and_replayed_from_disk() {
 
     let _ = fs::remove_file(out);
 }
-

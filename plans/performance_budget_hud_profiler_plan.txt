@@ -1,0 +1,101 @@
+Performance Budget HUD and Profiler Plan
+========================================
+
+Status
+- Current: NOT_STARTED
+- Last Reviewed: 2026-02-14
+- Notes: Timing capture exists, but budget thresholds/status reporting and budget-aware pass/fail checks are not implemented.
+
+Goal
+- Define explicit performance budgets before adding more visual complexity.
+- Surface budget status in debug HUD and profiling output so regressions are obvious.
+- Keep frame pacing stable for normal gameplay at target refresh rates.
+
+Dependencies
+- Should land before major visual upgrades (for example: multi-layer biome backgrounds).
+- Works alongside existing timing capture in:
+  - `game/src/debug.rs` (`DebugHud`)
+  - `engine/src/profiling.rs` (`StepTimings`)
+  - `game/src/bin/profile.rs` (headless profile report)
+
+Budget Targets (Initial Defaults)
+- Primary target: 60 FPS frame budget (`16.67ms` frame total).
+- Suggested v1 thresholds:
+  - frame total: warn `> 16.67ms`, critical `> 22ms`
+  - engine step total: warn `> 6ms`, critical `> 10ms`
+  - draw: warn `> 6ms`, critical `> 10ms`
+  - overlay/debug: warn `> 1.5ms`, critical `> 3ms`
+- Track both instant values and rolling averages to avoid noisy false positives.
+
+Design Rules
+- Budgets should be data-driven, not hardcoded across many files.
+- Warnings should be visible but non-disruptive during normal play.
+- Profiling output should include pass/fail summaries for CI or scripted checks.
+- Overhead of budget checks must be negligible.
+
+Phase 1: Budget Model and Evaluation
+- Add budget types in `game/src/debug.rs` (or shared module):
+  - `PerfBudgetThreshold` (warn, critical)
+  - `PerfBudgetSample` (last, avg, over-warn, over-critical counters)
+  - `PerfBudgetStatus` (`Ok`, `Warn`, `Critical`)
+- Implement helper to classify each metric against threshold.
+- Evaluate status from both `last` and rolling `avg` with simple rule:
+  - critical if either exceeds critical threshold
+  - warn if either exceeds warn threshold
+
+Phase 2: HUD Integration
+- Extend `DebugHud::lines()` to include budget status markers for tracked metrics.
+- Visual encoding in HUD text:
+  - `OK` normal color
+  - `WARN` amber-like color
+  - `CRIT` red-like color
+- Add short summary line:
+  - number of metrics currently warning/critical
+  - optional brief spike counter for recent frames
+
+Phase 3: Config Surface
+- Add env-configurable threshold overrides for quick tuning:
+  - `ROLLOUT_BUDGET_FRAME_WARN_MS`
+  - `ROLLOUT_BUDGET_FRAME_CRIT_MS`
+  - similar keys for engine/draw/overlay metrics
+- Keep sensible defaults if env vars are unset or invalid.
+- Document settings near debug/profiling usage instructions.
+
+Phase 4: Profile CLI Integration
+- Extend `game/src/bin/profile.rs` summary to evaluate final stats against budget thresholds.
+- Print explicit pass/fail lines per metric:
+  - average and p95 comparisons
+  - failure reason if above threshold
+- Optional: add non-zero exit mode (`--fail-on-budget`) for automation gates.
+
+Phase 5: Reporting and Guardrails
+- Add lightweight counters:
+  - consecutive critical frames
+  - percentage of frames over warn/critical
+- Include a compact "budget health" report in debug HUD and profile output.
+- Use these metrics as gate checks before landing heavy rendering features.
+
+Phase 6: Tests
+- Unit tests for threshold classifier:
+  - below warn = `Ok`
+  - between warn and critical = `Warn`
+  - above critical = `Critical`
+- Unit tests for env parsing fallbacks.
+- Snapshot-like tests for formatted status lines (stable prefixes/tokens).
+- Manual verification:
+  - force low thresholds and confirm HUD warnings trigger immediately
+  - restore defaults and confirm normal runs are mostly `OK`
+
+Acceptance Criteria
+- Runtime HUD shows clear per-metric budget status and aggregate warning state.
+- Profile command prints budget-aware pass/fail summary for key metrics.
+- Thresholds are configurable via environment variables with safe defaults.
+- Budget checks add minimal overhead and do not materially impact frame times.
+
+Risks and Mitigations
+- Risk: too-aggressive defaults produce constant warnings and alert fatigue.
+  - Mitigation: start conservative, tune using representative play sessions.
+- Risk: noisy frame spikes cause unstable status flicker.
+  - Mitigation: use rolling windows and optional consecutive-frame checks.
+- Risk: budget checks diverge between HUD and profile tool.
+  - Mitigation: centralize threshold definitions and classifier logic.

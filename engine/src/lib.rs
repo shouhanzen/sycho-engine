@@ -1,16 +1,16 @@
 pub mod agent;
 pub mod app;
 pub mod editor;
-pub mod render;
-pub mod surface;
+pub mod graphics;
+pub mod pixels_renderer;
+pub mod profiling;
 pub mod recording;
 pub mod regression;
-pub mod profiling;
+pub mod render;
+pub mod surface;
 pub mod ui;
 pub mod ui_tree;
 pub mod view_tree;
-pub mod graphics;
-pub mod pixels_renderer;
 
 use std::{
     fs,
@@ -18,7 +18,7 @@ use std::{
     path::Path,
 };
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TimeMachine<State> {
@@ -263,7 +263,11 @@ impl<G: GameLogic> HeadlessRunner<G> {
         }
     }
 
-    pub fn step_profiled<P: profiling::Profiler>(&mut self, input: G::Input, profiler: &mut P) -> usize {
+    pub fn step_profiled<P: profiling::Profiler>(
+        &mut self,
+        input: G::Input,
+        profiler: &mut P,
+    ) -> usize {
         use std::time::Instant;
 
         let total_start = Instant::now();

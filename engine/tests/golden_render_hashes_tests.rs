@@ -5,14 +5,14 @@ use std::{
 };
 
 use engine::{
+    GameLogic,
     graphics::CpuRenderer,
     regression::{
         assert_or_update_golden_hashes, record_state_then_replay_and_compare_render_hashes_with,
         update_goldens_enabled,
     },
-    render::{draw_board, CELL_SIZE},
+    render::{CELL_SIZE, draw_board},
     surface::SurfaceSize,
-    GameLogic,
 };
 
 fn unique_temp_dir() -> PathBuf {
@@ -110,4 +110,3 @@ fn golden_gridgame_render_hashes_are_stable() {
     let _ = fs::remove_file(artifacts.state_json);
     let _ = fs::remove_dir_all(out_dir);
 }
-

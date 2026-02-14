@@ -81,4 +81,3 @@ pub struct FramesRequest {
 pub struct SeekRequest {
     pub frame: usize,
 }
-

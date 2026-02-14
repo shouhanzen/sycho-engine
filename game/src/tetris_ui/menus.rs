@@ -1,14 +1,14 @@
 use engine::graphics::Renderer2d;
 use engine::render::color_for_cell;
-use engine::ui as ui;
+use engine::ui;
 use engine::ui_tree::UiTree;
 
 use crate::ui_ids::*;
 
 use super::{
-    blend_rect, draw_button, draw_rect_outline, draw_text, draw_text_scaled, fill_rect, Rect,
     COLOR_PAUSE_MENU_BG, COLOR_PAUSE_MENU_BORDER, COLOR_PAUSE_MENU_DIM, COLOR_PAUSE_MENU_TEXT,
-    MAIN_MENU_TITLE, PAUSE_MENU_DIM_ALPHA,
+    MAIN_MENU_TITLE, PAUSE_MENU_DIM_ALPHA, Rect, blend_rect, draw_button, draw_rect_outline,
+    draw_text, draw_text_scaled, fill_rect,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -139,7 +139,9 @@ impl PauseMenuView {
         };
         let end_run_button = Rect {
             x: resume_button.x,
-            y: resume_button.y.saturating_sub(resume_button.h.saturating_add(gap)),
+            y: resume_button
+                .y
+                .saturating_sub(resume_button.h.saturating_add(gap)),
             w: resume_button.w,
             h: resume_button.h,
         };
@@ -236,7 +238,9 @@ impl MainMenuView {
             .y
             .saturating_add(content.h.saturating_sub(stack_h) / 2);
 
-        let title_x = content.x.saturating_add(content.w.saturating_sub(title_w) / 2);
+        let title_x = content
+            .x
+            .saturating_add(content.w.saturating_sub(title_w) / 2);
         let title_y = top_y;
         draw_text_scaled(
             frame,
@@ -253,7 +257,9 @@ impl MainMenuView {
             .saturating_add(title_h)
             .saturating_add(title_button_gap);
         let start_button = Rect {
-            x: content.x.saturating_add(content.w.saturating_sub(button_size.w) / 2),
+            x: content
+                .x
+                .saturating_add(content.w.saturating_sub(button_size.w) / 2),
             y: buttons_y,
             w: button_size.w,
             h: button_size.h,
@@ -279,7 +285,11 @@ impl MainMenuView {
 
         ui_tree.ensure_container(UI_MAIN_MENU_CONTAINER, panel);
         ui_tree.add_child(UI_CANVAS, UI_MAIN_MENU_CONTAINER);
-        ui_tree.ensure_button(UI_MAIN_MENU_START, start_button, Some(ACTION_MAIN_MENU_START));
+        ui_tree.ensure_button(
+            UI_MAIN_MENU_START,
+            start_button,
+            Some(ACTION_MAIN_MENU_START),
+        );
         ui_tree.add_child(UI_MAIN_MENU_CONTAINER, UI_MAIN_MENU_START);
         ui_tree.ensure_button(
             UI_MAIN_MENU_SKILLTREE_EDITOR,
@@ -292,7 +302,11 @@ impl MainMenuView {
 
         for (id, rect, label) in [
             (UI_MAIN_MENU_START, start_button, "START"),
-            (UI_MAIN_MENU_SKILLTREE_EDITOR, skilltree_editor_button, "SKILLTREE EDITOR"),
+            (
+                UI_MAIN_MENU_SKILLTREE_EDITOR,
+                skilltree_editor_button,
+                "SKILLTREE EDITOR",
+            ),
             (UI_MAIN_MENU_QUIT, quit_button, "QUIT"),
         ] {
             let hovered = ui_tree.is_hovered(id);
@@ -451,7 +465,11 @@ impl GameOverMenuView {
 
         ui_tree.ensure_container(UI_GAME_OVER_CONTAINER, panel);
         ui_tree.add_child(UI_CANVAS, UI_GAME_OVER_CONTAINER);
-        ui_tree.ensure_button(UI_GAME_OVER_RESTART, restart_button, Some(ACTION_GAME_OVER_RESTART));
+        ui_tree.ensure_button(
+            UI_GAME_OVER_RESTART,
+            restart_button,
+            Some(ACTION_GAME_OVER_RESTART),
+        );
         ui_tree.add_child(UI_GAME_OVER_CONTAINER, UI_GAME_OVER_RESTART);
         ui_tree.ensure_button(
             UI_GAME_OVER_SKILLTREE,

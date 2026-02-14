@@ -2,61 +2,48 @@ use std::{
     cell::Cell,
     io,
     io::Cursor,
-    path::PathBuf,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use engine::HeadlessRunner;
 use engine::app::{
-    AppConfig,
-    AppContext,
-    GameApp,
-    InputFrame,
-    RecordingConfig,
-    ProfileConfig,
-    ReplayConfig,
-    run_game,
-    run_game_with_recording,
-    run_game_with_profile,
-    run_game_with_replay,
+    AppConfig, AppContext, CaptureCli, GameApp, InputFrame, ProfileConfig, RecordingConfig,
+    ReplayConfig, RunMode, default_recording_path, parse_capture_cli_with_default_path, run_game,
+    run_game_with_profile, run_game_with_recording, run_game_with_replay,
 };
 use engine::editor::{EditorSnapshot, EditorTimeline};
-use engine::pixels_renderer::PixelsRenderer2d;
 use engine::ui_tree::{UiEvent, UiInput, UiTree};
-use engine::view_tree::hit_test_actions;
-use pixels::{Pixels, PixelsBuilder, SurfaceTexture};
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
 use winit::{
     dpi::PhysicalSize,
-    event::{ElementState, Event, KeyboardInput, MouseButton, MouseScrollDelta, VirtualKeyCode, WindowEvent},
-    event_loop::{ControlFlow, EventLoop},
-    window::WindowBuilder,
+    event::{ElementState, Event, KeyboardInput, MouseButton, VirtualKeyCode, WindowEvent},
+    event_loop::ControlFlow,
 };
 
 use game::debug::DebugHud;
 use game::headful_editor_api::{RemoteCmd, RemoteServer};
 use game::playtest::{InputAction, TetrisLogic};
 use game::round_timer::RoundTimer;
-use game::state::{GameState, DEFAULT_GRAVITY_INTERVAL, DEFAULT_ROUND_LIMIT};
-use game::skilltree::{
-    clamp_camera_min_to_bounds, skilltree_world_bounds, SkillTreeEditorTool, SkillTreeRunMods,
-    SkillTreeRuntime, Vec2f,
-};
 use game::sfx::{ACTION_SFX_VOLUME, MUSIC_VOLUME};
+use game::skilltree::{
+    SkillTreeEditorTool, SkillTreeRunMods, SkillTreeRuntime, Vec2f, clamp_camera_min_to_bounds,
+    skilltree_world_bounds,
+};
+use game::state::{DEFAULT_GRAVITY_INTERVAL, DEFAULT_ROUND_LIMIT, GameState};
 use game::tetris_core::{Piece, Vec2i};
 use game::tetris_ui::{
+    GameOverMenuLayout, MainMenuLayout, PauseMenuLayout, Rect, SkillTreeLayout, UiLayout,
     draw_game_over_menu_with_ui, draw_main_menu_with_ui, draw_pause_menu_with_ui,
     draw_skilltree_runtime_with_ui_and_mouse, draw_tetris_hud_view, draw_tetris_world,
-    GameOverMenuLayout, MainMenuLayout, PauseMenuLayout, Rect, SkillTreeLayout, UiLayout,
 };
 use game::ui_ids::*;
 use game::view::{GameView, GameViewEffect, GameViewEvent};
 use game::view_tree::{
-    build_hud_view_tree, build_menu_view_tree, build_skilltree_toolbar_view_tree, GameUiAction,
+    GameUiAction, build_hud_view_tree, build_menu_view_tree, build_skilltree_toolbar_view_tree,
 };
 
 struct HeadfulApp {
-    profiling: bool,
+    profile_mode: bool,
     base_logic: TetrisLogic,
     base_round_limit: Duration,
     base_gravity_interval: Duration,
@@ -71,9 +58,7 @@ struct HeadfulApp {
     mouse_x: u32,
     mouse_y: u32,
     skilltree_cam_input: SkillTreeCameraInput,
-    last_frame: Instant,
     horizontal_repeat: HorizontalRepeat,
-    target_fps: u32,
     frame_interval: Duration,
     next_redraw: Instant,
     remote_editor_api: Option<RemoteServer>,
@@ -85,19 +70,16 @@ struct HeadfulApp {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let HeadfulCli {
+    let CaptureCli {
         help,
-        record,
-        record_path: record_path_arg,
+        record_path,
         replay_path,
-    } = parse_headful_cli()?;
+    } = parse_capture_cli_with_default_path(|| default_recording_path("headful"))?;
     if help {
         print_headful_help();
         return Ok(());
     }
 
-    let replay_mode = replay_path.is_some();
-    let record_path = record.then(|| record_path_arg.unwrap_or_else(default_recording_path));
     if let Some(path) = record_path.as_ref() {
         println!("state recording enabled: will save to {}", path.display());
     }
@@ -106,18 +88,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let profile_frames = env_usize("ROLLOUT_HEADFUL_PROFILE_FRAMES").unwrap_or(0);
-    if replay_mode && profile_frames > 0 {
+    if replay_path.is_some() && profile_frames > 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "cannot combine --replay with ROLLOUT_HEADFUL_PROFILE_FRAMES (profiling mode)",
         )
         .into());
     }
-    let profiling = profile_frames > 0;
-
-    let desired = if let (Some(w), Some(h)) =
-        (env_u32("ROLLOUT_HEADFUL_PROFILE_WIDTH"), env_u32("ROLLOUT_HEADFUL_PROFILE_HEIGHT"))
-    {
+    let desired = if let (Some(w), Some(h)) = (
+        env_u32("ROLLOUT_HEADFUL_PROFILE_WIDTH"),
+        env_u32("ROLLOUT_HEADFUL_PROFILE_HEIGHT"),
+    ) {
         PhysicalSize::new(w.max(1), h.max(1))
     } else {
         PhysicalSize::new(1920u32, 1080u32)
@@ -132,17 +113,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let base_logic = TetrisLogic::new(0, Piece::all());
-    let app = HeadfulApp::new(profiling, base_logic, DEFAULT_ROUND_LIMIT, DEFAULT_GRAVITY_INTERVAL);
+    let app = HeadfulApp::new(base_logic, DEFAULT_ROUND_LIMIT, DEFAULT_GRAVITY_INTERVAL);
 
     if let Some(path) = replay_path {
-        run_game_with_replay(
-            config,
-            app,
-            ReplayConfig {
-                path,
-                fps: 15,
-            },
-        )
+        run_game_with_replay(config, app, ReplayConfig { path, fps: 15 })
     } else if let Some(path) = record_path {
         run_game_with_recording(config, app, RecordingConfig { path })
     } else if profile_frames > 0 {
@@ -160,14 +134,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 impl HeadfulApp {
     fn new(
-        profiling: bool,
         base_logic: TetrisLogic,
         base_round_limit: Duration,
         base_gravity_interval: Duration,
     ) -> Self {
         let sfx = Sfx::new().ok();
-        let target_fps: u32 = 60;
-        let frame_interval = Duration::from_secs_f64(1.0 / (target_fps as f64));
+        let frame_interval = Duration::from_secs_f64(1.0 / 60.0);
         let remote_editor_api = match env_u16("ROLLOUT_HEADFUL_EDITOR_PORT").unwrap_or(0) {
             0 => None,
             port => match RemoteServer::start(port) {
@@ -184,7 +156,7 @@ impl HeadfulApp {
             },
         };
         Self {
-            profiling,
+            profile_mode: false,
             base_logic,
             base_round_limit,
             base_gravity_interval,
@@ -199,9 +171,7 @@ impl HeadfulApp {
             mouse_x: 0,
             mouse_y: 0,
             skilltree_cam_input: SkillTreeCameraInput::default(),
-            last_frame: Instant::now(),
             horizontal_repeat: HorizontalRepeat::default(),
-            target_fps,
             frame_interval,
             next_redraw: Instant::now(),
             remote_editor_api,
@@ -210,6 +180,306 @@ impl HeadfulApp {
             mouse_release_was_drag: false,
             consume_next_mouse_up: false,
             render_state: None,
+        }
+    }
+
+    fn play_click_sfx(&self) {
+        if let Some(sfx) = self.sfx.as_ref() {
+            sfx.play_click(ACTION_SFX_VOLUME);
+        }
+    }
+
+    fn reset_active_run(&mut self, state: &mut HeadlessRunner<TetrisLogic>) {
+        reset_run(
+            state,
+            &self.base_logic,
+            self.base_round_limit,
+            self.base_gravity_interval,
+            &mut self.horizontal_repeat,
+        );
+    }
+
+    fn snapshot(runner: &HeadlessRunner<TetrisLogic>) -> EditorSnapshot {
+        let frame = runner.frame();
+        game::editor_api::snapshot_from_state(frame, runner.state())
+    }
+
+    fn timeline(runner: &HeadlessRunner<TetrisLogic>) -> EditorTimeline {
+        let tm = runner.timemachine();
+        EditorTimeline {
+            frame: runner.frame(),
+            history_len: runner.history().len(),
+            can_rewind: tm.can_rewind(),
+            can_forward: tm.can_forward(),
+        }
+    }
+
+    fn handle_remote_command(&mut self, state: &mut HeadlessRunner<TetrisLogic>, cmd: RemoteCmd) {
+        match cmd {
+            RemoteCmd::GetState { respond } => {
+                let _ = respond.send(Self::snapshot(state));
+            }
+            RemoteCmd::GetTimeline { respond } => {
+                let _ = respond.send(Self::timeline(state));
+            }
+            RemoteCmd::Step { action_id, respond } => {
+                match game::editor_api::action_from_id(&action_id) {
+                    Some(action) => {
+                        state.step(action);
+                        let _ = respond.send(Ok(Self::snapshot(state)));
+                    }
+                    None => {
+                        let _ = respond.send(Err(format!("unknown actionId: {action_id}")));
+                    }
+                }
+            }
+            RemoteCmd::Rewind { frames, respond } => {
+                state.rewind(frames);
+                let _ = respond.send(Self::snapshot(state));
+            }
+            RemoteCmd::Forward { frames, respond } => {
+                state.forward(frames);
+                let _ = respond.send(Self::snapshot(state));
+            }
+            RemoteCmd::Seek { frame, respond } => {
+                state.seek(frame);
+                let _ = respond.send(Self::snapshot(state));
+            }
+            RemoteCmd::Reset { respond } => {
+                self.reset_active_run(state);
+                let _ = respond.send(Self::snapshot(state));
+            }
+        }
+    }
+
+    fn drain_remote_commands(&mut self, state: &mut HeadlessRunner<TetrisLogic>) {
+        loop {
+            let next_cmd = {
+                let Some(remote) = self.remote_editor_api.as_mut() else {
+                    return;
+                };
+                match remote.rx.try_recv() {
+                    Ok(cmd) => Some(cmd),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => None,
+                }
+            };
+            let Some(cmd) = next_cmd else {
+                break;
+            };
+            self.handle_remote_command(state, cmd);
+        }
+    }
+
+    fn handle_viewtree_action(
+        &mut self,
+        state: &mut HeadlessRunner<TetrisLogic>,
+        action: GameUiAction,
+    ) -> bool {
+        match action {
+            GameUiAction::StartGame => {
+                let view = state.state().view;
+                if matches!(view, GameView::MainMenu) {
+                    let (next, effect) = view.handle(GameViewEvent::StartGame);
+                    state.state_mut().view = next;
+                    if matches!(effect, GameViewEffect::ResetTetris) {
+                        self.reset_active_run(state);
+                    }
+                    self.play_click_sfx();
+                    return true;
+                }
+            }
+            GameUiAction::OpenSkillTreeEditor => {
+                let view = state.state().view;
+                if matches!(view, GameView::MainMenu) {
+                    let (next, _) = view.handle(GameViewEvent::OpenSkillTreeEditor);
+                    state.state_mut().view = next;
+                    self.horizontal_repeat.clear();
+                    let skilltree = &mut state.state_mut().skilltree;
+                    if !skilltree.editor.enabled {
+                        skilltree.editor_toggle();
+                    }
+                    self.play_click_sfx();
+                    return true;
+                }
+            }
+            GameUiAction::Quit => {
+                let view = state.state().view;
+                if matches!(view, GameView::MainMenu | GameView::GameOver) {
+                    self.exit_requested = true;
+                    return true;
+                }
+            }
+            GameUiAction::PauseToggle => {
+                let view = state.state().view;
+                if view.is_tetris() {
+                    let (next, _) = view.handle(GameViewEvent::TogglePause);
+                    let state = state.state_mut();
+                    state.view = next;
+                    state.gravity_elapsed = Duration::ZERO;
+                    self.play_click_sfx();
+                    return true;
+                }
+            }
+            GameUiAction::Resume => {
+                let view = state.state().view;
+                if matches!(view, GameView::Tetris { paused: true }) {
+                    let (next, _) = view.handle(GameViewEvent::TogglePause);
+                    let state = state.state_mut();
+                    state.view = next;
+                    state.gravity_elapsed = Duration::ZERO;
+                    self.play_click_sfx();
+                    return true;
+                }
+            }
+            GameUiAction::EndRun => {
+                let view = state.state().view;
+                if matches!(view, GameView::Tetris { paused: true }) {
+                    let earned = money_earned_from_run(state.state());
+                    if earned > 0 {
+                        state.state_mut().skilltree.add_money(earned);
+                    }
+                    let (next, _) = view.handle(GameViewEvent::GameOver);
+                    state.state_mut().view = next;
+                    self.horizontal_repeat.clear();
+                    self.play_click_sfx();
+                    return true;
+                }
+            }
+            GameUiAction::HoldPiece => {
+                let view = state.state().view;
+                if matches!(view, GameView::Tetris { paused: false }) {
+                    apply_action(
+                        state,
+                        self.sfx.as_ref(),
+                        &mut self.debug_hud,
+                        InputAction::Hold,
+                    );
+                    return true;
+                }
+            }
+            GameUiAction::Restart => {
+                let view = state.state().view;
+                if matches!(view, GameView::GameOver) {
+                    let (next, effect) = view.handle(GameViewEvent::StartGame);
+                    state.state_mut().view = next;
+                    if matches!(effect, GameViewEffect::ResetTetris) {
+                        self.reset_active_run(state);
+                    }
+                    self.play_click_sfx();
+                    return true;
+                }
+            }
+            GameUiAction::OpenSkillTree => {
+                let view = state.state().view;
+                if matches!(view, GameView::GameOver) {
+                    let (next, _) = view.handle(GameViewEvent::OpenSkillTree);
+                    state.state_mut().view = next;
+                    self.horizontal_repeat.clear();
+                    self.play_click_sfx();
+                    return true;
+                }
+            }
+            GameUiAction::SkillTreeToolSelect => {
+                let view = state.state().view;
+                let skilltree = &mut state.state_mut().skilltree;
+                if matches!(view, GameView::SkillTree) && skilltree.editor.enabled {
+                    skilltree.editor_set_tool(SkillTreeEditorTool::Select);
+                    self.play_click_sfx();
+                    return true;
+                }
+            }
+            GameUiAction::SkillTreeToolMove => {
+                let view = state.state().view;
+                let skilltree = &mut state.state_mut().skilltree;
+                if matches!(view, GameView::SkillTree) && skilltree.editor.enabled {
+                    skilltree.editor_set_tool(SkillTreeEditorTool::Move);
+                    self.play_click_sfx();
+                    return true;
+                }
+            }
+            GameUiAction::SkillTreeToolAddCell => {
+                let view = state.state().view;
+                let skilltree = &mut state.state_mut().skilltree;
+                if matches!(view, GameView::SkillTree) && skilltree.editor.enabled {
+                    skilltree.editor_set_tool(SkillTreeEditorTool::AddCell);
+                    self.play_click_sfx();
+                    return true;
+                }
+            }
+            GameUiAction::SkillTreeToolRemoveCell => {
+                let view = state.state().view;
+                let skilltree = &mut state.state_mut().skilltree;
+                if matches!(view, GameView::SkillTree) && skilltree.editor.enabled {
+                    skilltree.editor_set_tool(SkillTreeEditorTool::RemoveCell);
+                    self.play_click_sfx();
+                    return true;
+                }
+            }
+            GameUiAction::SkillTreeToolConnect => {
+                let view = state.state().view;
+                let skilltree = &mut state.state_mut().skilltree;
+                if matches!(view, GameView::SkillTree) && skilltree.editor.enabled {
+                    skilltree.editor_set_tool(SkillTreeEditorTool::ConnectPrereqs);
+                    self.play_click_sfx();
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    fn update_round_timer_and_game_over(
+        &mut self,
+        state: &mut HeadlessRunner<TetrisLogic>,
+        dt: Duration,
+    ) {
+        if self.profile_mode {
+            return;
+        }
+
+        let mut trigger_game_over = false;
+        {
+            let state = state.state_mut();
+            state
+                .round_timer
+                .tick_if_running(dt, state.view.is_tetris_playing());
+            if state.view.is_tetris_playing() && state.round_timer.is_up() {
+                let earned = money_earned_from_run(state);
+                if earned > 0 {
+                    state.skilltree.add_money(earned);
+                }
+                let (next, _) = state.view.handle(GameViewEvent::GameOver);
+                state.view = next;
+                state.gravity_elapsed = Duration::ZERO;
+                trigger_game_over = true;
+            }
+        }
+        if trigger_game_over {
+            self.horizontal_repeat.clear();
+        }
+    }
+
+    fn apply_gravity_steps(&mut self, state: &mut HeadlessRunner<TetrisLogic>, dt: Duration) {
+        let mut gravity_steps = 0usize;
+        {
+            let state = state.state_mut();
+            if state.view.is_tetris_playing() {
+                state.gravity_elapsed = state.gravity_elapsed.saturating_add(dt);
+                while state.gravity_elapsed >= state.gravity_interval {
+                    state.gravity_elapsed =
+                        state.gravity_elapsed.saturating_sub(state.gravity_interval);
+                    gravity_steps = gravity_steps.saturating_add(1);
+                }
+            } else {
+                state.gravity_elapsed = Duration::ZERO;
+            }
+        }
+        for _ in 0..gravity_steps {
+            let gravity_start = Instant::now();
+            state.step_profiled(InputAction::SoftDrop, &mut self.debug_hud);
+            self.debug_hud.record_gravity(gravity_start.elapsed());
         }
     }
 }
@@ -225,7 +495,7 @@ impl GameApp for HeadfulApp {
             runner.set_record_every_n_frames(record_every.max(1));
         }
         let state = runner.state_mut();
-        state.view = if self.profiling {
+        state.view = if self.profile_mode {
             GameView::Tetris { paused: false }
         } else {
             GameView::MainMenu
@@ -238,7 +508,18 @@ impl GameApp for HeadfulApp {
         runner
     }
 
-    fn build_view(&self, state: &Self::State, ctx: &AppContext) -> engine::view_tree::ViewTree<Self::Action> {
+    fn on_run_mode(&mut self, mode: RunMode, state: &mut Self::State, _ctx: &mut AppContext) {
+        self.profile_mode = matches!(mode, RunMode::Profile);
+        if self.profile_mode {
+            state.state_mut().view = GameView::Tetris { paused: false };
+        }
+    }
+
+    fn build_view(
+        &self,
+        state: &Self::State,
+        ctx: &AppContext,
+    ) -> engine::view_tree::ViewTree<Self::Action> {
         let size = ctx.renderer.size();
         let mut tree = build_menu_view_tree(state.state().view, size.width, size.height);
         tree.nodes
@@ -260,70 +541,14 @@ impl GameApp for HeadfulApp {
         self.last_frame_dt = dt;
         let now = Instant::now();
 
-        if let Some(remote) = self.remote_editor_api.as_mut() {
-            loop {
-                let cmd = match remote.rx.try_recv() {
-                    Ok(cmd) => cmd,
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-                };
+        self.drain_remote_commands(state);
 
-                let snapshot = |runner: &HeadlessRunner<TetrisLogic>| -> EditorSnapshot {
-                    let frame = runner.frame();
-                    game::editor_api::snapshot_from_state(frame, runner.state())
-                };
-                let timeline = |runner: &HeadlessRunner<TetrisLogic>| -> EditorTimeline {
-                    let tm = runner.timemachine();
-                    EditorTimeline {
-                        frame: runner.frame(),
-                        history_len: runner.history().len(),
-                        can_rewind: tm.can_rewind(),
-                        can_forward: tm.can_forward(),
-                    }
-                };
-
-                match cmd {
-                    RemoteCmd::GetState { respond } => {
-                        let _ = respond.send(snapshot(state));
-                    }
-                    RemoteCmd::GetTimeline { respond } => {
-                        let _ = respond.send(timeline(state));
-                    }
-                    RemoteCmd::Step { action_id, respond } => {
-                        match game::editor_api::action_from_id(&action_id) {
-                            Some(action) => {
-                                state.step(action);
-                                let _ = respond.send(Ok(snapshot(state)));
-                            }
-                            None => {
-                                let _ = respond.send(Err(format!("unknown actionId: {action_id}")));
-                            }
-                        }
-                    }
-                    RemoteCmd::Rewind { frames, respond } => {
-                        state.rewind(frames);
-                        let _ = respond.send(snapshot(state));
-                    }
-                    RemoteCmd::Forward { frames, respond } => {
-                        state.forward(frames);
-                        let _ = respond.send(snapshot(state));
-                    }
-                    RemoteCmd::Seek { frame, respond } => {
-                        state.seek(frame);
-                        let _ = respond.send(snapshot(state));
-                    }
-                    RemoteCmd::Reset { respond } => {
-                        reset_run(
-                            state,
-                            &self.base_logic,
-                            self.base_round_limit,
-                            self.base_gravity_interval,
-                            &mut self.horizontal_repeat,
-                        );
-                        let _ = respond.send(snapshot(state));
-                    }
-                }
-            }
+        if let Some((mx, my)) = input.mouse_pos {
+            self.mouse_x = mx;
+            self.mouse_y = my;
+        }
+        if !input.window_focused {
+            self.horizontal_repeat.clear();
         }
 
         let view = state.state().view;
@@ -342,192 +567,7 @@ impl GameApp for HeadfulApp {
         let mut ui_handled = false;
         if input.mouse_up && allow_ui {
             if let Some(action) = actions.first().copied() {
-                match action {
-                    GameUiAction::StartGame => {
-                        let view = state.state().view;
-                        if matches!(view, GameView::MainMenu) {
-                            let (next, effect) = view.handle(GameViewEvent::StartGame);
-                            state.state_mut().view = next;
-                            if matches!(effect, GameViewEffect::ResetTetris) {
-                                reset_run(
-                                    state,
-                                    &self.base_logic,
-                                    self.base_round_limit,
-                                    self.base_gravity_interval,
-                                    &mut self.horizontal_repeat,
-                                );
-                            }
-                            if let Some(sfx) = self.sfx.as_ref() {
-                                sfx.play_click(ACTION_SFX_VOLUME);
-                            }
-                            ui_handled = true;
-                        }
-                    }
-                    GameUiAction::OpenSkillTreeEditor => {
-                        let view = state.state().view;
-                        if matches!(view, GameView::MainMenu) {
-                            let (next, _) = view.handle(GameViewEvent::OpenSkillTreeEditor);
-                            state.state_mut().view = next;
-                            self.horizontal_repeat.clear();
-                            let skilltree = &mut state.state_mut().skilltree;
-                            if !skilltree.editor.enabled {
-                                skilltree.editor_toggle();
-                            }
-                            if let Some(sfx) = self.sfx.as_ref() {
-                                sfx.play_click(ACTION_SFX_VOLUME);
-                            }
-                            ui_handled = true;
-                        }
-                    }
-                    GameUiAction::Quit => {
-                        let view = state.state().view;
-                        if matches!(view, GameView::MainMenu | GameView::GameOver) {
-                            self.exit_requested = true;
-                            ui_handled = true;
-                        }
-                    }
-                    GameUiAction::PauseToggle => {
-                        let view = state.state().view;
-                        if view.is_tetris() {
-                            let (next, _) = view.handle(GameViewEvent::TogglePause);
-                            let state = state.state_mut();
-                            state.view = next;
-                            state.gravity_elapsed = Duration::ZERO;
-                            if let Some(sfx) = self.sfx.as_ref() {
-                                sfx.play_click(ACTION_SFX_VOLUME);
-                            }
-                            ui_handled = true;
-                        }
-                    }
-                    GameUiAction::Resume => {
-                        let view = state.state().view;
-                        if matches!(view, GameView::Tetris { paused: true }) {
-                            let (next, _) = view.handle(GameViewEvent::TogglePause);
-                            let state = state.state_mut();
-                            state.view = next;
-                            state.gravity_elapsed = Duration::ZERO;
-                            if let Some(sfx) = self.sfx.as_ref() {
-                                sfx.play_click(ACTION_SFX_VOLUME);
-                            }
-                            ui_handled = true;
-                        }
-                    }
-                    GameUiAction::EndRun => {
-                        let view = state.state().view;
-                        if matches!(view, GameView::Tetris { paused: true }) {
-                            let earned = money_earned_from_run(state.state());
-                            if earned > 0 {
-                                state.state_mut().skilltree.add_money(earned);
-                            }
-                            let (next, _) = view.handle(GameViewEvent::GameOver);
-                            state.state_mut().view = next;
-                            self.horizontal_repeat.clear();
-                            if let Some(sfx) = self.sfx.as_ref() {
-                                sfx.play_click(ACTION_SFX_VOLUME);
-                            }
-                            ui_handled = true;
-                        }
-                    }
-                    GameUiAction::HoldPiece => {
-                        let view = state.state().view;
-                        if matches!(view, GameView::Tetris { paused: false }) {
-                            apply_action(
-                                state,
-                                self.sfx.as_ref(),
-                                &mut self.debug_hud,
-                                InputAction::Hold,
-                            );
-                            ui_handled = true;
-                        }
-                    }
-                    GameUiAction::Restart => {
-                        let view = state.state().view;
-                        if matches!(view, GameView::GameOver) {
-                            let (next, effect) = view.handle(GameViewEvent::StartGame);
-                            state.state_mut().view = next;
-                            if matches!(effect, GameViewEffect::ResetTetris) {
-                                reset_run(
-                                    state,
-                                    &self.base_logic,
-                                    self.base_round_limit,
-                                    self.base_gravity_interval,
-                                    &mut self.horizontal_repeat,
-                                );
-                            }
-                            if let Some(sfx) = self.sfx.as_ref() {
-                                sfx.play_click(ACTION_SFX_VOLUME);
-                            }
-                            ui_handled = true;
-                        }
-                    }
-                    GameUiAction::OpenSkillTree => {
-                        let view = state.state().view;
-                        if matches!(view, GameView::GameOver) {
-                            let (next, _) = view.handle(GameViewEvent::OpenSkillTree);
-                            state.state_mut().view = next;
-                            self.horizontal_repeat.clear();
-                            if let Some(sfx) = self.sfx.as_ref() {
-                                sfx.play_click(ACTION_SFX_VOLUME);
-                            }
-                            ui_handled = true;
-                        }
-                    }
-                    GameUiAction::SkillTreeToolSelect => {
-                        let view = state.state().view;
-                        let skilltree = &mut state.state_mut().skilltree;
-                        if matches!(view, GameView::SkillTree) && skilltree.editor.enabled {
-                            skilltree.editor_set_tool(SkillTreeEditorTool::Select);
-                            if let Some(sfx) = self.sfx.as_ref() {
-                                sfx.play_click(ACTION_SFX_VOLUME);
-                            }
-                            ui_handled = true;
-                        }
-                    }
-                    GameUiAction::SkillTreeToolMove => {
-                        let view = state.state().view;
-                        let skilltree = &mut state.state_mut().skilltree;
-                        if matches!(view, GameView::SkillTree) && skilltree.editor.enabled {
-                            skilltree.editor_set_tool(SkillTreeEditorTool::Move);
-                            if let Some(sfx) = self.sfx.as_ref() {
-                                sfx.play_click(ACTION_SFX_VOLUME);
-                            }
-                            ui_handled = true;
-                        }
-                    }
-                    GameUiAction::SkillTreeToolAddCell => {
-                        let view = state.state().view;
-                        let skilltree = &mut state.state_mut().skilltree;
-                        if matches!(view, GameView::SkillTree) && skilltree.editor.enabled {
-                            skilltree.editor_set_tool(SkillTreeEditorTool::AddCell);
-                            if let Some(sfx) = self.sfx.as_ref() {
-                                sfx.play_click(ACTION_SFX_VOLUME);
-                            }
-                            ui_handled = true;
-                        }
-                    }
-                    GameUiAction::SkillTreeToolRemoveCell => {
-                        let view = state.state().view;
-                        let skilltree = &mut state.state_mut().skilltree;
-                        if matches!(view, GameView::SkillTree) && skilltree.editor.enabled {
-                            skilltree.editor_set_tool(SkillTreeEditorTool::RemoveCell);
-                            if let Some(sfx) = self.sfx.as_ref() {
-                                sfx.play_click(ACTION_SFX_VOLUME);
-                            }
-                            ui_handled = true;
-                        }
-                    }
-                    GameUiAction::SkillTreeToolConnect => {
-                        let view = state.state().view;
-                        let skilltree = &mut state.state_mut().skilltree;
-                        if matches!(view, GameView::SkillTree) && skilltree.editor.enabled {
-                            skilltree.editor_set_tool(SkillTreeEditorTool::ConnectPrereqs);
-                            if let Some(sfx) = self.sfx.as_ref() {
-                                sfx.play_click(ACTION_SFX_VOLUME);
-                            }
-                            ui_handled = true;
-                        }
-                    }
-                }
+                ui_handled = self.handle_viewtree_action(state, action);
             }
         }
 
@@ -678,23 +718,17 @@ impl GameApp for HeadfulApp {
                     self.mouse_x,
                     self.mouse_y,
                 ) {
-                    let hit_id = state
-                        .state()
-                        .skilltree
-                        .def
-                        .nodes
-                        .iter()
-                        .find_map(|node| {
-                            node.shape.iter().find_map(|rel| {
-                                let wx = node.pos.x + rel.x;
-                                let wy = node.pos.y + rel.y;
-                                if wx == world.x && wy == world.y {
-                                    Some(node.id.clone())
-                                } else {
-                                    None
-                                }
-                            })
-                        });
+                    let hit_id = state.state().skilltree.def.nodes.iter().find_map(|node| {
+                        node.shape.iter().find_map(|rel| {
+                            let wx = node.pos.x + rel.x;
+                            let wy = node.pos.y + rel.y;
+                            if wx == world.x && wy == world.y {
+                                Some(node.id.clone())
+                            } else {
+                                None
+                            }
+                        })
+                    });
                     if let Some(id) = hit_id {
                         let (next, _) = state.state().view.handle(GameViewEvent::OpenSkillTree);
                         state.state_mut().view = next;
@@ -711,63 +745,23 @@ impl GameApp for HeadfulApp {
             self.mouse_release_was_drag = false;
         }
 
-        if !self.profiling {
-            let mut trigger_game_over = false;
-            {
-                let state = state.state_mut();
-                state
-                    .round_timer
-                    .tick_if_running(dt, state.view.is_tetris_playing());
-                if state.view.is_tetris_playing() && state.round_timer.is_up() {
-                    let earned = money_earned_from_run(state);
-                    if earned > 0 {
-                        state.skilltree.add_money(earned);
-                    }
-                    let (next, _) = state.view.handle(GameViewEvent::GameOver);
-                    state.view = next;
-                    state.gravity_elapsed = Duration::ZERO;
-                    trigger_game_over = true;
-                }
-            }
-            if trigger_game_over {
-                self.horizontal_repeat.clear();
-            }
-        }
-
-        let mut gravity_steps = 0usize;
-        {
-            let state = state.state_mut();
-            if state.view.is_tetris_playing() {
-                state.gravity_elapsed = state.gravity_elapsed.saturating_add(dt);
-                while state.gravity_elapsed >= state.gravity_interval {
-                    state.gravity_elapsed =
-                        state.gravity_elapsed.saturating_sub(state.gravity_interval);
-                    gravity_steps = gravity_steps.saturating_add(1);
-                }
-            } else {
-                state.gravity_elapsed = Duration::ZERO;
-            }
-        }
-        for _ in 0..gravity_steps {
-            let gravity_start = Instant::now();
-            state.step_profiled(InputAction::SoftDrop, &mut self.debug_hud);
-            self.debug_hud.record_gravity(gravity_start.elapsed());
-        }
+        self.update_round_timer_and_game_over(state, dt);
+        self.apply_gravity_steps(state, dt);
 
         let view = state.state().view;
         if matches!(view, GameView::SkillTree) {
             let skilltree = &mut state.state_mut().skilltree;
             let dt_s = dt.as_secs_f32();
 
-            let scroll_y = self.skilltree_cam_input.pending_scroll_y;
-            self.skilltree_cam_input.pending_scroll_y = 0.0;
+            let scroll_y = input.scroll_y;
             if scroll_y != 0.0 {
                 let zoom_factor = 1.12f32.powf(scroll_y);
                 skilltree.camera.target_cell_px = (skilltree.camera.target_cell_px * zoom_factor)
                     .clamp(SKILLTREE_CAMERA_MIN_CELL_PX, SKILLTREE_CAMERA_MAX_CELL_PX);
 
                 if let Some(viewport) = skilltree_grid_viewport(self.last_skilltree) {
-                    if viewport.contains(self.mouse_x, self.mouse_y) && self.last_skilltree.grid_cell > 0
+                    if viewport.contains(self.mouse_x, self.mouse_y)
+                        && self.last_skilltree.grid_cell > 0
                     {
                         let old_cell = self.last_skilltree.grid_cell.max(1) as f32;
                         let sx = self.mouse_x as f32 + 0.5;
@@ -781,9 +775,8 @@ impl GameApp for HeadfulApp {
                         let row_from_top_f =
                             (sy - self.last_skilltree.grid_origin_y as f32) / old_cell;
                         let world_x = cam_min_x_old + col_f;
-                        let world_y = cam_min_y_old
-                            + (self.last_skilltree.grid_rows as f32)
-                            - row_from_top_f;
+                        let world_y =
+                            cam_min_y_old + (self.last_skilltree.grid_rows as f32) - row_from_top_f;
 
                         let grid_cell_new = skilltree
                             .camera
@@ -796,10 +789,8 @@ impl GameApp for HeadfulApp {
                             let grid_cols_new = grid.w / grid_cell_new;
                             let grid_rows_new = grid.h / grid_cell_new;
                             if grid_cols_new > 0 && grid_rows_new > 0 {
-                                let grid_pixel_w_new =
-                                    grid_cols_new.saturating_mul(grid_cell_new);
-                                let grid_pixel_h_new =
-                                    grid_rows_new.saturating_mul(grid_cell_new);
+                                let grid_pixel_w_new = grid_cols_new.saturating_mul(grid_cell_new);
+                                let grid_pixel_h_new = grid_rows_new.saturating_mul(grid_cell_new);
                                 let grid_origin_x_new = grid
                                     .x
                                     .saturating_add(grid.w.saturating_sub(grid_pixel_w_new) / 2);
@@ -812,8 +803,7 @@ impl GameApp for HeadfulApp {
 
                                 let cam_min_x_new =
                                     world_x - (sx - grid_origin_x_new as f32) / new_cell;
-                                let cam_min_y_new = world_y
-                                    - (grid_rows_new as f32)
+                                let cam_min_y_new = world_y - (grid_rows_new as f32)
                                     + (sy - grid_origin_y_new as f32) / new_cell;
 
                                 skilltree.camera.target_pan.x =
@@ -833,7 +823,8 @@ impl GameApp for HeadfulApp {
 
             if !self.skilltree_cam_input.left_down {
                 if let Some(viewport) = skilltree_grid_viewport(self.last_skilltree) {
-                    if viewport.contains(self.mouse_x, self.mouse_y) && self.last_skilltree.grid_cell > 0
+                    if viewport.contains(self.mouse_x, self.mouse_y)
+                        && self.last_skilltree.grid_cell > 0
                     {
                         let mx = self.mouse_x as f32;
                         let my = self.mouse_y as f32;
@@ -869,10 +860,10 @@ impl GameApp for HeadfulApp {
 
                         if (vx != 0.0 || vy != 0.0) && dt_s > 0.0 {
                             let cell_px = (self.last_skilltree.grid_cell as f32).max(1.0);
-                            let dx_cells = (vx * SKILLTREE_EDGE_PAN_MAX_SPEED_PX_PER_S * dt_s)
-                                / cell_px;
-                            let dy_cells = (vy * SKILLTREE_EDGE_PAN_MAX_SPEED_PX_PER_S * dt_s)
-                                / cell_px;
+                            let dx_cells =
+                                (vx * SKILLTREE_EDGE_PAN_MAX_SPEED_PX_PER_S * dt_s) / cell_px;
+                            let dy_cells =
+                                (vy * SKILLTREE_EDGE_PAN_MAX_SPEED_PX_PER_S * dt_s) / cell_px;
                             skilltree.camera.target_pan.x += dx_cells;
                             skilltree.camera.target_pan.y += dy_cells;
                             clamp_skilltree_camera_to_bounds(
@@ -930,7 +921,8 @@ impl GameApp for HeadfulApp {
         if matches!(view, GameView::SkillTree | GameView::MainMenu) {
             self.last_layout = UiLayout::default();
         } else {
-            let tetris_layout = draw_tetris_world(renderer, size.width, size.height, state.tetris());
+            let tetris_layout =
+                draw_tetris_world(renderer, size.width, size.height, state.tetris());
             if view.is_tetris() {
                 draw_tetris_hud_view(
                     renderer,
@@ -962,12 +954,8 @@ impl GameApp for HeadfulApp {
         let overlay_start = Instant::now();
         match view {
             GameView::MainMenu => {
-                self.last_main_menu = draw_main_menu_with_ui(
-                    renderer,
-                    size.width,
-                    size.height,
-                    &mut self.ui_tree,
-                );
+                self.last_main_menu =
+                    draw_main_menu_with_ui(renderer, size.width, size.height, &mut self.ui_tree);
                 self.last_pause_menu = PauseMenuLayout::default();
                 self.last_skilltree = SkillTreeLayout::default();
                 self.last_game_over_menu = GameOverMenuLayout::default();
@@ -987,12 +975,8 @@ impl GameApp for HeadfulApp {
             }
             GameView::Tetris { paused: true } => {
                 self.last_main_menu = MainMenuLayout::default();
-                self.last_pause_menu = draw_pause_menu_with_ui(
-                    renderer,
-                    size.width,
-                    size.height,
-                    &mut self.ui_tree,
-                );
+                self.last_pause_menu =
+                    draw_pause_menu_with_ui(renderer, size.width, size.height, &mut self.ui_tree);
                 self.last_skilltree = SkillTreeLayout::default();
                 self.last_game_over_menu = GameOverMenuLayout::default();
             }
@@ -1018,7 +1002,6 @@ impl GameApp for HeadfulApp {
             .draw_overlay(renderer, size.width, size.height);
         let overlay_dt = overlay_start.elapsed();
 
-        let present_start = Instant::now();
         let present_dt = Duration::ZERO;
         let frame_total_dt = frame_start.elapsed();
         self.debug_hud.on_frame(
@@ -1029,7 +1012,6 @@ impl GameApp for HeadfulApp {
             present_dt,
             frame_total_dt,
         );
-
     }
 
     fn handle_event(
@@ -1052,9 +1034,6 @@ impl GameApp for HeadfulApp {
                 WindowEvent::CloseRequested => {
                     *control_flow = ControlFlow::Exit;
                     return true;
-                }
-                WindowEvent::Focused(false) => {
-                    self.horizontal_repeat.clear();
                 }
                 WindowEvent::CursorMoved { position, .. } => {
                     let new_x = position.x.max(0.0) as u32;
@@ -1091,7 +1070,8 @@ impl GameApp for HeadfulApp {
                                 self.last_skilltree.grid_cols as f32,
                                 self.last_skilltree.grid_rows as f32,
                             );
-                            if let Some(bounds) = skilltree_world_bounds(&runner.state().skilltree.def)
+                            if let Some(bounds) =
+                                skilltree_world_bounds(&runner.state().skilltree.def)
                             {
                                 cam_min = clamp_camera_min_to_bounds(
                                     cam_min,
@@ -1121,27 +1101,18 @@ impl GameApp for HeadfulApp {
                         mouse_up: false,
                     });
                 }
-                WindowEvent::MouseWheel { delta, .. } => {
-                    let view = runner.state().view;
-                    if !matches!(view, GameView::SkillTree) {
-                        return false;
-                    }
-                    let scroll_y = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => *y,
-                        MouseScrollDelta::PixelDelta(pos) => (pos.y as f32) / 120.0,
-                    };
-                    self.skilltree_cam_input.pending_scroll_y += scroll_y;
-                }
                 WindowEvent::MouseInput {
                     state: ElementState::Pressed,
                     button: MouseButton::Left,
                     ..
                 } => {
                     let size = ctx.renderer.size();
-                    if self
-                        .debug_hud
-                        .handle_click(self.mouse_x, self.mouse_y, size.width, size.height)
-                    {
+                    if self.debug_hud.handle_click(
+                        self.mouse_x,
+                        self.mouse_y,
+                        size.width,
+                        size.height,
+                    ) {
                         self.consume_next_mouse_up = true;
                         return true;
                     }
@@ -1240,7 +1211,8 @@ impl GameApp for HeadfulApp {
                                     return true;
                                 }
 
-                                let skilltree_editor_enabled = runner.state().skilltree.editor.enabled;
+                                let skilltree_editor_enabled =
+                                    runner.state().skilltree.editor.enabled;
                                 if skilltree_editor_enabled {
                                     let skilltree = &mut runner.state_mut().skilltree;
                                     match *key {
@@ -1274,14 +1246,18 @@ impl GameApp for HeadfulApp {
                                             skilltree.camera.target_pan = skilltree.camera.pan;
                                         }
                                         VirtualKeyCode::Minus => {
-                                            skilltree.camera.cell_px = (skilltree.camera.cell_px - 2.0)
+                                            skilltree.camera.cell_px = (skilltree.camera.cell_px
+                                                - 2.0)
                                                 .max(SKILLTREE_CAMERA_MIN_CELL_PX);
-                                            skilltree.camera.target_cell_px = skilltree.camera.cell_px;
+                                            skilltree.camera.target_cell_px =
+                                                skilltree.camera.cell_px;
                                         }
                                         VirtualKeyCode::Equals => {
-                                            skilltree.camera.cell_px = (skilltree.camera.cell_px + 2.0)
+                                            skilltree.camera.cell_px = (skilltree.camera.cell_px
+                                                + 2.0)
                                                 .min(SKILLTREE_CAMERA_MAX_CELL_PX);
-                                            skilltree.camera.target_cell_px = skilltree.camera.cell_px;
+                                            skilltree.camera.target_cell_px =
+                                                skilltree.camera.cell_px;
                                         }
                                         VirtualKeyCode::N => {
                                             if let Some(world) = skilltree_world_cell_at_screen(
@@ -1296,18 +1272,16 @@ impl GameApp for HeadfulApp {
                                         VirtualKeyCode::Delete => {
                                             let _ = skilltree.editor_delete_selected();
                                         }
-                                        VirtualKeyCode::S => {
-                                            match skilltree.save_def() {
-                                                Ok(()) => {
-                                                    skilltree.editor.dirty = false;
-                                                    skilltree.editor.status = Some("SAVED".to_string());
-                                                }
-                                                Err(e) => {
-                                                    skilltree.editor.status =
-                                                        Some(format!("SAVE FAILED: {e}"));
-                                                }
+                                        VirtualKeyCode::S => match skilltree.save_def() {
+                                            Ok(()) => {
+                                                skilltree.editor.dirty = false;
+                                                skilltree.editor.status = Some("SAVED".to_string());
                                             }
-                                        }
+                                            Err(e) => {
+                                                skilltree.editor.status =
+                                                    Some(format!("SAVE FAILED: {e}"));
+                                            }
+                                        },
                                         VirtualKeyCode::R => {
                                             skilltree.reload_def();
                                             skilltree.editor.dirty = false;
@@ -1326,7 +1300,9 @@ impl GameApp for HeadfulApp {
                                     if let Some(sfx) = self.sfx.as_ref() {
                                         sfx.play_click(ACTION_SFX_VOLUME);
                                     }
-                                } else if *key == VirtualKeyCode::Return || *key == VirtualKeyCode::Space {
+                                } else if *key == VirtualKeyCode::Return
+                                    || *key == VirtualKeyCode::Space
+                                {
                                     let (next, effect) = view.handle(GameViewEvent::StartGame);
                                     view = next;
                                     runner.state_mut().view = view;
@@ -1354,7 +1330,9 @@ impl GameApp for HeadfulApp {
                                     if let Some(sfx) = self.sfx.as_ref() {
                                         sfx.play_click(ACTION_SFX_VOLUME);
                                     }
-                                } else if *key == VirtualKeyCode::Return || *key == VirtualKeyCode::Space {
+                                } else if *key == VirtualKeyCode::Return
+                                    || *key == VirtualKeyCode::Space
+                                {
                                     let (next, effect) = view.handle(GameViewEvent::StartGame);
                                     view = next;
                                     runner.state_mut().view = view;
@@ -1410,6 +1388,7 @@ impl GameApp for HeadfulApp {
                         };
 
                         if let Some(dir) = horizontal {
+                            let now = Instant::now();
                             if self.horizontal_repeat.on_press(dir, now) {
                                 apply_action(
                                     runner,
@@ -1527,8 +1506,6 @@ fn skilltree_node_at_world<'a>(skilltree: &'a SkillTreeRuntime, world: Vec2i) ->
 
 const SKILLTREE_CAMERA_MIN_CELL_PX: f32 = 8.0;
 const SKILLTREE_CAMERA_MAX_CELL_PX: f32 = 64.0;
-const SKILLTREE_CAMERA_PAN_LERP_RATE: f32 = 18.0; // 1/s
-const SKILLTREE_CAMERA_ZOOM_LERP_RATE: f32 = 16.0; // 1/s
 const SKILLTREE_EDGE_PAN_MARGIN_PX: f32 = 28.0;
 const SKILLTREE_EDGE_PAN_MAX_SPEED_PX_PER_S: f32 = 900.0;
 const SKILLTREE_DRAG_THRESHOLD_PX: f32 = 4.0;
@@ -1543,19 +1520,6 @@ struct SkillTreeCameraInput {
     down_y: u32,
     last_x: u32,
     last_y: u32,
-    pending_scroll_y: f32,
-}
-
-fn lerp_f32(current: f32, target: f32, t: f32) -> f32 {
-    current + (target - current) * t.clamp(0.0, 1.0)
-}
-
-fn smooth_t_from_rate(dt_s: f32, rate: f32) -> f32 {
-    if dt_s <= 0.0 || rate <= 0.0 {
-        return 0.0;
-    }
-    // Exponential smoothing factor (frame-rate independent).
-    1.0 - (-dt_s * rate).exp()
 }
 
 fn skilltree_grid_viewport(layout: SkillTreeLayout) -> Option<Rect> {
@@ -1570,7 +1534,11 @@ fn skilltree_grid_viewport(layout: SkillTreeLayout) -> Option<Rect> {
     Some(Rect::new(layout.grid_origin_x, layout.grid_origin_y, w, h))
 }
 
-fn clamp_skilltree_camera_to_bounds(skilltree: &mut SkillTreeRuntime, grid_cols: u32, grid_rows: u32) {
+fn clamp_skilltree_camera_to_bounds(
+    skilltree: &mut SkillTreeRuntime,
+    grid_cols: u32,
+    grid_rows: u32,
+) {
     if grid_cols == 0 || grid_rows == 0 {
         return;
     }
@@ -1586,8 +1554,12 @@ fn clamp_skilltree_camera_to_bounds(skilltree: &mut SkillTreeRuntime, grid_cols:
         default_cam_min_x as f32 + skilltree.camera.target_pan.x,
         default_cam_min_y as f32 + skilltree.camera.target_pan.y,
     );
-    let cam_min_target =
-        clamp_camera_min_to_bounds(cam_min_target, view, bounds, SKILLTREE_CAMERA_BOUNDS_PAD_CELLS);
+    let cam_min_target = clamp_camera_min_to_bounds(
+        cam_min_target,
+        view,
+        bounds,
+        SKILLTREE_CAMERA_BOUNDS_PAD_CELLS,
+    );
     skilltree.camera.target_pan.x = cam_min_target.x - default_cam_min_x as f32;
     skilltree.camera.target_pan.y = cam_min_target.y - default_cam_min_y as f32;
 
@@ -1595,7 +1567,8 @@ fn clamp_skilltree_camera_to_bounds(skilltree: &mut SkillTreeRuntime, grid_cols:
         default_cam_min_x as f32 + skilltree.camera.pan.x,
         default_cam_min_y as f32 + skilltree.camera.pan.y,
     );
-    let cam_min = clamp_camera_min_to_bounds(cam_min, view, bounds, SKILLTREE_CAMERA_BOUNDS_PAD_CELLS);
+    let cam_min =
+        clamp_camera_min_to_bounds(cam_min, view, bounds, SKILLTREE_CAMERA_BOUNDS_PAD_CELLS);
     skilltree.camera.pan.x = cam_min.x - default_cam_min_x as f32;
     skilltree.camera.pan.y = cam_min.y - default_cam_min_y as f32;
 }
@@ -1615,10 +1588,18 @@ fn gravity_interval_from_percent(base: Duration, faster_percent: u32) -> Duratio
     Duration::from_millis(ms.max(25))
 }
 
-fn run_tuning_from_mods(base_round_limit: Duration, base_gravity_interval: Duration, mods: SkillTreeRunMods) -> RunTuning {
+fn run_tuning_from_mods(
+    base_round_limit: Duration,
+    base_gravity_interval: Duration,
+    mods: SkillTreeRunMods,
+) -> RunTuning {
     RunTuning {
-        round_limit: base_round_limit.saturating_add(Duration::from_secs(mods.extra_round_time_seconds as u64)),
-        gravity_interval: gravity_interval_from_percent(base_gravity_interval, mods.gravity_faster_percent),
+        round_limit: base_round_limit
+            .saturating_add(Duration::from_secs(mods.extra_round_time_seconds as u64)),
+        gravity_interval: gravity_interval_from_percent(
+            base_gravity_interval,
+            mods.gravity_faster_percent,
+        ),
         score_bonus_per_line: mods.score_bonus_per_line,
     }
 }
@@ -1652,7 +1633,9 @@ fn reset_run(
 }
 
 fn env_usize(name: &str) -> Option<usize> {
-    std::env::var(name).ok().and_then(|v| v.parse::<usize>().ok())
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
 }
 
 fn env_u32(name: &str) -> Option<u32> {
@@ -1664,11 +1647,13 @@ fn env_u16(name: &str) -> Option<u16> {
 }
 
 fn env_bool(name: &str) -> Option<bool> {
-    std::env::var(name).ok().and_then(|v| match v.to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    })
+    std::env::var(name)
+        .ok()
+        .and_then(|v| match v.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
 }
 
 fn env_present_mode(name: &str) -> Option<pixels::wgpu::PresentMode> {
@@ -1683,14 +1668,6 @@ fn env_present_mode(name: &str) -> Option<pixels::wgpu::PresentMode> {
         "immediate" => Some(PresentMode::Immediate),
         _ => None,
     }
-}
-
-#[derive(Debug, Default, Clone)]
-struct HeadfulCli {
-    help: bool,
-    record: bool,
-    record_path: Option<PathBuf>,
-    replay_path: Option<PathBuf>,
 }
 
 fn print_headful_help() {
@@ -1717,65 +1694,6 @@ Flags:
 "#
     );
 }
-
-fn default_recording_path() -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    PathBuf::from("target")
-        .join("recordings")
-        .join(format!("headful_{nanos}.json"))
-}
-
-fn parse_headful_cli() -> io::Result<HeadfulCli> {
-    let mut cli = HeadfulCli::default();
-    let mut args = std::env::args().skip(1).peekable();
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--help" | "-h" => {
-                cli.help = true;
-            }
-            "--record" => {
-                cli.record = true;
-                if let Some(next) = args.peek() {
-                    if !next.starts_with("--") {
-                        cli.record_path = Some(PathBuf::from(
-                            args.next().expect("peeked Some means next() is Some"),
-                        ));
-                    }
-                }
-            }
-            "--replay" => {
-                let Some(path) = args.next() else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "--replay requires a path",
-                    ));
-                };
-                cli.replay_path = Some(PathBuf::from(path));
-            }
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unknown argument: {other} (try --help)"),
-                ));
-            }
-        }
-    }
-
-    if cli.record && cli.replay_path.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "cannot combine --record and --replay",
-        ));
-    }
-
-    Ok(cli)
-}
-
-#[derive(Debug, Clone, Copy)]
 #[derive(Debug, Clone)]
 struct BgMusic {
     sample_rate: u32,
@@ -2007,7 +1925,6 @@ fn map_key_to_action(key: VirtualKeyCode) -> Option<InputAction> {
         _ => None,
     }
 }
-
 
 fn should_play_action_sfx(action: InputAction) -> bool {
     // Gameplay actions happen very frequently; only hard drop gets a click SFX.

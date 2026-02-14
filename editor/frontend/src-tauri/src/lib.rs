@@ -66,4 +66,3 @@ mod tests {
         assert_eq!(port, 5173);
     }
 }
-

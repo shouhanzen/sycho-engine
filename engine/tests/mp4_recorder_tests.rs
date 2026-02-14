@@ -45,4 +45,3 @@ fn mp4_recorder_produces_file_when_ffmpeg_is_available() {
 
     let _ = fs::remove_file(out);
 }
-

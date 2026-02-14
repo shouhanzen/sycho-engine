@@ -96,9 +96,7 @@ impl GameLogic for TetrisLogic {
 
         let delta_lines = next.tetris.lines_cleared().saturating_sub(prev_lines);
         if delta_lines > 0 && self.score_bonus_per_line > 0 {
-            let bonus = self
-                .score_bonus_per_line
-                .saturating_mul(delta_lines);
+            let bonus = self.score_bonus_per_line.saturating_mul(delta_lines);
             next.tetris.add_score(bonus);
         }
 
@@ -128,10 +126,7 @@ mod tests {
         }
         // Sanity: row is not yet full.
         assert_eq!(
-            state
-                .tetris
-                .snapshot()
-                .board[0]
+            state.tetris.snapshot().board[0]
                 .iter()
                 .filter(|&&c| c != 0)
                 .count(),

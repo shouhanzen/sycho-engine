@@ -1,14 +1,14 @@
 use engine::graphics::CpuRenderer;
-use engine::render::{color_for_cell, CELL_SIZE};
+use engine::render::{CELL_SIZE, color_for_cell};
 use engine::surface::SurfaceSize;
 use engine::ui;
 use engine::ui_tree::{UiInput, UiTree};
 
-use game::tetris_core::{Piece, TetrisCore, Vec2i, BOARD_HEIGHT};
 use game::skilltree::SkillTreeRuntime;
+use game::tetris_core::{BOARD_HEIGHT, BOARD_WIDTH, Piece, TetrisCore, Vec2i};
 use game::tetris_ui::{
-    draw_game_over_menu, draw_main_menu, draw_main_menu_with_ui, draw_pause_menu,
-    draw_skilltree, draw_skilltree_runtime_with_ui, draw_tetris, MAIN_MENU_TITLE,
+    MAIN_MENU_TITLE, draw_game_over_menu, draw_main_menu, draw_main_menu_with_ui, draw_pause_menu,
+    draw_skilltree, draw_skilltree_runtime_with_ui, draw_tetris, draw_tetris_world,
 };
 use game::ui_ids::UI_CANVAS;
 
@@ -32,7 +32,83 @@ fn draw_tetris_renders_hold_panel_outside_board_area() {
     pixel.copy_from_slice(&frame[idx..idx + 4]);
 
     let bg = color_for_cell(0);
-    assert_ne!(pixel, bg, "expected hold panel border to differ from background");
+    assert_ne!(
+        pixel, bg,
+        "expected hold panel border to differ from background"
+    );
+}
+
+#[test]
+fn draw_tetris_world_background_is_deterministic_for_same_seed_and_depth() {
+    let width = 800u32;
+    let height = 600u32;
+
+    let mut frame_a = vec![0u8; (width * height * 4) as usize];
+    let mut frame_b = vec![0u8; (width * height * 4) as usize];
+
+    let mut core_a = TetrisCore::new(1337);
+    core_a.set_available_pieces(Piece::all());
+    core_a.initialize_game();
+
+    let mut core_b = TetrisCore::new(1337);
+    core_b.set_available_pieces(Piece::all());
+    core_b.initialize_game();
+
+    let mut gfx_a = CpuRenderer::new(&mut frame_a, SurfaceSize::new(width, height));
+    let mut gfx_b = CpuRenderer::new(&mut frame_b, SurfaceSize::new(width, height));
+    let _ = draw_tetris_world(&mut gfx_a, width, height, &core_a);
+    let _ = draw_tetris_world(&mut gfx_b, width, height, &core_b);
+
+    assert_eq!(
+        frame_a, frame_b,
+        "same seed + same depth should produce identical world rendering"
+    );
+}
+
+#[test]
+fn draw_tetris_world_background_scrolls_when_depth_increases() {
+    if std::env::var("ROLLOUT_DISABLE_TILE_BG")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+    {
+        return;
+    }
+
+    let width = 800u32;
+    let height = 600u32;
+
+    let mut frame_depth0 = vec![0u8; (width * height * 4) as usize];
+    let mut frame_depth1 = vec![0u8; (width * height * 4) as usize];
+
+    let mut core_depth0 = TetrisCore::new(2026);
+    core_depth0.set_available_pieces(Piece::all());
+    core_depth0.initialize_game();
+
+    let mut core_depth1 = TetrisCore::new(2026);
+    core_depth1.set_available_pieces(Piece::all());
+    core_depth1.initialize_game();
+
+    for x in 0..BOARD_WIDTH {
+        core_depth1.set_cell(x, 0, 1);
+    }
+    assert_eq!(core_depth1.clear_lines(), 1);
+    assert_eq!(core_depth1.lines_cleared(), 1);
+
+    let mut gfx_depth0 = CpuRenderer::new(&mut frame_depth0, SurfaceSize::new(width, height));
+    let mut gfx_depth1 = CpuRenderer::new(&mut frame_depth1, SurfaceSize::new(width, height));
+    let _ = draw_tetris_world(&mut gfx_depth0, width, height, &core_depth0);
+    let _ = draw_tetris_world(&mut gfx_depth1, width, height, &core_depth1);
+
+    assert_ne!(
+        frame_depth0, frame_depth1,
+        "increasing depth should change visible background tiles"
+    );
 }
 
 #[test]
@@ -64,7 +140,10 @@ fn draw_tetris_renders_ghost_piece_at_hard_drop_position() {
     let mut ghost_pixel = [0u8; 4];
     ghost_pixel.copy_from_slice(&frame[ghost_idx..ghost_idx + 4]);
 
-    assert_ne!(ghost_pixel, bg, "ghost cell should be drawn over background");
+    assert_ne!(
+        ghost_pixel, bg,
+        "ghost cell should be drawn over background"
+    );
     assert_ne!(
         ghost_pixel, piece_color,
         "ghost cell should differ from the solid piece color"
@@ -82,7 +161,6 @@ fn draw_tetris_renders_ghost_piece_at_hard_drop_position() {
         "active piece should render over the ghost"
     );
 }
-
 
 #[test]
 fn draw_tetris_renders_pause_button_in_bounds() {
@@ -150,9 +228,7 @@ fn draw_main_menu_draws_a_panel_and_buttons() {
     let layout = draw_main_menu(&mut gfx, width, height);
     assert!(layout.panel.w > 0 && layout.panel.h > 0);
     assert!(layout.start_button.w > 0 && layout.start_button.h > 0);
-    assert!(
-        layout.skilltree_editor_button.w > 0 && layout.skilltree_editor_button.h > 0
-    );
+    assert!(layout.skilltree_editor_button.w > 0 && layout.skilltree_editor_button.h > 0);
     assert!(layout.quit_button.w > 0 && layout.quit_button.h > 0);
 
     let idx = ((layout.panel.y * width + layout.panel.x) * 4) as usize;
@@ -352,7 +428,8 @@ fn draw_skilltree_draws_a_panel_and_start_new_game_button() {
         "expected skilltree scene to clear the tetris board/background"
     );
 
-    let start_idx = ((layout.start_new_game_button.y * width + layout.start_new_game_button.x) * 4) as usize;
+    let start_idx =
+        ((layout.start_new_game_button.y * width + layout.start_new_game_button.x) * 4) as usize;
     assert_ne!(
         &frame[start_idx..start_idx + 4],
         &bg,
@@ -394,9 +471,6 @@ fn draw_skilltree_draws_dependency_arrows() {
     draw_skilltree_runtime_with_ui(&mut gfx, width, height, &mut ui_tree, &runtime);
 
     let link_color = [110u8, 110, 150, 255];
-    let found = frame
-        .chunks_exact(4)
-        .any(|px| px == link_color);
+    let found = frame.chunks_exact(4).any(|px| px == link_color);
     assert!(found, "expected dependency arrow pixel to be drawn");
 }
-

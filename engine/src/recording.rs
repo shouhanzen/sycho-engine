@@ -139,4 +139,3 @@ impl Drop for Mp4Recorder {
         let _ = self.finish();
     }
 }
-

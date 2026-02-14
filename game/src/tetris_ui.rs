@@ -1,21 +1,22 @@
 use std::collections::HashMap;
 
 use engine::graphics::Renderer2d;
-use engine::render::{color_for_cell, draw_board, CELL_SIZE};
-use engine::ui as ui;
+use engine::render::{CELL_SIZE, color_for_cell, draw_board_cells};
+use engine::ui;
 use engine::ui_tree::UiTree;
 
+use crate::background::draw_tile_background;
 use crate::skilltree::{
     NodeState, SkillTreeDef, SkillTreeEditorTool, SkillTreeProgress, SkillTreeRuntime,
 };
-use crate::tetris_core::{piece_board_offset, piece_grid, piece_type, Piece, TetrisCore, Vec2i};
+use crate::tetris_core::{Piece, TetrisCore, Vec2i, piece_board_offset, piece_grid, piece_type};
 use crate::ui_ids::*;
 
 mod menus;
 pub use menus::{
-    draw_game_over_menu, draw_game_over_menu_with_ui, draw_main_menu, draw_main_menu_with_ui,
-    draw_pause_menu, draw_pause_menu_with_ui, GameOverMenuLayout, GameOverMenuView, MainMenuLayout,
-    MainMenuView, PauseMenuLayout, PauseMenuView,
+    GameOverMenuLayout, GameOverMenuView, MainMenuLayout, MainMenuView, PauseMenuLayout,
+    PauseMenuView, draw_game_over_menu, draw_game_over_menu_with_ui, draw_main_menu,
+    draw_main_menu_with_ui, draw_pause_menu, draw_pause_menu_with_ui,
 };
 
 const COLOR_PANEL_BG: [u8; 4] = [16, 16, 22, 255];
@@ -80,7 +81,13 @@ pub struct SkillTreeLayout {
     pub grid_cam_min_y: i32,
 }
 
-pub fn compute_layout(width: u32, height: u32, board_w: u32, board_h: u32, next_len: usize) -> UiLayout {
+pub fn compute_layout(
+    width: u32,
+    height: u32,
+    board_w: u32,
+    board_h: u32,
+    next_len: usize,
+) -> UiLayout {
     let board_pixel_width = board_w.saturating_mul(CELL_SIZE);
     let board_pixel_height = board_h.saturating_mul(CELL_SIZE);
     let board_x = width.saturating_sub(board_pixel_width) / 2;
@@ -99,7 +106,11 @@ pub fn compute_layout(width: u32, height: u32, board_w: u32, board_h: u32, next_
     // Next panel height depends on queue length.
     let next_h_content = (next_len as u32)
         .saturating_mul(PREVIEW_SIZE)
-        .saturating_add((next_len as u32).saturating_sub(1).saturating_mul(PREVIEW_GAP_Y));
+        .saturating_add(
+            (next_len as u32)
+                .saturating_sub(1)
+                .saturating_mul(PREVIEW_GAP_Y),
+        );
     let next_h = (next_h_content + PANEL_PADDING * 2).min(height);
 
     // Prefer hold on the left of the board, next on the right. If there isn't space,
@@ -151,6 +162,14 @@ pub fn compute_layout(width: u32, height: u32, board_w: u32, board_h: u32, next_
     }
 }
 
+/// Draw the Tetris world layers in the correct compositing order:
+///
+/// 1. **Background** - tile background/clear pass.
+/// 2. **Board cells** – outline, grid dots, and locked cells (no full-screen clear).
+/// 3. **Active piece + ghost** – drawn on top of the board.
+///
+/// The HUD/UI layer (#4) is handled separately by `draw_tetris_hud` so callers can
+/// insert additional overlays between the world and HUD if needed.
 pub fn draw_tetris_world(
     frame: &mut dyn Renderer2d,
     width: u32,
@@ -162,8 +181,20 @@ pub fn draw_tetris_world(
     let board_w = board.first().map(|r| r.len()).unwrap_or(0) as u32;
     let layout = compute_layout(width, height, board_w, board_h, state.next_queue().len());
 
-    draw_board(frame, board);
+    // --- Layer 1: background ---
+    draw_tile_background(
+        frame,
+        width,
+        height,
+        layout.board,
+        state.lines_cleared(),
+        state.background_seed(),
+    );
 
+    // --- Layer 2: board cells ---
+    draw_board_cells(frame, board);
+
+    // --- Layer 3: active piece + ghost ---
     draw_ghost_and_active_piece(frame, width, height, layout.board, board_w, board_h, state);
 
     layout
@@ -239,7 +270,15 @@ pub fn draw_tetris_hud_with_ui_and_pause_hover(
     let hud_y = layout.pause_button.y.saturating_add(6);
     let score_text = format!("SCORE {}", state.score());
     let lines_text = format!("LINES {}", state.lines_cleared());
-    draw_text(frame, width, height, hud_x, hud_y, &score_text, COLOR_PAUSE_ICON);
+    draw_text(
+        frame,
+        width,
+        height,
+        hud_x,
+        hud_y,
+        &score_text,
+        COLOR_PAUSE_ICON,
+    );
     draw_text(
         frame,
         width,
@@ -278,7 +317,15 @@ pub fn draw_tetris_hud_view(
     let hud_y = layout.pause_button.y.saturating_add(6);
     let score_text = format!("SCORE {}", state.score());
     let lines_text = format!("LINES {}", state.lines_cleared());
-    draw_text(frame, width, height, hud_x, hud_y, &score_text, COLOR_PAUSE_ICON);
+    draw_text(
+        frame,
+        width,
+        height,
+        hud_x,
+        hud_y,
+        &score_text,
+        COLOR_PAUSE_ICON,
+    );
     draw_text(
         frame,
         width,
@@ -317,16 +364,7 @@ fn draw_pause_button(
 
     let (fill, border) = button_colors(hovered);
     fill_rect(frame, width, height, rect.x, rect.y, rect.w, rect.h, fill);
-    draw_rect_outline(
-        frame,
-        width,
-        height,
-        rect.x,
-        rect.y,
-        rect.w,
-        rect.h,
-        border,
-    );
+    draw_rect_outline(frame, width, height, rect.x, rect.y, rect.w, rect.h, border);
 
     // Draw a simple pause icon: two vertical bars.
     let bar_w = (rect.w / 6).max(3).min(rect.w);
@@ -337,7 +375,16 @@ fn draw_pause_button(
     let icon_x0 = rect.x + rect.w.saturating_sub(icon_total_w) / 2;
     let icon_y0 = rect.y + rect.h.saturating_sub(bar_h) / 2;
 
-    fill_rect(frame, width, height, icon_x0, icon_y0, bar_w, bar_h, COLOR_PAUSE_ICON);
+    fill_rect(
+        frame,
+        width,
+        height,
+        icon_x0,
+        icon_y0,
+        bar_w,
+        bar_h,
+        COLOR_PAUSE_ICON,
+    );
     fill_rect(
         frame,
         width,
@@ -466,7 +513,9 @@ fn draw_skilltree_impl(
     let mut tool_remove_cell_button = Rect::default();
     let mut tool_connect_button = Rect::default();
     if editor_enabled {
-        let tool = runtime.map(|rt| rt.editor.tool).unwrap_or(SkillTreeEditorTool::Select);
+        let tool = runtime
+            .map(|rt| rt.editor.tool)
+            .unwrap_or(SkillTreeEditorTool::Select);
         let tool_text = format!(
             "EDITOR ON  TOOL {}  (TAB CYCLE, S SAVE, R RELOAD)",
             skilltree_tool_label(tool)
@@ -516,9 +565,7 @@ fn draw_skilltree_impl(
         ];
 
         for (idx, (tool_kind, label)) in tool_buttons.iter().enumerate() {
-            let x = toolbar_x.saturating_add(
-                (tool_button_w + tool_gap).saturating_mul(idx as u32),
-            );
+            let x = toolbar_x.saturating_add((tool_button_w + tool_gap).saturating_mul(idx as u32));
             let rect = Rect {
                 x,
                 y: toolbar_y,
@@ -533,8 +580,12 @@ fn draw_skilltree_impl(
                     SkillTreeEditorTool::Select => ui_tree.is_hovered(UI_SKILLTREE_TOOL_SELECT),
                     SkillTreeEditorTool::Move => ui_tree.is_hovered(UI_SKILLTREE_TOOL_MOVE),
                     SkillTreeEditorTool::AddCell => ui_tree.is_hovered(UI_SKILLTREE_TOOL_ADD_CELL),
-                    SkillTreeEditorTool::RemoveCell => ui_tree.is_hovered(UI_SKILLTREE_TOOL_REMOVE_CELL),
-                    SkillTreeEditorTool::ConnectPrereqs => ui_tree.is_hovered(UI_SKILLTREE_TOOL_LINK),
+                    SkillTreeEditorTool::RemoveCell => {
+                        ui_tree.is_hovered(UI_SKILLTREE_TOOL_REMOVE_CELL)
+                    }
+                    SkillTreeEditorTool::ConnectPrereqs => {
+                        ui_tree.is_hovered(UI_SKILLTREE_TOOL_LINK)
+                    }
                 }
             };
             draw_tool_button(frame, width, height, rect, label, hovered, active);
@@ -627,8 +678,12 @@ fn draw_skilltree_impl(
 
     let grid_pixel_w = grid_cols.saturating_mul(grid_cell).min(grid.w);
     let grid_pixel_h = grid_rows.saturating_mul(grid_cell).min(grid.h);
-    let grid_origin_x = grid.x.saturating_add(grid.w.saturating_sub(grid_pixel_w) / 2);
-    let grid_origin_y = grid.y.saturating_add(grid.h.saturating_sub(grid_pixel_h) / 2);
+    let grid_origin_x = grid
+        .x
+        .saturating_add(grid.w.saturating_sub(grid_pixel_w) / 2);
+    let grid_origin_y = grid
+        .y
+        .saturating_add(grid.h.saturating_sub(grid_pixel_h) / 2);
 
     let default_cam_min_x = -(grid_cols as i32) / 2;
     let default_cam_min_y = 0i32;
@@ -781,7 +836,9 @@ fn draw_skilltree_impl(
                 && (px as u32).saturating_add(grid_cell) <= width
                 && (py as u32).saturating_add(grid_cell) <= height
             {
-                draw_rect_outline(frame, width, height, px as u32, py as u32, grid_cell, grid_cell, border);
+                draw_rect_outline(
+                    frame, width, height, px as u32, py as u32, grid_cell, grid_cell, border,
+                );
             }
         }
 
@@ -789,7 +846,15 @@ fn draw_skilltree_impl(
         if let Some(bbox) = node_boxes.get(node.id.as_str()) {
             let label_x = bbox.min_x.saturating_add(6);
             let label_y = bbox.min_y.saturating_add(6);
-            draw_text(frame, width, height, label_x, label_y, &node.name, COLOR_PAUSE_MENU_TEXT);
+            draw_text(
+                frame,
+                width,
+                height,
+                label_x,
+                label_y,
+                &node.name,
+                COLOR_PAUSE_MENU_TEXT,
+            );
             if node.cost > 0 {
                 let cost = format!("${}", node.cost);
                 draw_text(
@@ -962,10 +1027,22 @@ fn draw_piece_on_board(
 
             match style {
                 PieceDrawStyle::Solid => {
-                    fill_rect(frame, width, height, pixel_x, pixel_y, CELL_SIZE, CELL_SIZE, color);
+                    fill_rect(
+                        frame, width, height, pixel_x, pixel_y, CELL_SIZE, CELL_SIZE, color,
+                    );
                 }
                 PieceDrawStyle::Ghost => {
-                    blend_rect(frame, width, height, pixel_x, pixel_y, CELL_SIZE, CELL_SIZE, color, GHOST_ALPHA);
+                    blend_rect(
+                        frame,
+                        width,
+                        height,
+                        pixel_x,
+                        pixel_y,
+                        CELL_SIZE,
+                        CELL_SIZE,
+                        color,
+                        GHOST_ALPHA,
+                    );
                 }
             }
         }
@@ -984,7 +1061,16 @@ fn draw_hold_panel(
         return;
     }
 
-    fill_rect(frame, width, height, rect.x, rect.y, rect.w, rect.h, COLOR_PANEL_BG);
+    fill_rect(
+        frame,
+        width,
+        height,
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        COLOR_PANEL_BG,
+    );
     let border = if can_hold {
         COLOR_PANEL_BORDER
     } else {
@@ -994,7 +1080,9 @@ fn draw_hold_panel(
 
     let preview_x = rect.x + PANEL_PADDING;
     let preview_y = rect.y + PANEL_PADDING;
-    draw_piece_preview(frame, width, height, preview_x, preview_y, held_piece, can_hold);
+    draw_piece_preview(
+        frame, width, height, preview_x, preview_y, held_piece, can_hold,
+    );
 }
 
 fn draw_next_panel(
@@ -1008,7 +1096,16 @@ fn draw_next_panel(
         return;
     }
 
-    fill_rect(frame, width, height, rect.x, rect.y, rect.w, rect.h, COLOR_PANEL_BG);
+    fill_rect(
+        frame,
+        width,
+        height,
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        COLOR_PANEL_BG,
+    );
     draw_rect_outline(
         frame,
         width,
@@ -1046,7 +1143,16 @@ fn draw_piece_preview(
     }
 
     // Preview background area.
-    fill_rect(frame, width, height, x, y, PREVIEW_SIZE, PREVIEW_SIZE, [10, 10, 14, 255]);
+    fill_rect(
+        frame,
+        width,
+        height,
+        x,
+        y,
+        PREVIEW_SIZE,
+        PREVIEW_SIZE,
+        [10, 10, 14, 255],
+    );
 
     let Some(piece) = piece else {
         return;
@@ -1072,7 +1178,16 @@ fn draw_piece_preview(
 
             let px = x + (offset_x + gx as u32) * PREVIEW_CELL;
             let py = y + (offset_y + gy as u32) * PREVIEW_CELL;
-            fill_rect(frame, width, height, px, py, PREVIEW_CELL, PREVIEW_CELL, color);
+            fill_rect(
+                frame,
+                width,
+                height,
+                px,
+                py,
+                PREVIEW_CELL,
+                PREVIEW_CELL,
+                color,
+            );
         }
     }
 }
@@ -1448,16 +1563,7 @@ fn draw_line_i32(
     let t = thickness.max(1);
 
     loop {
-        fill_rect_i32(
-            frame,
-            width,
-            height,
-            x0 - half,
-            y0 - half,
-            t,
-            t,
-            color,
-        );
+        fill_rect_i32(frame, width, height, x0 - half, y0 - half, t, t, color);
         if x0 == x1 && y0 == y1 {
             break;
         }
@@ -1472,4 +1578,3 @@ fn draw_line_i32(
         }
     }
 }
-

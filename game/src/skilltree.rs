@@ -71,8 +71,8 @@ pub struct SkillTreeRunMods {
 impl Default for SkillTreeDef {
     fn default() -> Self {
         // Keep a compile-time fallback so the game still runs even if the asset file is missing.
-        serde_json::from_str(include_str!("../assets/skilltree.json"))
-            .unwrap_or_else(|_| SkillTreeDef {
+        serde_json::from_str(include_str!("../assets/skilltree.json")).unwrap_or_else(|_| {
+            SkillTreeDef {
                 version: 1,
                 nodes: vec![SkillNodeDef {
                     id: "start".to_string(),
@@ -84,7 +84,8 @@ impl Default for SkillTreeDef {
                     requires: vec![],
                     effect: SkillEffect::None,
                 }],
-            })
+            }
+        })
     }
 }
 
@@ -746,10 +747,9 @@ fn normalize_and_validate(def: &mut SkillTreeDef) {
         let mut seen = HashSet::<(i32, i32)>::new();
         node.shape.retain(|c| seen.insert((c.x, c.y)));
 
-        let (min_x, min_y) = node
-            .shape
-            .iter()
-            .fold((i32::MAX, i32::MAX), |(mx, my), c| (mx.min(c.x), my.min(c.y)));
+        let (min_x, min_y) = node.shape.iter().fold((i32::MAX, i32::MAX), |(mx, my), c| {
+            (mx.min(c.x), my.min(c.y))
+        });
         if min_x != 0 || min_y != 0 {
             node.pos = Vec2i::new(node.pos.x + min_x, node.pos.y + min_y);
             for c in &mut node.shape {
@@ -946,4 +946,3 @@ mod tests {
         assert_eq!(clamped, Vec2f::new(-5.0, -5.0));
     }
 }
-

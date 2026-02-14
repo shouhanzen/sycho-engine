@@ -3,5 +3,6 @@ members = [
     "engine",
     "game",
     "editor/frontend/src-tauri",
+    "orca/plantool",
 ]
 resolver = "2"

@@ -37,17 +37,21 @@ impl GameView {
     /// so callers can stay deterministic + easy to test.
     pub fn handle(self, event: GameViewEvent) -> (GameView, GameViewEffect) {
         match (self, event) {
-            (GameView::MainMenu, GameViewEvent::StartGame) => {
-                (GameView::Tetris { paused: false }, GameViewEffect::ResetTetris)
-            }
+            (GameView::MainMenu, GameViewEvent::StartGame) => (
+                GameView::Tetris { paused: false },
+                GameViewEffect::ResetTetris,
+            ),
             (GameView::MainMenu, GameViewEvent::OpenSkillTreeEditor) => {
                 (GameView::SkillTree, GameViewEffect::None)
             }
 
-            (GameView::SkillTree, GameViewEvent::Back) => (GameView::MainMenu, GameViewEffect::None),
-            (GameView::SkillTree, GameViewEvent::StartGame) => {
-                (GameView::Tetris { paused: false }, GameViewEffect::ResetTetris)
+            (GameView::SkillTree, GameViewEvent::Back) => {
+                (GameView::MainMenu, GameViewEffect::None)
             }
+            (GameView::SkillTree, GameViewEvent::StartGame) => (
+                GameView::Tetris { paused: false },
+                GameViewEffect::ResetTetris,
+            ),
 
             (GameView::Tetris { paused }, GameViewEvent::TogglePause) => {
                 (GameView::Tetris { paused: !paused }, GameViewEffect::None)
@@ -56,9 +60,10 @@ impl GameView {
                 (GameView::GameOver, GameViewEffect::None)
             }
 
-            (GameView::GameOver, GameViewEvent::StartGame) => {
-                (GameView::Tetris { paused: false }, GameViewEffect::ResetTetris)
-            }
+            (GameView::GameOver, GameViewEvent::StartGame) => (
+                GameView::Tetris { paused: false },
+                GameViewEffect::ResetTetris,
+            ),
             (GameView::GameOver, GameViewEvent::OpenSkillTree) => {
                 (GameView::SkillTree, GameViewEffect::None)
             }
@@ -95,7 +100,10 @@ mod tests {
     fn start_game_from_main_menu_enters_tetris_and_requests_reset() {
         assert_eq!(
             GameView::MainMenu.handle(GameViewEvent::StartGame),
-            (GameView::Tetris { paused: false }, GameViewEffect::ResetTetris)
+            (
+                GameView::Tetris { paused: false },
+                GameViewEffect::ResetTetris
+            )
         );
     }
 
@@ -147,7 +155,10 @@ mod tests {
     fn game_over_menu_can_restart_or_open_skilltree() {
         assert_eq!(
             GameView::GameOver.handle(GameViewEvent::StartGame),
-            (GameView::Tetris { paused: false }, GameViewEffect::ResetTetris)
+            (
+                GameView::Tetris { paused: false },
+                GameViewEffect::ResetTetris
+            )
         );
         assert_eq!(
             GameView::GameOver.handle(GameViewEvent::OpenSkillTree),
@@ -163,4 +174,3 @@ mod tests {
         );
     }
 }
-

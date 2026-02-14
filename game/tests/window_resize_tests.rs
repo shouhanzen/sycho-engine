@@ -1,7 +1,7 @@
+use engine::HeadlessRunner;
 use engine::graphics::CpuRenderer;
 use engine::render::draw_board;
 use engine::surface::{RgbaBufferSurface, Surface, SurfaceSize};
-use engine::HeadlessRunner;
 
 use game::playtest::TetrisLogic;
 use game::tetris_core::Piece;
@@ -36,4 +36,3 @@ fn headless_surface_resize_changes_buffer_size_and_allows_rendering() {
     }
     surface.present().unwrap();
 }
-

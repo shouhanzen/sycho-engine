@@ -23,7 +23,10 @@ impl Rect {
     }
 
     pub fn size(&self) -> Size {
-        Size { w: self.w, h: self.h }
+        Size {
+            w: self.w,
+            h: self.h,
+        }
     }
 
     pub fn contains(&self, px: u32, py: u32) -> bool {

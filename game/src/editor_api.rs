@@ -1,9 +1,10 @@
 use engine::agent::{AgentCommand, AgentHost, AgentResponse};
 use engine::editor::{
-    EditorAction, EditorGrid, EditorManifest, EditorPaletteEntry, EditorSnapshot, EditorStat,
-    EditorTimeline, GridOrigin,
+    EditorGrid, EditorManifest, EditorPaletteEntry, EditorSnapshot, EditorStat, EditorTimeline,
+    GridOrigin,
 };
 
+use crate::editor_actions;
 use crate::playtest::{InputAction, TetrisLogic};
 use crate::state::GameState;
 use crate::tetris_core::Piece;
@@ -26,47 +27,7 @@ impl EditorSession {
     }
 
     pub fn manifest(&self) -> EditorManifest {
-        EditorManifest {
-            title: "Tetree (Tetris)".to_string(),
-            actions: vec![
-                EditorAction {
-                    id: "moveLeft".to_string(),
-                    label: "Left".to_string(),
-                },
-                EditorAction {
-                    id: "moveRight".to_string(),
-                    label: "Right".to_string(),
-                },
-                EditorAction {
-                    id: "softDrop".to_string(),
-                    label: "Down".to_string(),
-                },
-                EditorAction {
-                    id: "rotateCw".to_string(),
-                    label: "Rotate CW".to_string(),
-                },
-                EditorAction {
-                    id: "rotateCcw".to_string(),
-                    label: "Rotate CCW".to_string(),
-                },
-                EditorAction {
-                    id: "rotate180".to_string(),
-                    label: "Rotate 180".to_string(),
-                },
-                EditorAction {
-                    id: "hardDrop".to_string(),
-                    label: "Hard Drop".to_string(),
-                },
-                EditorAction {
-                    id: "hold".to_string(),
-                    label: "Hold".to_string(),
-                },
-                EditorAction {
-                    id: "noop".to_string(),
-                    label: "Noop".to_string(),
-                },
-            ],
-        }
+        editor_actions::default_manifest()
     }
 
     pub fn timeline(&self) -> EditorTimeline {
@@ -110,18 +71,7 @@ impl EditorSession {
 }
 
 pub fn action_from_id(id: &str) -> Option<InputAction> {
-    match id {
-        "moveLeft" => Some(InputAction::MoveLeft),
-        "moveRight" => Some(InputAction::MoveRight),
-        "softDrop" => Some(InputAction::SoftDrop),
-        "rotateCw" => Some(InputAction::RotateCw),
-        "rotateCcw" => Some(InputAction::RotateCcw),
-        "rotate180" => Some(InputAction::Rotate180),
-        "hardDrop" => Some(InputAction::HardDrop),
-        "hold" => Some(InputAction::Hold),
-        "noop" => Some(InputAction::Noop),
-        _ => None,
-    }
+    editor_actions::action_from_id(id)
 }
 
 fn snapshot_from_response(response: AgentResponse<GameState>) -> EditorSnapshot {
@@ -140,7 +90,10 @@ pub fn snapshot_from_state(frame: usize, state: &GameState) -> EditorSnapshot {
     let stats = vec![
         stat("score", state.tetris.score()),
         stat("linesCleared", state.tetris.lines_cleared()),
-        stat_opt("currentPiece", state.tetris.current_piece().map(piece_label)),
+        stat_opt(
+            "currentPiece",
+            state.tetris.current_piece().map(piece_label),
+        ),
         stat_opt("nextPiece", state.tetris.next_piece().map(piece_label)),
         stat("posX", pos.x),
         stat("posY", pos.y),
@@ -259,4 +212,3 @@ mod tests {
         }
     }
 }
-

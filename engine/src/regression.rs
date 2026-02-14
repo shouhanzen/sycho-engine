@@ -9,20 +9,19 @@
 
 use std::{
     ffi::OsString,
-    fs,
-    io,
+    fs, io,
     path::{Path, PathBuf},
     process::Command,
 };
 
 use std::io::Write;
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    recording::{Mp4Config, Mp4Recorder},
     GameLogic, HeadlessRunner, TimeMachine,
+    recording::{Mp4Config, Mp4Recorder},
 };
 
 /// Environment flag helper: accepts `1/true/yes/on` (case-insensitive).
@@ -71,7 +70,13 @@ fn ffmpeg_bin() -> OsString {
 
 pub fn sanitize_filename(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -229,7 +234,12 @@ pub fn dump_ppm_on_mismatch_enabled() -> bool {
     env_flag("ROLLOUT_REGRESSION_DUMP_PPM")
 }
 
-pub fn write_ppm_rgb(path: impl AsRef<Path>, width: u32, height: u32, rgba: &[u8]) -> io::Result<()> {
+pub fn write_ppm_rgb(
+    path: impl AsRef<Path>,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> io::Result<()> {
     let path = path.as_ref();
     let expected = (width as usize)
         .saturating_mul(height as usize)
@@ -539,14 +549,15 @@ where
     let mut live_rec = Mp4Recorder::start(&live_mp4, video.mp4)?;
     {
         let mut buf = vec![0u8; video.rgba_frame_len()];
-        let mut capture = |rec: &mut Mp4Recorder, state: &G::State, hashes: &mut Vec<String>| -> io::Result<()> {
-            render(state, &mut buf, video.mp4.width, video.mp4.height);
-            hashes.push(rgba_sha256_hex(&buf));
-            for _ in 0..hold_frames {
-                rec.push_rgba_frame(&buf)?;
-            }
-            Ok(())
-        };
+        let mut capture =
+            |rec: &mut Mp4Recorder, state: &G::State, hashes: &mut Vec<String>| -> io::Result<()> {
+                render(state, &mut buf, video.mp4.width, video.mp4.height);
+                hashes.push(rgba_sha256_hex(&buf));
+                for _ in 0..hold_frames {
+                    rec.push_rgba_frame(&buf)?;
+                }
+                Ok(())
+            };
 
         capture(&mut live_rec, live_runner.state(), &mut live_hashes)?;
         for input in inputs {
@@ -564,14 +575,15 @@ where
     let mut replay_rec = Mp4Recorder::start(&replay_mp4, video.mp4)?;
     {
         let mut buf = vec![0u8; video.rgba_frame_len()];
-        let mut capture = |rec: &mut Mp4Recorder, state: &G::State, hashes: &mut Vec<String>| -> io::Result<()> {
-            render(state, &mut buf, video.mp4.width, video.mp4.height);
-            hashes.push(rgba_sha256_hex(&buf));
-            for _ in 0..hold_frames {
-                rec.push_rgba_frame(&buf)?;
-            }
-            Ok(())
-        };
+        let mut capture =
+            |rec: &mut Mp4Recorder, state: &G::State, hashes: &mut Vec<String>| -> io::Result<()> {
+                render(state, &mut buf, video.mp4.width, video.mp4.height);
+                hashes.push(rgba_sha256_hex(&buf));
+                for _ in 0..hold_frames {
+                    rec.push_rgba_frame(&buf)?;
+                }
+                Ok(())
+            };
 
         let frames = replay_runner.history().len();
         for frame in 0..frames {
@@ -601,8 +613,6 @@ where
         replay_mp4,
     })
 }
-
-
 
 /// Engine-level regression helper (hash-only, no ffmpeg dependency):
 /// - run a scenario live, saving a `TimeMachine` JSON recording
@@ -643,8 +653,12 @@ where
 
     let live_hashes =
         render_frame_hashes_for_timemachine(live_runner.timemachine(), width, height, &mut render);
-    let replay_hashes =
-        render_frame_hashes_for_timemachine(replay_runner.timemachine(), width, height, &mut render);
+    let replay_hashes = render_frame_hashes_for_timemachine(
+        replay_runner.timemachine(),
+        width,
+        height,
+        &mut render,
+    );
 
     compare_render_hashes_and_maybe_dump(
         name,

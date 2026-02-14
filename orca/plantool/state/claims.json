@@ -1,0 +1,34 @@
+{
+  "claims": {
+    "PLAN::BACKGROUND_TILE_MVP_CHECKLIST": {
+      "task_id": "PLAN::BACKGROUND_TILE_MVP_CHECKLIST",
+      "owner": "agent:cursor-agent",
+      "claimed_at": "2026-02-14T21:25:06.066794700Z",
+      "lease_until": "2026-02-14T21:55:06.066794700Z"
+    },
+    "BACKGROUND_TILE_MVP_CHECKLIST#12": {
+      "task_id": "BACKGROUND_TILE_MVP_CHECKLIST#12",
+      "owner": "agent:cursor-agent",
+      "claimed_at": "2026-02-14T20:31:08.086105800Z",
+      "lease_until": "2026-02-14T21:01:08.086105800Z"
+    },
+    "BACKGROUND_TILE_MVP_CHECKLIST#1": {
+      "task_id": "BACKGROUND_TILE_MVP_CHECKLIST#1",
+      "owner": "agent:cursor-agent",
+      "claimed_at": "2026-02-14T20:18:23.907648300Z",
+      "lease_until": "2026-02-14T20:48:23.907648300Z"
+    },
+    "BACKGROUND_TILE_MVP_CHECKLIST#10": {
+      "task_id": "BACKGROUND_TILE_MVP_CHECKLIST#10",
+      "owner": "agent:cursor-agent",
+      "claimed_at": "2026-02-14T20:22:31.212956200Z",
+      "lease_until": "2026-02-14T20:52:31.212956200Z"
+    },
+    "BACKGROUND_TILE_MVP_CHECKLIST#11": {
+      "task_id": "BACKGROUND_TILE_MVP_CHECKLIST#11",
+      "owner": "agent:cursor-agent",
+      "claimed_at": "2026-02-14T20:22:53.893316500Z",
+      "lease_until": "2026-02-14T20:52:53.893316500Z"
+    }
+  }
+}

@@ -7,17 +7,17 @@ use std::{
 };
 
 use axum::{
+    Json, Router,
     extract::State,
     http::Method,
     http::StatusCode,
     routing::{get, post},
-    Json, Router,
 };
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Uri, header};
 use hyper_util::{
-    client::legacy::{connect::HttpConnector, Client},
+    client::legacy::{Client, connect::HttpConnector},
     rt::TokioExecutor,
 };
 use serde::Serialize;
@@ -114,9 +114,7 @@ where
         return addr;
     }
 
-    if let Some(port) = get_env("ROLLOUT_EDITOR_API_PORT")
-        .and_then(|v| v.parse::<u16>().ok())
-    {
+    if let Some(port) = get_env("ROLLOUT_EDITOR_API_PORT").and_then(|v| v.parse::<u16>().ok()) {
         return SocketAddr::from(([127, 0, 0, 1], port));
     }
 
@@ -270,20 +268,31 @@ async fn proxy_to_game(
         .uri(uri)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Full::new(Bytes::from(body.unwrap_or_default())))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("request build failed: {e}")))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("request build failed: {e}"),
+            )
+        })?;
 
-    let res = state
-        .client
-        .request(req)
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("failed reaching game: {e}")))?;
+    let res = state.client.request(req).await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("failed reaching game: {e}"),
+        )
+    })?;
 
     let status = res.status();
     let bytes = res
         .into_body()
         .collect()
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("failed reading game response: {e}")))?
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("failed reading game response: {e}"),
+            )
+        })?
         .to_bytes();
 
     Ok((status, bytes))
@@ -344,10 +353,7 @@ async fn game_launch(State(state): State<AppState>) -> Json<GameLaunchResponse> 
         });
     }
 
-    let env = [(
-        "ROLLOUT_HEADFUL_EDITOR_PORT".to_string(),
-        port.to_string(),
-    )];
+    let env = [("ROLLOUT_HEADFUL_EDITOR_PORT".to_string(), port.to_string())];
 
     match run_go_sh_with_env("--restart --game --detach", &env) {
         Ok(output) => {
@@ -375,7 +381,9 @@ async fn manifest() -> Json<EditorManifest> {
     Json(default_manifest())
 }
 
-async fn agent_state(State(state): State<AppState>) -> Result<Json<EditorSnapshot>, (StatusCode, String)> {
+async fn agent_state(
+    State(state): State<AppState>,
+) -> Result<Json<EditorSnapshot>, (StatusCode, String)> {
     let (status, bytes) = proxy_to_game(&state, Method::GET, "/api/agent/state", None).await?;
     if !status.is_success() {
         return Err((status, String::from_utf8_lossy(&bytes).to_string()));
@@ -403,7 +411,8 @@ async fn agent_step(
 ) -> Result<Json<EditorSnapshot>, (StatusCode, String)> {
     let body = serde_json::to_vec(&payload)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let (status, bytes) = proxy_to_game(&state, Method::POST, "/api/agent/step", Some(body)).await?;
+    let (status, bytes) =
+        proxy_to_game(&state, Method::POST, "/api/agent/step", Some(body)).await?;
     if !status.is_success() {
         return Err((status, String::from_utf8_lossy(&bytes).to_string()));
     }
@@ -418,7 +427,8 @@ async fn agent_rewind(
 ) -> Result<Json<EditorSnapshot>, (StatusCode, String)> {
     let body = serde_json::to_vec(&payload)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let (status, bytes) = proxy_to_game(&state, Method::POST, "/api/agent/rewind", Some(body)).await?;
+    let (status, bytes) =
+        proxy_to_game(&state, Method::POST, "/api/agent/rewind", Some(body)).await?;
     if !status.is_success() {
         return Err((status, String::from_utf8_lossy(&bytes).to_string()));
     }
@@ -449,7 +459,8 @@ async fn agent_seek(
 ) -> Result<Json<EditorSnapshot>, (StatusCode, String)> {
     let body = serde_json::to_vec(&payload)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let (status, bytes) = proxy_to_game(&state, Method::POST, "/api/agent/seek", Some(body)).await?;
+    let (status, bytes) =
+        proxy_to_game(&state, Method::POST, "/api/agent/seek", Some(body)).await?;
     if !status.is_success() {
         return Err((status, String::from_utf8_lossy(&bytes).to_string()));
     }
@@ -458,7 +469,9 @@ async fn agent_seek(
     Ok(Json(snapshot))
 }
 
-async fn agent_reset(State(state): State<AppState>) -> Result<Json<EditorSnapshot>, (StatusCode, String)> {
+async fn agent_reset(
+    State(state): State<AppState>,
+) -> Result<Json<EditorSnapshot>, (StatusCode, String)> {
     let (status, bytes) = proxy_to_game(&state, Method::POST, "/api/agent/reset", None).await?;
     if !status.is_success() {
         return Err((status, String::from_utf8_lossy(&bytes).to_string()));
@@ -482,9 +495,7 @@ async fn main() {
         .await
         .expect("bind editor api");
 
-    axum::serve(listener, app)
-        .await
-        .expect("serve editor api");
+    axum::serve(listener, app).await.expect("serve editor api");
 }
 
 #[cfg(test)]
@@ -492,10 +503,10 @@ mod tests {
     use super::*;
 
     use axum::body::Body;
-    use axum::http::{header, Method, Request};
+    use axum::http::{Method, Request, header};
     use http_body_util::BodyExt;
-    use serde::de::DeserializeOwned;
     use serde::Deserialize;
+    use serde::de::DeserializeOwned;
     use tower::ServiceExt;
 
     use std::collections::BTreeMap;
@@ -522,20 +533,12 @@ mod tests {
     }
 
     async fn stub_state(State(state): State<StubGameState>) -> Json<EditorSnapshot> {
-        let snapshot = state
-            .session
-            .lock()
-            .expect("stub session lock")
-            .state();
+        let snapshot = state.session.lock().expect("stub session lock").state();
         Json(snapshot)
     }
 
     async fn stub_timeline(State(state): State<StubGameState>) -> Json<EditorTimeline> {
-        let timeline = state
-            .session
-            .lock()
-            .expect("stub session lock")
-            .timeline();
+        let timeline = state.session.lock().expect("stub session lock").timeline();
         Json(timeline)
     }
 
@@ -664,7 +667,10 @@ mod tests {
                 prev
             };
 
-            Self { prev_root, prev_env }
+            Self {
+                prev_root,
+                prev_env,
+            }
         }
     }
 
@@ -693,7 +699,11 @@ mod tests {
     }
 
     async fn http_call(app: &Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
-        let res = app.clone().oneshot(req).await.expect("router call should succeed");
+        let res = app
+            .clone()
+            .oneshot(req)
+            .await
+            .expect("router call should succeed");
         let status = res.status();
         let body = res
             .into_body()
@@ -808,14 +818,20 @@ mod tests {
         assert!(!tl0.can_rewind);
         assert!(!tl0.can_forward);
 
-        let s1: EditorSnapshot =
-            http_post_json_ok(&app, "/api/agent/step", serde_json::json!({"actionId":"noop"}))
-                .await;
+        let s1: EditorSnapshot = http_post_json_ok(
+            &app,
+            "/api/agent/step",
+            serde_json::json!({"actionId":"noop"}),
+        )
+        .await;
         assert_eq!(s1.frame, 1);
 
-        let s2: EditorSnapshot =
-            http_post_json_ok(&app, "/api/agent/step", serde_json::json!({"actionId":"noop"}))
-                .await;
+        let s2: EditorSnapshot = http_post_json_ok(
+            &app,
+            "/api/agent/step",
+            serde_json::json!({"actionId":"noop"}),
+        )
+        .await;
         assert_eq!(s2.frame, 2);
 
         let tl2: EditorTimeline = http_get_json(&app, "/api/agent/timeline").await;
@@ -1049,4 +1065,3 @@ esac
         let _ = fs::remove_dir_all(tmp);
     }
 }
-

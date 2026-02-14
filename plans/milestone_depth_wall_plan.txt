@@ -1,0 +1,126 @@
+Milestone Depth Wall Progression Plan
+=====================================
+
+Status
+- Current: NOT_STARTED
+- Last Reviewed: 2026-02-14
+- Notes: Depends on bottomwell and currently has no wall-model/persistence implementation in runtime code.
+
+Goal
+- Add milestone depth walls between biome transitions.
+- When a wall is active, digging progression pauses: bottomwell does not advance until the wall is broken.
+- Wall breaks persist across future runs, so each wall is permanently cleared once completed.
+
+Dependencies
+- Requires `plans/bottomwell_plan.txt` (depth progression source and reveal pipeline).
+- Should integrate with `plans/biome_transition_parallax_layers_plan.txt` so walls align with biome boundaries.
+- Should expose wall state in editor and HUD (for tuning and testing).
+
+Core Loop Contract
+- Hitting a milestone depth triggers a wall encounter (if not already globally broken).
+- During encounter:
+  - no new bottomwell rows are revealed
+  - depth does not advance
+  - player must deal configured wall damage to clear the gate
+- After wall HP reaches zero:
+  - encounter ends immediately
+  - wall is marked permanently broken in progression save data
+  - future runs skip this wall entirely
+
+Design Rules
+- Deterministic runtime behavior per seed and input sequence.
+- Persistent progression stored in a stable save format (versioned).
+- Wall system should be data-driven so milestone list and HP can be tuned without deep code edits.
+- Paused depth progression must be obvious in HUD/feedback to avoid player confusion.
+
+Phase 1: Data Model and Persistence
+- Add wall definition model (for tuning):
+  - `DepthWallDef { id, depth_trigger, hp, biome_from, biome_to }`
+- Add runtime wall state:
+  - `active_wall_id: Option<String>`
+  - `active_wall_hp_remaining: u32`
+  - `depth_progress_paused: bool`
+- Add persistent progression model:
+  - `broken_walls: HashSet<String>`
+  - version field for forward compatibility
+- Persist wall progression alongside existing meta progression (or a dedicated file if cleaner).
+
+Phase 2: Wall Activation Pipeline
+- During depth progression checks, detect crossing a wall trigger depth.
+- Activation criteria:
+  - trigger reached
+  - wall not already in persistent `broken_walls`
+  - no other wall currently active
+- On activation:
+  - initialize remaining HP from wall definition
+  - set depth progression pause flag
+  - surface a clear player-facing message/event
+
+Phase 3: Damage and Unblock Rules
+- Define v1 damage source (simple and explicit):
+  - each cleared line deals fixed wall damage (configurable)
+  - optional bonus damage for multi-line clears
+- While wall is active:
+  - run normal line clear and scoring
+  - block bottomwell reveal and depth increment
+  - apply wall damage from the clear result
+- On wall break:
+  - clear pause flag
+  - mark wall as broken in persistent progression
+  - save immediately to reduce loss on crash/exit
+
+Phase 4: Gameplay and UX Feedback
+- HUD additions:
+  - wall label (for example: "STONE VEIN WALL")
+  - HP remaining meter/text
+  - "DEPTH LOCKED" indicator while active
+- Optional effects:
+  - impact cue on damage
+  - break cue when HP reaches zero
+- Editor snapshot additions:
+  - include active wall ID and HP in `EditorSnapshot` stats
+
+Phase 5: Config and Tuning Surface
+- Initial milestone list aligned to biome transitions:
+  - one wall near each transition depth
+- Add tunables:
+  - per-wall HP
+  - per-line damage
+  - multi-clear bonus multiplier
+- Keep defaults conservative to avoid excessive grind in early walls.
+
+Phase 6: Testing
+- Unit tests:
+  - wall activates at trigger depth
+  - while active, bottomwell reveal is paused
+  - damage reduces HP and break clears pause
+  - broken walls persist and are skipped in new runs
+- Integration tests:
+  - same seed and input yields same activation/damage timeline
+  - wall break state survives restart/reload
+- Manual tests:
+  - HUD communicates blocked progression clearly
+  - gameplay remains stable during prolonged wall phase
+
+Acceptance Criteria
+- Reaching configured milestone depth can activate a wall encounter.
+- Bottomwell progression pauses until wall HP is fully depleted.
+- Breaking a wall permanently unlocks it for future runs.
+- Wall state is visible in HUD and available for editor/debug inspection.
+- No regression in normal line clear, scoring, and control behavior.
+
+Risks and Mitigations
+- Risk: encounter feels like a confusing soft lock.
+  - Mitigation: explicit HUD messaging and visible HP progress.
+- Risk: persistence corruption could re-lock cleared walls.
+  - Mitigation: versioned save schema plus load fallback behavior.
+- Risk: badly tuned HP causes grind spikes.
+  - Mitigation: data-driven tuning and early playtest passes per milestone.
+
+Open Decisions
+- Confirm exact damage formula:
+  - flat per-line only
+  - or per-line plus clear-size bonuses
+- Confirm persistence location:
+  - merge into existing skilltree/meta progress file
+  - or use dedicated wall-progression file.

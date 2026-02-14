@@ -1,5 +1,5 @@
 use engine::graphics::CpuRenderer;
-use engine::render::{color_for_cell, draw_board, CELL_SIZE};
+use engine::render::{CELL_SIZE, color_for_cell, draw_board};
 use engine::surface::SurfaceSize;
 
 #[test]
@@ -54,7 +54,10 @@ fn draw_board_centers_board_in_larger_buffer() {
     let expected_x = offset_x;
     let expected_y = offset_y + board_pixel_height - 1;
     let expected_index = ((expected_y * width + expected_x) * 4) as usize;
-    assert_eq!(&frame[expected_index..expected_index + 4], &[0, 229, 255, 255]);
+    assert_eq!(
+        &frame[expected_index..expected_index + 4],
+        &[0, 229, 255, 255]
+    );
 
     let window_bottom_left_index = ((height - 1) * width * 4) as usize;
     assert_eq!(
@@ -101,4 +104,3 @@ fn draw_board_draws_faint_outline_and_grid_dots() {
     let dot_index = ((dot_y * width + dot_x) * 4) as usize;
     assert_eq!(&frame[dot_index..dot_index + 4], &dot_color);
 }
-

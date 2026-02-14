@@ -100,6 +100,8 @@ pub struct TetrisCore {
     current_piece_rotation: u8,
     available_pieces: Vec<Piece>,
     piece_bag: Vec<Piece>,
+    #[serde(default)]
+    background_seed: u64,
     rng: Rng,
     lines_cleared: u32,
     score: u32,
@@ -119,6 +121,7 @@ impl TetrisCore {
             current_piece_rotation: 0,
             available_pieces: vec![Piece::O],
             piece_bag: Vec::new(),
+            background_seed: seed,
             rng: Rng::new(seed),
             lines_cleared: 0,
             score: 0,
@@ -243,6 +246,10 @@ impl TetrisCore {
         self.lines_cleared
     }
 
+    pub fn background_seed(&self) -> u64 {
+        self.background_seed
+    }
+
     pub fn score(&self) -> u32 {
         self.score
     }
@@ -287,9 +294,7 @@ impl TetrisCore {
         if self.piece_bag.is_empty() {
             self.refill_bag();
         }
-        self.piece_bag
-            .pop()
-            .unwrap_or(Piece::O)
+        self.piece_bag.pop().unwrap_or(Piece::O)
     }
 
     fn fill_next_queue(&mut self) {
@@ -550,7 +555,11 @@ struct Rng {
 
 impl Rng {
     fn new(seed: u64) -> Self {
-        let seed = if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed };
+        let seed = if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        };
         Self { state: seed }
     }
 
@@ -782,11 +791,7 @@ mod piece_grid_tests {
         for y in 0..g.size() {
             for x in 0..g.size() {
                 let expected = if x == 2 { 1 } else { 0 };
-                assert_eq!(
-                    g.cell(x, y),
-                    expected,
-                    "unexpected cell at x={x} y={y}"
-                );
+                assert_eq!(g.cell(x, y), expected, "unexpected cell at x={x} y={y}");
             }
         }
     }

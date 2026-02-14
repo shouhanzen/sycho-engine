@@ -1,0 +1,102 @@
+Biome Transition and Parallax Layers Plan
+=========================================
+
+Status
+- Current: NOT_STARTED
+- Last Reviewed: 2026-02-14
+- Notes: This depends on the MVP background plan and has not started yet.
+
+Goal
+- Extend the background system from MVP to production-ready layering:
+  - smooth biome transitions using blend windows
+  - 2-3 deterministic parallax layers (far, mid, near)
+- Keep rendering deterministic and performant before adding heavier visual effects.
+
+Dependencies
+- Start only after `plans/background_tile_mvp_checklist.txt` is complete and verified.
+- Coordinate thresholds with `plans/performance_budget_hud_profiler_plan.txt` so layer additions are budget-aware.
+
+Design Rules
+- Deterministic: same seed + same depth + same camera state yields identical background output.
+- Layered: each layer has independent parallax factor and tile sampling stream.
+- Readable: board and active gameplay pieces remain visually dominant over background.
+- Bounded cost: per-frame cost scales with visible tile count only.
+
+Phase 1: MVP Stability Gate
+- Verify MVP baseline for one layer:
+  - depth scrolling works
+  - deterministic tile sampling works
+  - no obvious frame spikes in normal gameplay
+- Record baseline timing from debug HUD for later comparison (before adding layers).
+
+Phase 2: Layer Model and Runtime Data
+- Add background layer configuration in `game/src/background.rs`:
+  - `BackgroundLayerId` (Far, Mid, Near)
+  - `BackgroundLayerSpec` (tile size, parallax factor, alpha, palette bias)
+- Define default v1 layer specs:
+  - Far: low detail, lowest contrast, slowest movement
+  - Mid: medium detail and contrast
+  - Near: highest detail while still behind board readability
+- Keep per-layer hash stream deterministic by including `layer_id` in tile hash input.
+
+Phase 3: Biome Band and Blend Window Model
+- Replace hard biome switch with blend-window mapping:
+  - `biome_at_depth(depth) -> (primary, secondary, blend_alpha)`
+- Define explicit biome bands and blend widths:
+  - Dirt -> Stone blend window around first boundary
+  - additional bands can be appended later without changing API shape
+- Blend behavior:
+  - outside window: single biome
+  - inside window: weighted contribution from both biome tables
+
+Phase 4: Rendering Pipeline Integration
+- Update background draw call to iterate layers in order:
+  - far, then mid, then near (all behind board)
+- For each visible tile:
+  - sample base kind from primary biome
+  - sample alternate kind from secondary biome when `blend_alpha > 0`
+  - blend motif/palette contribution by `blend_alpha`
+- Ensure board draw pass never clears over already rendered background layers.
+
+Phase 5: Tuning and Debug Hooks
+- Add quick runtime toggles for iteration:
+  - enable/disable each layer
+  - force biome ID
+  - force blend alpha
+  - parallax multiplier override
+- Add optional debug overlay:
+  - current biome pair
+  - blend alpha
+  - sampled layer offsets
+
+Phase 6: Performance Hardening
+- Avoid allocations in tile sampling hot paths.
+- Reuse computed viewport bounds per layer where possible.
+- Cap tile motif complexity for far and mid layers to protect frame budget.
+- Validate render timings against performance budget thresholds before and after each added layer.
+
+Phase 7: Testing
+- Unit tests in `game/src/background.rs`:
+  - deterministic layer sampling
+  - biome blend alpha at and around boundaries
+  - tile selection stability with fixed seed/depth/layer
+- Integration tests:
+  - depth changes shift layer offsets with expected parallax factors
+  - blending changes smoothly through transition windows (no abrupt jumps)
+- Manual verification:
+  - readability pass with active gameplay and UI overlays
+  - profiling pass with all enabled layers
+
+Acceptance Criteria
+- Background has 2-3 parallax layers with deterministic sampling.
+- Biome boundaries transition smoothly through blend windows.
+- Gameplay readability remains clear across all active views.
+- Frame timing stays within agreed budget thresholds during normal play.
+
+Risks and Mitigations
+- Risk: visual noise reduces board readability.
+  - Mitigation: constrain near-layer contrast and enforce palette separation from pieces.
+- Risk: blend implementation doubles tile sampling cost.
+  - Mitigation: keep blend path simple and skip secondary sample when alpha is effectively zero.
+- Risk: adding layers before perf guardrails hides regressions.
+  - Mitigation: couple rollout to budget HUD warnings and profile checks.

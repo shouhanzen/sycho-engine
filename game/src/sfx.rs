@@ -9,4 +9,3 @@ pub const LINE_CLEAR_SFX_VOLUME: f32 = 0.45;
 ///
 /// Kept intentionally low so it sits under the gameplay SFX.
 pub const MUSIC_VOLUME: f32 = 0.12;
-

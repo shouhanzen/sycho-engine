@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use game::tetris_core::{Piece, TetrisCore, Vec2i, BOARD_HEIGHT, BOARD_WIDTH, NEXT_QUEUE_LEN};
+use game::tetris_core::{BOARD_HEIGHT, BOARD_WIDTH, NEXT_QUEUE_LEN, Piece, TetrisCore, Vec2i};
 
 #[test]
 fn initializes_board_and_spawns_piece() {

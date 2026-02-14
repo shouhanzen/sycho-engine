@@ -1,0 +1,131 @@
+Tile-Based Background System Plan
+=================================
+
+Status
+- Current: NOT_STARTED
+- Last Reviewed: 2026-02-14
+- Notes: System design is documented, but implementation modules and runtime wiring have not started.
+
+Goal
+- Build a tile-based background that appears behind the Tetris board and scrolls as the player digs down.
+- Use deterministic random tile patterns so each run feels varied but reproducible.
+- Support depth-based biome transitions for future content expansion.
+
+Core Vision
+- Background is a separate visual layer (not gameplay collision).
+- Tiles are generated from depth + seed, then rendered in a screen-space viewport.
+- As dig depth increases, the background shifts downward and transitions biome themes.
+
+Design Pillars
+- Deterministic: same seed + same depth => same background tiles.
+- Lightweight: render only visible background tiles.
+- Layered: far/mid/near tile layers with different parallax factors.
+- Extensible: add biomes, animated tiles, and effects without rewriting core logic.
+
+Phase 1: Architecture and Ownership
+- Add a new module: `game/src/background.rs`.
+- Add runtime data holder:
+  - `BackgroundRuntime` (parallax offsets, transition alpha, optional animation timer).
+- Add definitions:
+  - `BackgroundBiome` (Surface, Dirt, Stone, Crystal, Magma, etc.).
+  - `BackgroundTileKind` (Empty, DirtA, DirtB, RockA, RockB, Vein, Crack, Fossil, etc.).
+- Decide state ownership:
+  - Option A: keep runtime visuals in app/headful render state.
+  - Option B: attach background runtime to `GameState` (recommended if replay consistency matters).
+
+Phase 2: Seeded Tile Generation
+- Inputs to generation:
+  - `world_seed` (from run seed),
+  - `depth_row` (global background row index),
+  - `layer_id` (far/mid/near).
+- Add deterministic hash helper:
+  - `tile_hash(seed, depth_row, col, layer_id) -> u32`.
+- Map hash to tile kind with weighted tables per biome.
+- Keep tiles gameplay-agnostic; this is visual only.
+
+Generation Rules (v1)
+- Each biome has:
+  - base palette
+  - tile kind weights
+  - rare accent tile chance
+- Example:
+  - Surface/Dirt: more soft patterns, occasional pebble/crack.
+  - Stone: denser rock motifs, fewer bright accents.
+  - Crystal/Magma: rare glowing tiles.
+
+Phase 3: Depth and Biome Mapping
+- Define biome bands by dig depth:
+  - 0..49 Surface
+  - 50..149 Dirt
+  - 150..299 Stone
+  - 300+ Crystal (or Magma later)
+- Add blending window between bands (e.g. 16-32 rows) for smooth transitions.
+- Function:
+  - `biome_at_depth(depth) -> (primary, secondary, blend_alpha)`.
+
+Phase 4: Render Pipeline Integration
+- Current issue:
+  - `engine::render::draw_board` clears full screen to black first.
+- Refactor path:
+  - Add or use a board draw function that does NOT clear the entire frame.
+  - Draw order for Tetris scene:
+    1) tile background layers
+    2) board cells
+    3) ghost + active piece
+    4) HUD/UI
+- Keep SkillTree/Menu rendering behavior unchanged.
+
+Phase 5: Tile Viewport and Scrolling
+- Build `draw_tile_background(...)` API:
+  - args: renderer, screen size, board rect, depth, time/runtime, seed.
+- Render only visible tiles for each layer:
+  - compute tile size per layer (far larger, near smaller or equal).
+  - compute row offset using `depth * parallax_factor`.
+  - sample deterministic tile kind for each visible tile coordinate.
+- Suggested parallax:
+  - far: 0.25x
+  - mid: 0.55x
+  - near: 0.9x
+
+Phase 6: Tile Art via Procedural Motifs
+- No texture atlas required for v1.
+- Draw each tile kind with small procedural motifs:
+  - solid fill + small dots/lines/cracks/veins.
+- Keep motifs cheap and branch-light.
+- Optionally jitter motif placement from tile hash.
+
+Phase 7: Performance and Safety
+- Cache per-frame computed tile ranges to avoid recomputing bounds repeatedly.
+- Avoid allocations in hot loop where possible.
+- Keep render cost bounded by viewport tile count only.
+- Ensure full determinism for replay/profile modes.
+
+Phase 8: Debug and Tuning Hooks
+- Add debug toggles (optional env vars):
+  - enable/disable background
+  - force biome id
+  - adjust parallax multipliers
+  - show tile grid overlay
+- Useful for art tuning while gameplay code evolves elsewhere.
+
+Phase 9: Tests
+- Unit tests in `game/src/background.rs`:
+  - deterministic hash output
+  - deterministic tile kind selection
+  - biome mapping by depth
+  - blend alpha behavior around boundaries
+- Integration sanity test:
+  - depth increment changes sampled tile coordinates as expected.
+
+Acceptance Criteria
+- Background scrolls downward as player digs deeper.
+- Tile patterns are deterministic per seed/depth.
+- Biome transitions occur at configured depth bands with smooth blending.
+- Board and gameplay readability remain clear.
+- No noticeable frame-time spikes from background rendering.
+
+Future Upgrades
+- Animated special tiles (glow, shimmer, lava pulse).
+- Rare landmarks every N depth rows.
+- Biome-specific particle systems tied to depth.
+- Upgrade system hooks: reveal scanner, richer ore vein visuals, hazard warnings.

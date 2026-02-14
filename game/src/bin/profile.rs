@@ -1,9 +1,9 @@
 use std::time::{Duration, Instant};
 
+use engine::HeadlessRunner;
+use engine::graphics::CpuRenderer;
 use engine::profiling::{Profiler, StepTimings};
 use engine::surface::{RgbaBufferSurface, Surface, SurfaceSize};
-use engine::graphics::CpuRenderer;
-use engine::HeadlessRunner;
 
 use game::playtest::{InputAction, TetrisLogic};
 use game::tetris_core::Piece;
@@ -203,4 +203,3 @@ fn main() {
     print_stats("draw", draw.stats());
     print_stats("frame", frame_total.stats());
 }
-
