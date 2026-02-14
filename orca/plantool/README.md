@@ -86,7 +86,7 @@ Defaults for `plan run`:
 
 On Windows, `plan run` executes task commands through native PowerShell.
 
-If output is idle for `--idle-timeout-seconds`, `plan run` restarts `cursor-agent` with `--continue` and a resume prompt asking it to diagnose why the stall happened and fix it before continuing (no hard timeout).
+If output is idle for `--idle-timeout-seconds`, `plan run` restarts `cursor-agent` with `--continue` and a short resume prompt asking it to diagnose the stall and continue from current state (it does not resend the full plan prompt on resume).
 
 Template variables for `--exec`:
 

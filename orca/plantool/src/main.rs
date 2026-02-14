@@ -730,15 +730,35 @@ fn ensure_continue_flag(command: &str) -> String {
 }
 
 fn with_continue_diagnostic_prompt(command: &str, idle_timeout_seconds: u64) -> String {
-    let base = ensure_continue_flag(command);
+    let base = extract_continue_base(command);
     let resume_prompt = format!(
         "Session resumed after {}s of no output. First, identify why the previous run timed out or stalled. \
 Then fix the root cause if possible (for example: hung command, missing timeout wrapper, blocked tool call, or bad test command). \
-After that, continue executing the plan.",
+After that, continue from the current state. Do not restart the plan from scratch.",
         idle_timeout_seconds
     );
     let escaped = resume_prompt.replace('\'', "''");
     format!("{base} '{escaped}'")
+}
+
+fn extract_continue_base(command: &str) -> String {
+    let mut base = command.to_string();
+    if let Some(idx) = base.find(" --continue") {
+        base.truncate(idx);
+    }
+
+    let trimmed = base.trim_end().to_string();
+    if trimmed.ends_with('\'') {
+        if let Some(first_quote) = trimmed.find('\'') {
+            base = trimmed[..first_quote].trim_end().to_string();
+        } else {
+            base = trimmed;
+        }
+    } else {
+        base = trimmed;
+    }
+
+    ensure_continue_flag(&base)
 }
 
 fn terminate_process_tree(pid: u32) {
