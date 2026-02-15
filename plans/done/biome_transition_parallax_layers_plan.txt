@@ -1,10 +1,12 @@
 Biome Transition and Parallax Layers Plan
 =========================================
 
+Plan-ID: BIOME_TRANSITION_PARALLAX_LAYERS_PLAN
+
 Status
-- Current: NOT_STARTED
+- Current: DONE
 - Last Reviewed: 2026-02-14
-- Notes: This depends on the MVP background plan and has not started yet.
+- Notes: All phases implemented and tested. 37 background unit tests + 2 integration tests pass.
 
 Goal
 - Extend the background system from MVP to production-ready layering:
@@ -21,6 +23,35 @@ Design Rules
 - Layered: each layer has independent parallax factor and tile sampling stream.
 - Readable: board and active gameplay pieces remain visually dominant over background.
 - Bounded cost: per-frame cost scales with visible tile count only.
+
+Execution Checklist
+- [x] Phase 1: verify MVP baseline behavior and capture pre-layer timing baseline.
+      Done: 16 existing background tests + 2 integration tests pass. MVP has 2-layer parallax working.
+- [x] Phase 2: introduce `BackgroundLayerId` and `BackgroundLayerSpec` model/runtime defaults.
+      Done: BackgroundLayerId (Far/Mid/Near), BackgroundLayerSpec with tile_px/alpha/depth_divisor/motif_enabled.
+      3 layer specs: LAYER_FAR (72px, alpha=70, div=3, no motifs), LAYER_MID (48px, alpha=108, div=2),
+      LAYER_NEAR (24px, alpha=255, div=1).
+- [x] Phase 3: implement biome band blend-window mapping API and data.
+      Done: BiomeBlendInfo, BiomeBand, biome_blend_at_depth(), biome_blend_at_depth_with_bands().
+      V1_BIOME_BANDS defines Dirt->Stone at depth 50 with 10-row blend. lerp_color/lerp_palette for smooth blending.
+- [x] Phase 4: integrate multi-layer render pass and blended sampling in draw pipeline.
+      Done: draw_tile_background_impl iterates V1_LAYERS back-to-front. Per-row palette blending
+      with probabilistic tile-kind selection. Far layer skips motifs for perf.
+- [x] Phase 5: add runtime tuning/debug toggles for layer and blend inspection.
+      Done: ROLLOUT_DISABLE_LAYER_FAR/MID/NEAR, ROLLOUT_FORCE_BLEND_ALPHA, ROLLOUT_BLEND_DEBUG overlay.
+      Existing toggles preserved: ROLLOUT_DISABLE_TILE_BG, ROLLOUT_FORCE_BIOME, ROLLOUT_PARALLAX_MULT,
+      ROLLOUT_TILE_GRID_OVERLAY.
+- [x] Phase 6: harden hot-path performance and validate against budget thresholds.
+      Done: Per-row palette computed once (not per-tile). blend_alpha==0 fast path skips lerp.
+      Far layer motif_enabled=false saves motif draw calls. No allocations in tile sampling.
+      Stack-only data throughout hot path.
+- [x] Phase 7: add deterministic/blend/parallax tests and manual readability/profile passes.
+      Done: 37 unit tests covering hash determinism, layer specs, blend alpha monotonicity,
+      smooth visual transitions, parallax offset differences, color lerp, custom bands,
+      per-layer determinism, tile selection stability. 2 integration tests verified.
+- [x] Acceptance: deterministic multi-layer biome transitions run within frame budget.
+      Done: All tests pass. Same seed+depth produces identical output. 3 parallax layers with
+      smooth biome blending. No regressions in existing 155 engine+game tests.
 
 Phase 1: MVP Stability Gate
 - Verify MVP baseline for one layer:

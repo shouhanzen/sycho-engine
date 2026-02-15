@@ -1,0 +1,117 @@
+Tetris Ground Lock Delay Plan
+=============================
+
+Plan-ID: TETRIS_LOCK_DELAY_PLAN
+Depends-On:
+
+Status
+- Current: NOT_STARTED
+- Last Reviewed: 2026-02-14
+- Claimed By: cursor-agent @ 2026-02-14
+- Notes: Gravity currently advances pieces downward but does not maintain a dedicated timed ground-lock state.
+
+Goal
+- When an active piece reaches floor/stack contact, start a short lock delay and then lock automatically.
+- Keep movement/rotation responsive during the lock-delay window so players can make last-moment adjustments.
+- Preserve deterministic simulation and existing hard-drop behavior.
+
+Dependencies
+- `game/src/tetris_core.rs` for canonical piece movement, collision checks, line clear flow, and spawn flow.
+- `game/src/playtest.rs` for frame-step simulation behavior that currently applies gravity with `move_piece_down()`.
+- `game/src/bin/headful/main.rs` for runtime gravity timing, pause behavior, and integration with real frame `dt`.
+- `game/tests/tetris_core_tests.rs` and `game/src/bin/headful/headful_tests.rs` for unit/integration safety coverage.
+
+Non-Goals
+- No redesign of SRS kicks, piece bag, or scoring tables in this effort.
+- No gameplay-level speed curve redesign beyond introducing lock delay.
+- No visual-only polish requirements (landing FX/sound tuning can be follow-up).
+
+Design Rules
+- Lock-delay behavior is owned by `TetrisCore` so all runtimes (headful, playtest, agent) stay consistent.
+- Delay progression is deterministic and driven by explicit simulation time input (no wall-clock reads).
+- Hard drop bypasses delay and still locks immediately.
+- Successful reposition actions during ground contact reset lock delay; failed actions do not.
+- Spawn/hold/reset paths must clear lock-delay state to avoid stale carry-over.
+
+Execution Checklist
+- [ ] Phase 1: define lock-delay contract, defaults, and integration API. (owner: cursor-agent @ 2026-02-14)
+- [ ] Phase 2: add core lock-delay state machine for ground contact and timed lock.
+- [ ] Phase 3: wire gravity/update callsites in playtest and headful to use canonical lock-delay path.
+- [ ] Phase 4: add/reset semantics for movement, rotation, hold, and hard drop interactions.
+- [ ] Phase 5: add tests for timing thresholds, reset behavior, determinism, and pause handling.
+- [ ] Phase 6: run manual feel pass and tune default lock delay.
+- [ ] Acceptance: pieces auto-lock after configurable delay on ground contact without regressions.
+
+Phase 1: Contract and Tuning Surface
+- Define v1 lock-delay constant (for example `LOCK_DELAY_MS_DEFAULT = 500`) and where it lives.
+- Add one canonical core API for gravity advancement with lock accounting (example shape):
+  - `advance_with_gravity(dt_ms)` or equivalent deterministic helper.
+- Decide return contract for callers (for example: none, bool, or enum for `Moved`/`Locked`).
+- Keep API small and explicit so current callers can migrate without broad churn.
+
+Phase 2: Core Lock-Delay State Machine
+- Add lock-delay state fields in `TetrisCore` (example: accumulated grounded ms, grounded flag, optional reset counter).
+- On successful downward movement:
+  - clear grounded timer/state.
+- On blocked downward movement:
+  - enter/continue grounded state and accumulate lock-delay progress.
+  - once threshold reached, execute existing lock pipeline (`place_piece` -> `clear_lines` -> `spawn_new_piece`).
+- Ensure game-over spawn overlap behavior remains unchanged after lock.
+
+Phase 3: Gravity Integration
+- Update `TetrisLogic::step` and related gravity paths to call the canonical lock-delay-aware API instead of raw `move_piece_down()`.
+- Update `HeadfulApp::apply_gravity_steps` flow so gravity accumulation advances lock delay deterministically.
+- Keep pause behavior explicit: paused runtime should not accumulate lock-delay time.
+
+Phase 4: Input and Reset Semantics
+- Define reset policy on successful actions while grounded:
+  - horizontal move that changes position resets timer.
+  - rotation that changes orientation/position resets timer.
+- Failed move/rotation attempts do not reset timer.
+- Hard drop remains instant lock and should clear/ignore pending lock-delay state.
+- Hold/spawn/reset paths clear lock-delay state so new active piece starts fresh.
+
+Phase 5: Tests
+- Add/extend `game/tests/tetris_core_tests.rs` for:
+  - piece does not lock before threshold.
+  - piece locks after cumulative grounded delay.
+  - successful ground adjustments reset delay.
+  - failed adjustments do not reset delay.
+  - hard drop remains immediate and unaffected by delay state.
+  - hold/spawn paths reset delay state.
+- Add/extend `game/src/bin/headful/headful_tests.rs` for:
+  - gravity dt integration reaches lock at expected timing.
+  - paused state does not advance lock delay.
+  - deterministic repeatability for same input timeline.
+
+Phase 6: Manual Verification and Tuning
+- Manual checks in headful:
+  - piece rests briefly at floor/stack, then locks without extra input.
+  - horizontal/rotation adjustments during delay feel responsive.
+  - hard drop still locks instantly.
+- Tune delay default (and optional debug/env override if needed) based on play feel.
+
+Acceptance Criteria
+- Active piece automatically locks after a short delay when grounded.
+- Piece remains adjustable during delay, with expected reset behavior.
+- Hard drop remains instant and deterministic.
+- No regressions in line clears, hold behavior, scoring, or spawn/game-over flow.
+- Tests cover threshold timing and key edge cases across core + headful integration.
+
+Risks and Mitigations
+- Risk: timer integration differs across runtimes and causes desync.
+  - Mitigation: centralize timing in `TetrisCore` API and test deterministic parity.
+- Risk: unlimited reset behavior allows indefinite stalling.
+  - Mitigation: document v1 behavior and leave reset-cap as explicit follow-up decision.
+- Risk: interaction regressions with hold/spawn paths.
+  - Mitigation: add focused tests for lock-delay state reset on hold/spawn/reset.
+
+Open Decisions
+- Should v1 include a lock-reset cap (modern guideline) or allow unlimited resets initially?
+- Should soft drop accelerate lock-delay countdown, or only movement speed?
+- Should lock-delay default be fixed or scaled by gameplay progression later?
+
+Future Extensions
+- Add landing/ground-contact telegraph (subtle flash or cue) before lock.
+- Add optional lock-delay tuning hooks in debug HUD/editor tools.
+- Add progression-based lock-delay scaling for higher-speed/endgame modes.

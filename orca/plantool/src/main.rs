@@ -1,6 +1,8 @@
 mod plans;
 mod state;
 
+use std::collections::HashSet;
+use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -54,11 +56,11 @@ enum Commands {
         max_minutes: u64,
         #[arg(long, default_value_t = 5)]
         sleep_seconds: u64,
-        #[arg(long, default_value_t = 300)]
+        #[arg(long, default_value_t = 600)]
         idle_timeout_seconds: u64,
         #[arg(
             long,
-            default_value = "cursor-agent --print --output-format stream-json --stream-partial-output 'You are executing plan {plan_id} from {plan_path}.\n\nComplete as much of this plan as you can in this single run.\nIf you finish items, update checklist markers in the plan file.\nIf blocked, leave clear notes in the plan file.\n\nOpen checklist items ({pending_count}):\n{open_tasks}\n\nFull plan text:\n{plan_text}'"
+            default_value = "cursor-agent --print --force --output-format stream-json --stream-partial-output 'You are executing plan {plan_id} from {plan_path}.\n\nComplete as much of this plan as you can in this single run.\nIf you finish items, update checklist markers in the plan file.\nIf blocked, leave clear notes in the plan file.\n\nOpen checklist items ({pending_count}):\n{open_tasks}\n\nFull plan text:\n{plan_text}'"
         )]
         exec: String,
         #[arg(long, default_value_t = false)]
@@ -104,15 +106,7 @@ fn main() -> Result<()> {
 
 fn cmd_validate(root: &Path) -> Result<()> {
     let graph = load_plans(root)?;
-    let dep_errors = graph.dependency_errors();
-    let cycle_errors = graph.cycle_errors();
-    if !dep_errors.is_empty() || !cycle_errors.is_empty() {
-        for e in dep_errors {
-            eprintln!("ERROR: {e}");
-        }
-        for e in cycle_errors {
-            eprintln!("ERROR: {e}");
-        }
+    if assert_graph_valid(&graph).is_err() {
         bail!("Validation failed");
     }
 
@@ -126,8 +120,8 @@ fn cmd_validate(root: &Path) -> Result<()> {
 }
 
 fn cmd_list(root: &Path, ready_only: bool) -> Result<()> {
-    let graph = load_plans(root)?;
-    assert_graph_valid(&graph)?;
+    let (graph, excluded_plan_ids) = load_actionable_graph(root)?;
+    warn_excluded_plans(&excluded_plan_ids);
     let claims = ClaimStore::load(root)?;
     let now = Utc::now();
 
@@ -164,8 +158,8 @@ fn cmd_list(root: &Path, ready_only: bool) -> Result<()> {
 }
 
 fn cmd_claim(root: &Path, task_id: &str, owner: &str) -> Result<()> {
-    let graph = load_plans(root)?;
-    assert_graph_valid(&graph)?;
+    let (graph, excluded_plan_ids) = load_actionable_graph(root)?;
+    warn_excluded_plans(&excluded_plan_ids);
     let task = graph
         .tasks_by_id
         .get(task_id)
@@ -185,8 +179,8 @@ fn cmd_claim(root: &Path, task_id: &str, owner: &str) -> Result<()> {
 }
 
 fn cmd_complete(root: &Path, task_id: &str, owner: Option<&str>, note: Option<&str>) -> Result<()> {
-    let graph = load_plans(root)?;
-    assert_graph_valid(&graph)?;
+    let (graph, excluded_plan_ids) = load_actionable_graph(root)?;
+    warn_excluded_plans(&excluded_plan_ids);
     let task = graph
         .tasks_by_id
         .get(task_id)
@@ -214,6 +208,13 @@ fn cmd_complete(root: &Path, task_id: &str, owner: Option<&str>, note: Option<&s
     claims.release(task_id);
     claims.save(root)?;
     println!("Completed {}", task_id);
+    if let Some(archived_path) = maybe_archive_completed_plan(root, &task.plan_id)? {
+        println!(
+            "Archived completed plan {} to {}",
+            task.plan_id,
+            archived_path.display()
+        );
+    }
     Ok(())
 }
 
@@ -232,6 +233,7 @@ fn cmd_run(
     let started = Instant::now();
     let mut steps = 0usize;
     let mut consecutive_failures = 0usize;
+    let mut last_excluded_signature = String::new();
 
     loop {
         if steps >= max_steps {
@@ -243,8 +245,12 @@ fn cmd_run(
             break;
         }
 
-        let graph = load_plans(root)?;
-        assert_graph_valid(&graph)?;
+        let (graph, excluded_plan_ids) = load_actionable_graph(root)?;
+        let excluded_signature = excluded_plan_ids.join(",");
+        if !excluded_plan_ids.is_empty() && excluded_signature != last_excluded_signature {
+            warn_excluded_plans(&excluded_plan_ids);
+            last_excluded_signature = excluded_signature;
+        }
         let mut claims = ClaimStore::load(root)?;
         let now = Utc::now();
         let Some(plan_work) = select_next_ready_plan(&graph, &claims, now, owner) else {
@@ -253,7 +259,9 @@ fn cmd_run(
                 thread::sleep(StdDuration::from_secs(sleep_seconds));
                 continue;
             }
+            let diagnostics = compute_ready_diagnostics(&graph, &claims, now, owner);
             println!("No ready tasks. Exiting.");
+            print_no_ready_guidance(&diagnostics);
             break;
         };
 
@@ -294,10 +302,25 @@ fn cmd_run(
                 "Plan {} failed (failure count: {})",
                 plan_work.plan_id, consecutive_failures
             );
+            if let Some(archived_path) = maybe_archive_completed_plan(root, &plan_work.plan_id)? {
+                println!(
+                    "Archived completed plan {} to {}",
+                    plan_work.plan_id,
+                    archived_path.display()
+                );
+            }
             if consecutive_failures >= 3 {
                 println!("Circuit breaker: 3 consecutive failures.");
                 break;
             }
+            continue;
+        }
+        if let Some(archived_path) = maybe_archive_completed_plan(root, &plan_work.plan_id)? {
+            println!(
+                "Archived completed plan {} to {}",
+                plan_work.plan_id,
+                archived_path.display()
+            );
         }
     }
 
@@ -498,21 +521,15 @@ fn run_shell(command: &str, idle_timeout_seconds: u64) -> Result<ExecResult> {
             );
         }
 
-        let mut platform_command = if cfg!(windows) {
-            let mut cmd = Command::new("powershell.exe");
-            cmd.arg("-NoProfile").arg("-Command").arg(&current_command);
-            cmd
-        } else {
-            let mut cmd = Command::new("bash");
-            cmd.arg("-lc").arg(&current_command);
-            cmd
-        };
+        // Execute plan commands through bash so WSL runs natively without PowerShell routing.
+        let mut platform_command = Command::new("bash");
+        platform_command.arg("-lc").arg(&current_command);
 
         let mut child = platform_command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| "Failed to spawn platform shell for exec command")?;
+            .with_context(|| "Failed to spawn bash for exec command")?;
 
         let stdout = child
             .stdout
@@ -651,8 +668,143 @@ struct PlanWorkItem {
     first_task_text: String,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ReadyDiagnostics {
+    open_plans: usize,
+    open_tasks: usize,
+    ready_plans: usize,
+    blocked_by_dependencies: usize,
+    claimed_by_other_owner: usize,
+    claimed_by_self: usize,
+}
+
+fn compute_ready_diagnostics(
+    graph: &PlanGraph,
+    claims: &ClaimStore,
+    now: chrono::DateTime<Utc>,
+    owner: &str,
+) -> ReadyDiagnostics {
+    let mut diagnostics = ReadyDiagnostics::default();
+
+    for plan in &graph.plans {
+        let open_tasks = plan.tasks.iter().filter(|task| !task.done).count();
+        if open_tasks == 0 {
+            continue;
+        }
+
+        diagnostics.open_plans += 1;
+        diagnostics.open_tasks += open_tasks;
+        let deps_ok = graph.dependencies_completed(&plan.id);
+        let claim_id = plan_claim_key(&plan.id);
+
+        match claims.active_claim(&claim_id, now) {
+            Some(claim) if claim.owner == owner => diagnostics.claimed_by_self += 1,
+            Some(_) => diagnostics.claimed_by_other_owner += 1,
+            None if deps_ok => diagnostics.ready_plans += 1,
+            None => diagnostics.blocked_by_dependencies += 1,
+        }
+    }
+
+    diagnostics
+}
+
+fn print_no_ready_guidance(diagnostics: &ReadyDiagnostics) {
+    if diagnostics.open_plans == 0 {
+        println!("All checklist items are complete in plans/*.txt and plans/*.md.");
+    } else {
+        println!(
+            "Open tasks: {} across {} plan(s). Ready plans: {}. Blocked by dependencies: {}. Claimed by other owners: {}. Claimed by this owner: {}.",
+            diagnostics.open_tasks,
+            diagnostics.open_plans,
+            diagnostics.ready_plans,
+            diagnostics.blocked_by_dependencies,
+            diagnostics.claimed_by_other_owner,
+            diagnostics.claimed_by_self
+        );
+    }
+    println!(
+        "Hint: run `plan list --ready` to inspect ready work, or `plan run --watch` to wait for tasks."
+    );
+}
+
 fn plan_claim_key(plan_id: &str) -> String {
     format!("PLAN::{plan_id}")
+}
+
+fn maybe_archive_completed_plan(root: &Path, plan_id: &str) -> Result<Option<PathBuf>> {
+    let graph = load_plans(root)?;
+    let Some(plan) = graph.plans_by_id.get(plan_id) else {
+        return Ok(None);
+    };
+    if plan.tasks.is_empty() || plan.tasks.iter().any(|task| !task.done) {
+        return Ok(None);
+    }
+
+    let done_dir = root.join("plans").join("done");
+    if plan.path.starts_with(&done_dir) {
+        return Ok(None);
+    }
+    if !plan.path.exists() {
+        return Ok(None);
+    }
+
+    let archived_path = archive_plan_file(root, &plan.path)?;
+    Ok(Some(archived_path))
+}
+
+fn archive_plan_file(root: &Path, plan_path: &Path) -> Result<PathBuf> {
+    let done_dir = root.join("plans").join("done");
+    fs::create_dir_all(&done_dir)
+        .with_context(|| format!("Failed to create {}", done_dir.display()))?;
+
+    let file_name = plan_path
+        .file_name()
+        .with_context(|| format!("Plan path {} has no file name", plan_path.display()))?;
+    let mut archived_path = done_dir.join(file_name);
+    if archived_path.exists() {
+        let stem = plan_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("plan");
+        let ext = plan_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|v| format!(".{v}"))
+            .unwrap_or_default();
+        let mut suffix = 1usize;
+        loop {
+            let candidate = done_dir.join(format!("{stem}_{suffix}{ext}"));
+            if !candidate.exists() {
+                archived_path = candidate;
+                break;
+            }
+            suffix += 1;
+        }
+    }
+
+    fs::rename(plan_path, &archived_path)
+        .or_else(|_| copy_then_remove(plan_path, &archived_path))
+        .with_context(|| {
+            format!(
+                "Failed to move completed plan {} to {}",
+                plan_path.display(),
+                archived_path.display()
+            )
+        })?;
+    Ok(archived_path)
+}
+
+fn copy_then_remove(src: &Path, dst: &Path) -> Result<()> {
+    fs::copy(src, dst).with_context(|| {
+        format!(
+            "Failed to copy completed plan from {} to {}",
+            src.display(),
+            dst.display()
+        )
+    })?;
+    fs::remove_file(src)
+        .with_context(|| format!("Failed to remove original plan {}", src.display()))?;
+    Ok(())
 }
 
 fn sanitize_prompt_fragment(value: &str) -> String {
@@ -831,6 +983,42 @@ fn assert_graph_valid(graph: &PlanGraph) -> Result<()> {
     Ok(())
 }
 
+fn load_actionable_graph(root: &Path) -> Result<(PlanGraph, Vec<String>)> {
+    let graph = load_plans(root)?;
+    Ok(prune_invalid_plans(graph))
+}
+
+fn prune_invalid_plans(mut graph: PlanGraph) -> (PlanGraph, Vec<String>) {
+    let mut removed_plan_ids = HashSet::new();
+    loop {
+        let mut invalid_plan_ids = graph.plans_with_missing_dependencies();
+        invalid_plan_ids.extend(graph.plans_in_cycles());
+        if invalid_plan_ids.is_empty() {
+            break;
+        }
+        removed_plan_ids.extend(invalid_plan_ids.iter().cloned());
+        graph = graph.without_plans(&invalid_plan_ids);
+        if graph.plans.is_empty() {
+            break;
+        }
+    }
+
+    let mut removed: Vec<String> = removed_plan_ids.into_iter().collect();
+    removed.sort();
+    (graph, removed)
+}
+
+fn warn_excluded_plans(excluded_plan_ids: &[String]) {
+    if excluded_plan_ids.is_empty() {
+        return;
+    }
+    eprintln!(
+        "WARNING: Excluding invalid plan node(s): {}",
+        excluded_plan_ids.join(", ")
+    );
+    eprintln!("WARNING: Run `plan validate` for detailed graph errors.");
+}
+
 fn discover_workspace_root() -> Result<PathBuf> {
     let cwd = std::env::current_dir().with_context(|| "Failed to get current directory")?;
     for dir in cwd.ancestors() {
@@ -844,4 +1032,202 @@ fn discover_workspace_root() -> Result<PathBuf> {
         }
     }
     bail!("Could not locate workspace root from current directory");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TempWorkspace {
+        root: PathBuf,
+    }
+
+    impl TempWorkspace {
+        fn new() -> Self {
+            let nonce = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time should be monotonic")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "plantool_main_{}_{}_{}",
+                std::process::id(),
+                ts,
+                nonce
+            ));
+            fs::create_dir_all(root.join("plans")).expect("create plans directory");
+            Self { root }
+        }
+    }
+
+    impl Drop for TempWorkspace {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn make_plan(id: &str, depends_on: &[&str], task_done: &[bool]) -> plans::Plan {
+        let path = PathBuf::from(format!("plans/{}.md", id.to_ascii_lowercase()));
+        let tasks = task_done
+            .iter()
+            .enumerate()
+            .map(|(idx, done)| Task {
+                id: format!("{id}#{}", idx + 1),
+                plan_id: id.to_string(),
+                plan_path: path.clone(),
+                line_index: idx,
+                text: format!("task {id}#{}", idx + 1),
+                done: *done,
+            })
+            .collect();
+        plans::Plan {
+            id: id.to_string(),
+            path,
+            depends_on: depends_on.iter().map(|dep| dep.to_string()).collect(),
+            tasks,
+        }
+    }
+
+    fn make_graph(plans: Vec<plans::Plan>) -> PlanGraph {
+        let mut plans_by_id = HashMap::new();
+        let mut tasks_by_id = HashMap::new();
+        for plan in &plans {
+            plans_by_id.insert(plan.id.clone(), plan.clone());
+            for task in &plan.tasks {
+                tasks_by_id.insert(task.id.clone(), task.clone());
+            }
+        }
+        PlanGraph {
+            plans,
+            plans_by_id,
+            tasks_by_id,
+        }
+    }
+
+    #[test]
+    fn run_command_default_exec_enables_force_mode() {
+        let cli = Cli::try_parse_from(["plantool", "run"]).expect("run args should parse");
+        let Commands::Run { exec, .. } = cli.command else {
+            panic!("expected run subcommand");
+        };
+        assert!(exec.contains("--force"));
+    }
+
+    #[test]
+    fn run_command_default_idle_timeout_is_ten_minutes() {
+        let cli = Cli::try_parse_from(["plantool", "run"]).expect("run args should parse");
+        let Commands::Run {
+            idle_timeout_seconds,
+            ..
+        } = cli.command
+        else {
+            panic!("expected run subcommand");
+        };
+        assert_eq!(idle_timeout_seconds, 600);
+    }
+
+    #[test]
+    fn diagnostics_explain_why_no_plan_is_ready() {
+        let graph = make_graph(vec![
+            make_plan("A", &[], &[true]),
+            make_plan("B", &["A"], &[false]),
+            make_plan("C", &["B"], &[false]),
+        ]);
+        let now = Utc::now();
+        let mut claims = ClaimStore::default();
+        claims
+            .claim("PLAN::B", "agent:other", now)
+            .expect("claim should succeed");
+
+        let diagnostics = compute_ready_diagnostics(&graph, &claims, now, "agent:self");
+        assert_eq!(
+            diagnostics,
+            ReadyDiagnostics {
+                open_plans: 2,
+                open_tasks: 2,
+                ready_plans: 0,
+                blocked_by_dependencies: 1,
+                claimed_by_other_owner: 1,
+                claimed_by_self: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn maybe_archive_completed_plan_moves_file_to_done() {
+        let ws = TempWorkspace::new();
+        let plans_dir = ws.root.join("plans");
+        let active_path = plans_dir.join("archive_me_plan.txt");
+        fs::write(&active_path, "Plan-ID: ARCHIVE_ME_PLAN\n- [x] done\n")
+            .expect("write active plan");
+
+        let archived_path =
+            maybe_archive_completed_plan(&ws.root, "ARCHIVE_ME_PLAN").expect("archive result");
+        let archived_path = archived_path.expect("completed plan should be archived");
+
+        assert!(
+            archived_path.starts_with(plans_dir.join("done")),
+            "expected archived path under plans/done"
+        );
+        assert!(!active_path.exists(), "expected source plan to be moved");
+        assert!(archived_path.exists(), "expected archived plan to exist");
+    }
+
+    #[test]
+    fn maybe_archive_completed_plan_keeps_open_plan_in_place() {
+        let ws = TempWorkspace::new();
+        let plans_dir = ws.root.join("plans");
+        let active_path = plans_dir.join("still_open_plan.txt");
+        fs::write(
+            &active_path,
+            "Plan-ID: STILL_OPEN_PLAN\n- [x] done\n- [ ] still open\n",
+        )
+        .expect("write active plan");
+
+        let archived_path =
+            maybe_archive_completed_plan(&ws.root, "STILL_OPEN_PLAN").expect("archive result");
+        assert!(
+            archived_path.is_none(),
+            "incomplete plan should not be archived"
+        );
+        assert!(active_path.exists(), "open plan should remain active");
+    }
+
+    #[test]
+    fn prune_invalid_plans_removes_missing_dependency_chains() {
+        let graph = make_graph(vec![
+            make_plan("VALID", &[], &[false]),
+            make_plan("BROKEN", &["MISSING"], &[false]),
+            make_plan("DOWNSTREAM", &["BROKEN"], &[false]),
+        ]);
+
+        let (pruned, removed) = prune_invalid_plans(graph);
+        assert_eq!(removed, vec!["BROKEN", "DOWNSTREAM"]);
+        assert!(pruned.plans_by_id.contains_key("VALID"));
+        assert!(!pruned.plans_by_id.contains_key("BROKEN"));
+        assert!(!pruned.plans_by_id.contains_key("DOWNSTREAM"));
+    }
+
+    #[test]
+    fn prune_invalid_plans_removes_cycles_and_keeps_valid_nodes() {
+        let graph = make_graph(vec![
+            make_plan("A", &["B"], &[false]),
+            make_plan("B", &["A"], &[false]),
+            make_plan("VALID", &[], &[false]),
+        ]);
+
+        let (pruned, removed) = prune_invalid_plans(graph);
+        assert_eq!(removed, vec!["A", "B"]);
+        assert!(pruned.plans_by_id.contains_key("VALID"));
+        assert!(!pruned.plans_by_id.contains_key("A"));
+        assert!(!pruned.plans_by_id.contains_key("B"));
+    }
 }

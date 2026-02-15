@@ -11,6 +11,12 @@ const COLOR_Z: [u8; 4] = [220, 20, 60, 255];
 const COLOR_J: [u8; 4] = [30, 144, 255, 255];
 const COLOR_L: [u8; 4] = [255, 140, 0, 255];
 
+// Bottomwell earth cell colors
+const COLOR_GARBAGE: [u8; 4] = [90, 80, 70, 255]; // dark brown/grey
+const COLOR_STONE: [u8; 4] = [140, 135, 130, 255]; // grey stone
+const COLOR_ORE: [u8; 4] = [200, 120, 50, 255]; // copper/ore orange
+const COLOR_COIN: [u8; 4] = [255, 230, 50, 255]; // bright gold
+
 pub fn color_for_cell(cell: u8) -> [u8; 4] {
     match cell {
         0 => COLOR_BACKGROUND,
@@ -21,6 +27,10 @@ pub fn color_for_cell(cell: u8) -> [u8; 4] {
         5 => COLOR_Z,
         6 => COLOR_J,
         7 => COLOR_L,
+        8 => COLOR_GARBAGE,
+        9 => COLOR_STONE,
+        10 => COLOR_ORE,
+        11 => COLOR_COIN,
         _ => [255, 255, 255, 255],
     }
 }
@@ -57,6 +67,38 @@ pub fn draw_board_cells(gfx: &mut dyn crate::graphics::Renderer2d, board: &[Vec<
     let offset_x = width.saturating_sub(board_pixel_width) / 2;
     let offset_y = height.saturating_sub(board_pixel_height) / 2;
 
+    draw_board_cells_in_rect(
+        gfx,
+        board,
+        crate::ui::Rect::new(offset_x, offset_y, board_pixel_width, board_pixel_height),
+    );
+}
+
+/// Draw board outline, grid dots, and filled cells at an explicit board rect origin.
+///
+/// `board_rect.w` / `board_rect.h` are currently ignored and board dimensions are derived from
+/// `board` and `CELL_SIZE`. This keeps rendering deterministic while exposing world-offset control.
+pub fn draw_board_cells_in_rect(
+    gfx: &mut dyn crate::graphics::Renderer2d,
+    board: &[Vec<u8>],
+    board_rect: crate::ui::Rect,
+) {
+    if board.is_empty() {
+        return;
+    }
+
+    let size = gfx.size();
+    let width = size.width;
+    let height = size.height;
+
+    let board_height = board.len() as u32;
+    let board_width = board[0].len() as u32;
+
+    let board_pixel_width = board_width.saturating_mul(CELL_SIZE);
+    let board_pixel_height = board_height.saturating_mul(CELL_SIZE);
+    let offset_x = board_rect.x;
+    let offset_y = board_rect.y;
+
     draw_board_outline(
         gfx,
         offset_x,
@@ -71,7 +113,9 @@ pub fn draw_board_cells(gfx: &mut dyn crate::graphics::Renderer2d, board: &[Vec<
             let inverted_y = board_height.saturating_sub(1).saturating_sub(y as u32);
             let pixel_y = offset_y + inverted_y * CELL_SIZE;
 
-            if pixel_x + CELL_SIZE > width || pixel_y + CELL_SIZE > height {
+            if pixel_x.saturating_add(CELL_SIZE) > width
+                || pixel_y.saturating_add(CELL_SIZE) > height
+            {
                 continue;
             }
 

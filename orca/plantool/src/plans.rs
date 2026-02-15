@@ -47,6 +47,72 @@ impl PlanGraph {
         errors
     }
 
+    pub fn plans_with_missing_dependencies(&self) -> HashSet<String> {
+        let mut broken = HashSet::new();
+        for plan in &self.plans {
+            if plan
+                .depends_on
+                .iter()
+                .any(|dep| !self.plans_by_id.contains_key(dep))
+            {
+                broken.insert(plan.id.clone());
+            }
+        }
+        broken
+    }
+
+    pub fn plans_in_cycles(&self) -> HashSet<String> {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Mark {
+            Temp,
+            Perm,
+        }
+
+        fn visit(
+            id: &str,
+            graph: &PlanGraph,
+            marks: &mut HashMap<String, Mark>,
+            stack: &mut Vec<String>,
+            cycle_ids: &mut HashSet<String>,
+        ) {
+            if let Some(mark) = marks.get(id) {
+                if *mark == Mark::Perm {
+                    return;
+                }
+                if *mark == Mark::Temp {
+                    if let Some(idx) = stack.iter().position(|x| x == id) {
+                        for plan_id in &stack[idx..] {
+                            cycle_ids.insert(plan_id.clone());
+                        }
+                        cycle_ids.insert(id.to_string());
+                    }
+                    return;
+                }
+            }
+            marks.insert(id.to_string(), Mark::Temp);
+            stack.push(id.to_string());
+
+            if let Some(plan) = graph.plans_by_id.get(id) {
+                for dep in &plan.depends_on {
+                    if graph.plans_by_id.contains_key(dep) {
+                        visit(dep, graph, marks, stack, cycle_ids);
+                    }
+                }
+            }
+
+            stack.pop();
+            marks.insert(id.to_string(), Mark::Perm);
+        }
+
+        let mut marks = HashMap::new();
+        let mut stack = Vec::new();
+        let mut cycle_ids = HashSet::new();
+        for id in self.plans_by_id.keys() {
+            visit(id, self, &mut marks, &mut stack, &mut cycle_ids);
+        }
+        cycle_ids
+    }
+
     pub fn cycle_errors(&self) -> Vec<String> {
         #[derive(Clone, Copy, PartialEq, Eq)]
         enum Mark {
@@ -111,24 +177,40 @@ impl PlanGraph {
             .map(|p| p.depends_on.iter().all(|dep| self.plan_completed(dep)))
             .unwrap_or(false)
     }
+
+    pub fn without_plans(&self, removed_plan_ids: &HashSet<String>) -> PlanGraph {
+        let plans: Vec<Plan> = self
+            .plans
+            .iter()
+            .filter(|plan| !removed_plan_ids.contains(&plan.id))
+            .cloned()
+            .collect();
+
+        let mut plans_by_id = HashMap::new();
+        let mut tasks_by_id = HashMap::new();
+        for plan in &plans {
+            plans_by_id.insert(plan.id.clone(), plan.clone());
+            for task in &plan.tasks {
+                tasks_by_id.insert(task.id.clone(), task.clone());
+            }
+        }
+
+        PlanGraph {
+            plans,
+            plans_by_id,
+            tasks_by_id,
+        }
+    }
 }
 
 pub fn load_plans(root: &Path) -> Result<PlanGraph> {
     let plans_dir = root.join("plans");
     let mut paths = Vec::new();
     if plans_dir.exists() {
-        for entry in fs::read_dir(&plans_dir).with_context(|| "Failed to read plans directory")? {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let Some(ext) = path.extension().and_then(|x| x.to_str()) else {
-                continue;
-            };
-            if matches!(ext, "txt" | "md") {
-                paths.push(path);
-            }
+        collect_top_level_plan_files(&plans_dir, &mut paths)?;
+        let archived_dir = plans_dir.join("done");
+        if archived_dir.exists() {
+            collect_plan_files_recursive(&archived_dir, &mut paths)?;
         }
     }
     paths.sort();
@@ -166,6 +248,43 @@ pub fn load_plans(root: &Path) -> Result<PlanGraph> {
     })
 }
 
+fn collect_top_level_plan_files(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(dir)
+        .with_context(|| format!("Failed to read plans directory {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() && is_plan_file(&path) {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn collect_plan_files_recursive(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(dir)
+        .with_context(|| format!("Failed to read archived plans directory {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_plan_files_recursive(&path, paths)?;
+            continue;
+        }
+        if path.is_file() && is_plan_file(&path) {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_plan_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|x| x.to_str()),
+        Some("txt" | "md")
+    )
+}
+
 fn parse_plan_file(path: &Path) -> Result<Plan> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("Failed reading plan file {}", path.display()))?;
@@ -186,7 +305,7 @@ fn parse_plan_file(path: &Path) -> Result<Plan> {
             depends_on = value
                 .split(',')
                 .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
+                .filter(|s| !s.is_empty() && !is_no_dependency_marker(s))
                 .map(|s| s.to_string())
                 .collect();
         } else if let Some(task) = parse_task_line(trimmed) {
@@ -260,6 +379,13 @@ fn infer_plan_id(path: &Path) -> String {
     sanitize_id(stem)
 }
 
+fn is_no_dependency_marker(raw: &str) -> bool {
+    raw.eq_ignore_ascii_case("none")
+        || raw.eq_ignore_ascii_case("null")
+        || raw.eq_ignore_ascii_case("n/a")
+        || raw == "-"
+}
+
 fn sanitize_id(raw: &str) -> String {
     raw.chars()
         .map(|c| {
@@ -270,4 +396,93 @@ fn sanitize_id(raw: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    struct TempWorkspace {
+        root: PathBuf,
+    }
+
+    impl TempWorkspace {
+        fn new() -> Self {
+            let nonce = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time should be monotonic")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "plantool_load_plans_{}_{}_{}",
+                std::process::id(),
+                ts,
+                nonce
+            ));
+            fs::create_dir_all(root.join("plans")).expect("create plans directory");
+            Self { root }
+        }
+    }
+
+    impl Drop for TempWorkspace {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn load_plans_includes_done_archive_for_dependency_resolution() {
+        let ws = TempWorkspace::new();
+        let plans = ws.root.join("plans");
+        let archive = plans.join("done").join("2026-02");
+        fs::create_dir_all(&archive).expect("create archive directory");
+
+        fs::write(
+            plans.join("milestone_depth_wall_plan.txt"),
+            "Plan-ID: MILESTONE_DEPTH_WALL_PLAN\nDepends-On: BOTTOMWELL_PLAN\n- [ ] implement wall\n",
+        )
+        .expect("write active plan");
+        fs::write(
+            archive.join("bottomwell_plan.txt"),
+            "Plan-ID: BOTTOMWELL_PLAN\n- [x] done\n",
+        )
+        .expect("write archived dependency plan");
+
+        let graph = load_plans(&ws.root).expect("load plans");
+        assert!(
+            graph.dependency_errors().is_empty(),
+            "expected dependencies to resolve across plans/done"
+        );
+        assert!(graph.plans_by_id.contains_key("MILESTONE_DEPTH_WALL_PLAN"));
+        assert!(graph.plans_by_id.contains_key("BOTTOMWELL_PLAN"));
+    }
+
+    #[test]
+    fn load_plans_treats_none_dependency_marker_as_empty() {
+        let ws = TempWorkspace::new();
+        let plans = ws.root.join("plans");
+        fs::write(
+            plans.join("tetris_lock_delay_plan.txt"),
+            "Plan-ID: TETRIS_LOCK_DELAY_PLAN\nDepends-On: NONE\n- [ ] lock delay\n",
+        )
+        .expect("write plan");
+
+        let graph = load_plans(&ws.root).expect("load plans");
+        let plan = graph
+            .plans_by_id
+            .get("TETRIS_LOCK_DELAY_PLAN")
+            .expect("expected lock delay plan");
+        assert!(
+            plan.depends_on.is_empty(),
+            "NONE marker should not produce a dependency edge"
+        );
+        assert!(
+            graph.dependency_errors().is_empty(),
+            "NONE marker should not trigger dependency errors"
+        );
+    }
 }

@@ -1,10 +1,13 @@
 Headful Runtime Modularization Plan
 ===================================
 
+Plan-ID: HEADFUL_MODULARIZATION_PLAN
+Depends-On: INPUT_FRAMEWORK_ENGINE_MIGRATION_PLAN
+
 Status
-- Current: NOT_STARTED
+- Current: IN_PROGRESS
 - Last Reviewed: 2026-02-14
-- Notes: No `game/src/headful/` module tree exists yet; extraction work has not started.
+- Notes: `game/src/headful/` module tree now exists and major extraction is landed; `headful/main.rs` is reduced but still contains substantial orchestration + gameplay branch logic.
 
 Goal
 - Split `game/src/bin/headful.rs` into focused modules to reduce regression risk and improve iteration speed.
@@ -37,6 +40,16 @@ Design Rules
 - Prefer moving pure functions first, then stateful code.
 - Keep every step compiling and testable.
 - Keep new module APIs narrow and explicit.
+
+Execution Checklist
+- [x] Phase 1: capture baseline parity and add any missing high-risk tests. (Done 2026-02-14: baseline `cargo test -p game --bin headful`; added focused module tests in `headful/input_adapter.rs`, `headful/view_transitions.rs`, and `headful/skilltree_camera.rs`; verified with `cargo test -p game`.)
+- [x] Phase 2: scaffold `game/src/headful/` module files and API boundaries. (Done 2026-02-14: added `mod.rs`, `input_adapter.rs`, `view_transitions.rs`, `skilltree_camera.rs`, `render_pipeline.rs`; wired `pub mod headful;` in `game/src/lib.rs`.)
+- [x] Phase 3: extract pure helpers/constants with behavior-preserving wrappers. (Done 2026-02-14: moved key mapping/action-sfx, view transition/result helpers, and camera mapping/bounds helpers into dedicated modules; kept wrapper callsites in `headful/main.rs`.)
+- [x] Phase 4: extract stateful subsystems (skilltree camera, transitions, input adapter). (Done 2026-02-14: extracted horizontal repeat/input-frame adaptation, view-event transition application helpers, and skilltree drag/zoom/edge-pan/finalize camera behavior into `game/src/headful/*` modules.)
+- [x] Phase 5: extract rendering orchestration to `render_pipeline.rs`. (Done 2026-02-14: moved render draw ordering/overlay/layout-cache orchestration into `game/src/headful/render_pipeline.rs`; `headful/main.rs::render` now delegates.)
+- [ ] Phase 6: reduce `headful.rs` to orchestration-only flow. (Remaining: `process_keyboard_frame`, `update_state` UI/editor match branches, and remote command handling still contain large control-flow blocks in `game/src/bin/headful/main.rs`.)
+- [ ] Phase 7: run test/manual parity passes for controls, drag/zoom, menus, and debug HUD. (Blocked for manual pass in this environment: no interactive windowed session run captured in this execution; automated parity/tests completed via `cargo test -p game`.)
+- [ ] Acceptance: dedicated modules own behavior while runtime behavior remains unchanged. (Pending completion of Phase 6 + manual parity pass in Phase 7.)
 
 Phase 1: Baseline and Safety Net
 - Capture baseline behavior with existing tests and quick manual smoke checks:

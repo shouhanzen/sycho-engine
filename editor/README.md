@@ -10,6 +10,7 @@ running headful game instance, so the timeline reflects the external game you la
 
 ## Run (local)
 - Via `go.sh` (recommended):
+  - If needed once: `chmod +x ./go.sh`
   - Foreground (best for dev): `./go.sh --start --editor`
   - Background: `./go.sh --start --editor --detach` (stop with `./go.sh --stop --editor`)
 
@@ -17,6 +18,22 @@ running headful game instance, so the timeline reflects the external game you la
 - Editor app: `cd editor/frontend && npm install && npm run tauri dev`
 
 Set `VITE_EDITOR_API` to point the UI at a different backend base URL.
+
+## WSL prerequisites
+When running the editor app natively in WSL (Ubuntu), install Linux desktop build dependencies once:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  build-essential \
+  pkg-config \
+  libasound2-dev \
+  libgtk-3-dev \
+  libjavascriptcoregtk-4.0-dev \
+  libwebkit2gtk-4.0-dev \
+  libayatana-appindicator3-dev \
+  librsvg2-dev
+```
 
 ## Timeline behavior
 - Click **Launch Headful Game** in the editor to start the game process.

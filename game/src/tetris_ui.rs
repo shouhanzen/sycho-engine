@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use engine::graphics::Renderer2d;
-use engine::render::{CELL_SIZE, color_for_cell, draw_board_cells};
+use engine::render::{CELL_SIZE, color_for_cell, draw_board_cells_in_rect};
 use engine::ui;
 use engine::ui_tree::UiTree;
 
@@ -176,26 +176,45 @@ pub fn draw_tetris_world(
     height: u32,
     state: &TetrisCore,
 ) -> UiLayout {
+    draw_tetris_world_with_camera_offset(frame, width, height, state, 0)
+}
+
+pub fn draw_tetris_world_with_camera_offset(
+    frame: &mut dyn Renderer2d,
+    width: u32,
+    height: u32,
+    state: &TetrisCore,
+    world_offset_y_px: i32,
+) -> UiLayout {
     let board = state.board();
     let board_h = board.len() as u32;
     let board_w = board.first().map(|r| r.len()).unwrap_or(0) as u32;
     let layout = compute_layout(width, height, board_w, board_h, state.next_queue().len());
+    let world_board_rect = offset_rect_y(layout.board, world_offset_y_px);
 
     // --- Layer 1: background ---
     draw_tile_background(
         frame,
         width,
         height,
-        layout.board,
-        state.lines_cleared(),
+        world_board_rect,
+        state.background_depth_rows(),
         state.background_seed(),
     );
 
     // --- Layer 2: board cells ---
-    draw_board_cells(frame, board);
+    draw_board_cells_in_rect(frame, board, world_board_rect);
 
     // --- Layer 3: active piece + ghost ---
-    draw_ghost_and_active_piece(frame, width, height, layout.board, board_w, board_h, state);
+    draw_ghost_and_active_piece(
+        frame,
+        width,
+        height,
+        world_board_rect,
+        board_w,
+        board_h,
+        state,
+    );
 
     layout
 }
@@ -346,6 +365,15 @@ pub fn draw_tetris(
     let layout = draw_tetris_world(frame, width, height, state);
     draw_tetris_hud(frame, width, height, state, layout);
     layout
+}
+
+fn offset_rect_y(rect: Rect, delta_y_px: i32) -> Rect {
+    let y = if delta_y_px >= 0 {
+        rect.y.saturating_add(delta_y_px as u32)
+    } else {
+        rect.y.saturating_sub(delta_y_px.saturating_abs() as u32)
+    };
+    Rect { y, ..rect }
 }
 
 fn draw_pause_button(

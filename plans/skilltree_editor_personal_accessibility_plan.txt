@@ -1,0 +1,142 @@
+Skilltree Editor Personal Accessibility Plan
+===========================================
+
+Plan-ID: SKILLTREE_EDITOR_PERSONAL_ACCESSIBILITY_PLAN
+Depends-On: INPUT_FRAMEWORK_ENGINE_MIGRATION_PLAN
+
+Status
+- Current: NOT_STARTED
+- Last Reviewed: 2026-02-14
+- Owner: @hanzen (claimed 2026-02-14)
+- Notes: Current editor flow is usable but pointer-heavy and shortcut-discovery is low. Priority is faster, safer, lower-friction authoring for regular personal use.
+
+Goal
+- Make the skilltree editor faster to operate for day-to-day iteration.
+- Reduce misclick/destructive-edit risk while keeping editing flow lightweight.
+- Enable full edit throughput without requiring precise mouse targeting.
+- Preserve current save format and gameplay/progression semantics.
+
+Dependencies
+- Runtime input/edit behavior in `game/src/bin/headful/main.rs`.
+- Editor state/model operations in `game/src/skilltree.rs`.
+- Toolbar/help/status rendering in `game/src/tetris_ui.rs`.
+- UI interaction primitives in `engine/src/ui_tree.rs` (if keyboard focus helpers are added).
+- Coordinate with `plans/headful_modularization_plan.txt` if extraction lands first, so behavior changes are implemented in extracted modules instead of a re-expanded `main.rs`.
+
+Non-Goals
+- No redesign of unlock economics, node effects, or progression persistence schema.
+- No requirement for screen-reader integration in the in-game renderer for v1.
+- No large visual art/style rewrite of the skilltree scene.
+- No migration of all editing to Tauri in this milestone.
+
+Design Rules / Constraints
+- Keyboard-first: every frequent action should be reachable without pointer precision.
+- Reversible-by-default: destructive edits need undo/confirm protection.
+- Low-context-switch: in-editor guidance should avoid requiring external docs.
+- Deterministic behavior: same input sequence should produce same edit result.
+- Small diffs: ship in focused slices with tests per phase.
+
+Current Baseline (for reference)
+- Editor toggle + core shortcuts exist (`F4`, `Tab`, arrows, `N`, `Delete`, `S`, `R`) in `game/src/bin/headful/main.rs`.
+- Tool usage is still heavily mouse-position dependent for world-cell operations.
+- There is no undo/redo for node edits, and delete is immediate.
+- Status text exists but does not act as a structured command/help surface.
+
+Execution Checklist
+- [ ] Phase 1: add direct hotkeys + always-visible compact controls/help overlay.
+- [ ] Phase 2: add camera/navigation accelerators for large trees.
+- [ ] Phase 3: add keyboard cursor and tool-apply actions independent of mouse.
+- [ ] Phase 4: add safety net (undo/redo + delete guardrail).
+- [ ] Phase 5: add high-signal status/selection context and reduced-error connect flow.
+- [ ] Phase 6: add optional productivity QoL commands (duplicate/search/focus).
+- [ ] Phase 7: add unit/headful/render coverage + manual throughput verification.
+- [ ] Acceptance: frequent edit workflows are fast, keyboard-friendly, and resilient to mistakes.
+
+Phase 1: Hotkey Access and Discoverability
+- Add direct tool hotkeys (`1..5`) for Select/Move/Add/Remove/Link.
+- Keep `Tab` cycle as secondary behavior.
+- Add in-scene compact help line (or toggleable help panel with `?`) that lists active shortcuts by mode.
+- Keep text concise and always visible while editor is enabled.
+
+Phase 2: Camera and Navigation Throughput
+- Add camera convenience shortcuts:
+  - reset camera (`0`)
+  - focus selected node (`F`)
+  - optional fast pan step (`Shift+Arrows`) and normal pan with arrows
+- Preserve existing mouse drag/wheel camera behavior.
+- Keep bounds clamp behavior unchanged while adding these shortcuts.
+
+Phase 3: Keyboard Cursor Editing
+- Add editor world cursor state (visible crosshair/outline cell).
+- Add cursor movement keys (reuse arrows when in cursor mode, or alternative mapping if pan remains on arrows).
+- Add apply keys (`Enter`/`Space`) to execute current tool at cursor world cell.
+- Support pointer + keyboard mixed workflow (cursor does not disable mouse path).
+
+Phase 4: Undo/Redo and Delete Safety
+- Add lightweight undo/redo stack for editor mutations:
+  - create/delete node
+  - move node
+  - add/remove cell
+  - toggle prereq
+- Add `Ctrl+Z` undo and `Ctrl+Y` redo.
+- Add delete guardrail:
+  - either confirm step, or "pending delete until next confirm keypress"
+  - keep flow fast while preventing accidental loss
+
+Phase 5: High-Signal Context and Linking UX
+- Expand status text to include:
+  - active tool
+  - selected node id/name
+  - unsaved state marker
+  - connect-source state when link mode is active
+- Improve link-mode flow:
+  - explicit "source set" feedback
+  - allow repeated target toggles until source is cleared
+- Keep save/reload status paths intact and explicit.
+
+Phase 6: Personal Productivity QoL (Optional but Valuable)
+- Add duplicate-selected-node command with deterministic id naming.
+- Add jump/search command by node id/name (quick focus/selection).
+- Add nudge-selected-node shortcuts for one-cell deterministic moves.
+- Gate each command behind clear keybinds shown in help overlay.
+
+Phase 7: Verification
+- Unit tests (`game/src/skilltree.rs`) for undo/redo stack correctness and mutation reversibility.
+- Headful behavior tests (`game/src/bin/headful/headful_tests.rs`) for:
+  - hotkey-to-tool behavior
+  - keyboard cursor editing flow
+  - undo/redo and delete guardrail behavior
+  - camera shortcut behavior
+- Render/UI tests (`game/tests/tetris_ui_tests.rs`) for visible help/status/cursor indicators.
+- Manual throughput checks with control surface:
+  - `./go.sh --start --game --headful`
+  - author a small tree edit session using keyboard-first flow
+  - verify save/reload roundtrip and no accidental destructive actions
+
+Acceptance Criteria
+- Frequent actions (tool switch, move, edit cells, link, save) can be completed quickly without precise mouse operations.
+- Editor exposes enough in-scene help that key workflows are discoverable without external notes.
+- Undo/redo reliably restores prior editor state for supported mutations.
+- Delete path has a guardrail that meaningfully reduces accidental loss.
+- Existing persistence and runtime behavior remain deterministic and stable.
+
+Risks and Mitigations
+- Risk: keybind collisions with existing gameplay/view controls.
+  - Mitigation: scope keybinds to `GameView::SkillTree` + editor-enabled state and document precedence.
+- Risk: undo stack memory growth on long sessions.
+  - Mitigation: cap history depth and store compact snapshots/deltas.
+- Risk: keyboard cursor introduces control ambiguity with camera pan.
+  - Mitigation: explicit mode indicator and clear mapping rules in help/status.
+- Risk: extra HUD text increases visual clutter.
+  - Mitigation: compact one-line default + expandable help panel.
+
+Open Decisions
+- Cursor movement mapping: dedicated mode toggle vs always-on cursor keys.
+- Delete guardrail choice: confirm keypress vs one-step soft delete.
+- Undo implementation shape: full snapshot stack vs command/delta log.
+- Search UX scope: id-only in v1 vs id + name fuzzy match.
+
+Future Extensions
+- Personalized keybind remapping persisted in a local config file.
+- Macro actions for common edit patterns (duplicate-and-link chains).
+- Optional external editor bridge path for bulk graph edits with import/export.

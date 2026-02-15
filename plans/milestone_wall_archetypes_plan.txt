@@ -1,0 +1,146 @@
+Milestone Wall Archetypes Plan
+==============================
+
+Plan-ID: MILESTONE_WALL_ARCHETYPES_PLAN
+Depends-On: MILESTONE_DEPTH_WALL_PLAN
+
+Status
+- Current: NOT_STARTED
+- Last Reviewed: 2026-02-14
+- Notes: Base milestone wall plan defines one HP-gated wall flow. Archetype behavior, telegraphing, and reward variety are not implemented.
+
+Goal
+- Extend milestone walls into distinct encounter archetypes with unique rules:
+  - Regen Wall
+  - Timed Wall
+  - Combo Wall
+- Keep wall encounters deterministic and readable.
+- Add archetype-specific telegraphing and deterministic reward drops to strengthen progression moments.
+
+Dependencies
+- `game/src/tetris_core.rs` for line-clear outcomes and depth progression lock integration.
+- `game/src/state.rs` for runtime encounter state.
+- `game/src/tetris_ui.rs` and `game/src/tetris_ui/menus.rs` for HUD feedback and encounter messaging.
+- `game/src/bin/headful/main.rs` for update loop wiring and transition event cues.
+- `plans/milestone_depth_wall_plan.txt` for baseline wall activation/persistence contracts.
+
+Non-Goals
+- No redesign of the baseline wall trigger depths in this milestone.
+- No procedural boss AI beyond deterministic archetype rules.
+- No live content authoring tool for archetypes in v1.
+
+Design Rules
+- Preserve baseline contract: depth progression is paused while an active wall is unresolved.
+- Keep archetype logic data-driven through wall definitions, not hardcoded switch logic spread across files.
+- Deterministic rule: same seed + same input timeline yields same wall behavior and reward outcome.
+- Telegraphing rule: players should always understand why damage did or did not apply.
+- Keep first release narrow: 3 archetypes only, with clear defaults and caps.
+
+Archetype Contract (v1)
+- `Standard`: baseline HP wall behavior from `MILESTONE_DEPTH_WALL_PLAN`.
+- `RegenWall`:
+  - heals at fixed deterministic intervals while active
+  - regen pauses briefly after taking valid damage
+- `TimedWall`:
+  - has an encounter timer/turn budget
+  - failing timer applies explicit penalty (for example HP reset, partial depth rollback, or lock extension)
+- `ComboWall`:
+  - requires combined attack damage for a clear event to meet a threshold before any HP is removed
+  - sub-threshold attacks do zero wall damage (clear UI feedback required)
+  - example: if `combo_gate_damage = 6`, a 2-line clear with low bonus fails, while a stronger multi-clear burst succeeds
+
+Execution Checklist
+- [ ] Phase 1: add wall archetype data model and runtime encounter state extensions.
+- [ ] Phase 2: add canonical wall attack damage model shared by all archetypes.
+- [ ] Phase 3: implement Regen Wall rules and telegraphing.
+- [ ] Phase 4: implement Timed Wall rules and fail-state handling.
+- [ ] Phase 5: implement Combo Wall threshold-gate logic and feedback.
+- [ ] Phase 6: add archetype reward drops and persistence integration.
+- [ ] Phase 7: add deterministic/unit/integration/manual coverage and tuning pass.
+- [ ] Acceptance: milestone walls support deterministic archetypes with clear feedback and rewards.
+
+Phase 1: Data Model + Runtime Shape
+- Extend wall definition model with archetype fields (example):
+  - `WallArchetype::Standard`
+  - `WallArchetype::Regen { regen_per_tick, tick_interval_rows_or_events, damage_grace_events }`
+  - `WallArchetype::Timed { timer_events, fail_mode }`
+  - `WallArchetype::Combo { combo_gate_damage }`
+- Extend active encounter runtime with archetype-local state:
+  - regen cooldown/tick accumulator
+  - timed remaining counter
+  - last attack outcome (`Applied`, `BlockedByComboGate`, etc.)
+- Keep persistence of `broken_walls` compatible; archetype data remains in definitions.
+
+Phase 2: Canonical Attack Damage Model
+- Define one wall damage input value per clear event (example `wall_attack_damage`):
+  - starts from line-clear base damage
+  - includes configured multi-clear bonus
+  - can include future skill modifiers without rewriting archetypes
+- Ensure all archetypes consume this same value.
+- Add explicit debug/HUD hook to surface last computed attack damage.
+
+Phase 3: Regen Wall
+- Apply fixed regen ticks while wall is active.
+- Add grace period after successful damage events to avoid immediate full negation.
+- Clamp regen so HP never exceeds configured max.
+- HUD feedback:
+  - "REGENERATING" indicator
+  - optional pulse cue on regen ticks
+
+Phase 4: Timed Wall
+- Track deterministic encounter timer budget in event-space (prefer line-clear/piece-lock ticks, not frame-time).
+- On timeout, apply configured fail action:
+  - v1 recommended default: reset wall HP to full and continue lock state
+- Show visible timer state in HUD.
+- Emit explicit fail cue so outcome is understandable.
+
+Phase 5: Combo Wall (Your Gate Idea)
+- Combo gate rule:
+  - if `wall_attack_damage < combo_gate_damage`, apply `0` wall damage
+  - if `wall_attack_damage >= combo_gate_damage`, apply full damage normally
+- Add clear blocked-hit feedback:
+  - "COMBO TOO WEAK" style indicator
+  - show current attack vs required threshold
+- Optional extension point (not v1 default):
+  - short combo carry buffer where consecutive strong clears accumulate.
+
+Phase 6: Archetype Rewards
+- Add deterministic wall reward drop model in definitions:
+  - score bonus
+  - money bonus
+  - ore/coin bonus
+  - optional one-run buff token (if enabled later)
+- Apply reward once on wall break and include in run-end payout inputs.
+- Record reward event for UI/debug summaries.
+
+Phase 7: Tests + Tuning
+- Unit tests:
+  - archetype state transitions and invariants
+  - combo gate behavior at threshold boundaries
+  - regen/timer rules and clamping
+- Integration tests:
+  - depth remains locked until archetype wall is broken
+  - same seed + input gives same archetype timeline
+  - wall reward applied once and persisted as broken
+- Manual checks:
+  - each archetype communicates rules clearly in HUD
+  - no soft-lock/confusion in long encounters
+
+Acceptance Criteria
+- Milestone walls can be configured as Standard, Regen, Timed, or Combo.
+- Combo walls enforce a deterministic damage threshold gate as designed.
+- Archetype feedback makes blocked hits, regen, and timer pressure obvious.
+- Wall-break rewards are deterministic, applied once, and available for run-end economy.
+
+Risks and Mitigations
+- Risk: archetypes become overly punishing and stall progression.
+  - Mitigation: conservative defaults and early tuning sessions per archetype.
+- Risk: timer implementation tied to frame-time causes nondeterminism.
+  - Mitigation: use event-based counters for encounter timing.
+- Risk: combo gate feels opaque.
+  - Mitigation: explicit required/current damage HUD feedback each hit.
+
+Open Decisions
+- Timed wall fail mode default: HP reset, partial reset, or alternate penalty?
+- Combo gate basis: strictly single clear-event damage, or allow short carry-over buffer?
+- Should reward drops vary by archetype tier or stay flat in v1?

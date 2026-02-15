@@ -1,0 +1,137 @@
+Run Resource Economy Bridge Plan
+================================
+
+Plan-ID: RUN_RESOURCE_ECONOMY_BRIDGE_PLAN
+Depends-On: BOTTOMWELL_SKILL_PROGRESSION_PLAN, MILESTONE_DEPTH_WALL_PLAN
+
+Status
+- Current: NOT_STARTED
+- Last Reviewed: 2026-02-14
+- Notes: Run-end money currently uses a simple score/lines formula and does not expose an explicit per-resource payout breakdown.
+
+Goal
+- Unify run rewards behind one deterministic payout model that combines:
+  - score
+  - lines cleared
+  - ore collected
+  - coins collected
+  - depth reached
+  - milestone walls broken
+- Apply one canonical payout calculation regardless of how a run ends.
+- Add a clear Game Over payout breakdown UI so players can understand how rewards were earned.
+
+Dependencies
+- `game/src/tetris_core.rs` for source metrics (`score`, `lines_cleared`, `ore_collected`, `coins_collected`, `background_depth_rows`).
+- `game/src/headful/view_transitions.rs` for run-end money calculation entry point.
+- `game/src/bin/headful/main.rs` for run-end award triggers (`EndRun`, timer expiry).
+- `game/src/tetris_ui/menus.rs` for Game Over panel and payout rows.
+- `game/src/state.rs` for storing/transporting run-end payout snapshot data if needed.
+- `plans/milestone_depth_wall_plan.txt` for wall-break progression state that contributes `walls_broken`.
+
+Non-Goals
+- No rebalance of all skilltree costs in this milestone.
+- No live in-run payout panel; scope is run-end breakdown only.
+- No online/global leaderboard economy integration.
+
+Design Rules
+- One source of truth: payout is computed by one pure helper and reused by all run-end paths.
+- Deterministic output: same run metrics must always produce the same payout result.
+- Idempotent award path: money must be granted once per run end, never double-counted.
+- Explainability first: UI should present both components and total.
+- Conservative defaults: initial multipliers should avoid inflation spikes.
+
+Core Contract (v1)
+- Introduce a run-end payout summary model (example):
+  - `RunPayoutBreakdown { score_part, lines_part, ore_part, coin_part, depth_part, walls_part, total }`
+- Define a canonical input model (example):
+  - `RunPayoutInputs { score, lines, ore, coins, depth_rows, walls_broken }`
+- Calculation policy:
+  - pure function from `RunPayoutInputs` to `RunPayoutBreakdown`
+  - saturating math on all arithmetic
+  - fixed tuning constants (with optional env overrides later)
+
+Execution Checklist
+- [ ] Phase 1: add payout input/breakdown models and pure calculator helper.
+- [ ] Phase 2: wire canonical input collection from run state (including wall break count).
+- [ ] Phase 3: route all run-end award callsites through one payout path.
+- [ ] Phase 4: add Game Over payout breakdown UI rows and total.
+- [ ] Phase 5: add tests for formula determinism, saturation, and one-time award semantics.
+- [ ] Phase 6: manual tuning pass and readability pass on Game Over panel.
+- [ ] Acceptance: run-end rewards use one transparent payout model and are visibly broken down in UI.
+
+Phase 1: Payout Data Model + Pure Calculator
+- Add a small, pure payout module (or equivalent helper in `headful/view_transitions.rs`):
+  - `collect_run_payout_inputs(state, wall_stats) -> RunPayoutInputs`
+  - `compute_run_payout(inputs) -> RunPayoutBreakdown`
+- Keep constants grouped together and documented.
+- Add explicit token labels to support stable UI rendering and tests.
+
+Phase 2: Input Collection Contract
+- Source metrics from `TetrisCore` getters:
+  - `score()`
+  - `lines_cleared()`
+  - `ore_collected()`
+  - `coins_collected()`
+  - `background_depth_rows()`
+- Add wall metric source:
+  - `walls_broken_this_run` from milestone wall runtime state.
+- Decide and lock whether depth contribution uses current depth or max depth reached; keep it explicit.
+
+Phase 3: Unified Award Path
+- Replace ad-hoc run-end money conversion with canonical breakdown total in:
+  - pause menu End Run action path
+  - timer-expired Game Over path
+- Ensure award is applied once even if repeated transition events occur in a short window.
+- Store last payout breakdown in state scoped to current run-end so UI can display exact values.
+
+Phase 4: Game Over Breakdown UI
+- Extend Game Over panel to include:
+  - Score contribution
+  - Lines contribution
+  - Ore contribution
+  - Coin contribution
+  - Depth contribution
+  - Walls broken contribution
+  - Final total
+- Keep panel readable on current target resolutions (do not overlap primary buttons).
+- Use compact formatting and fixed row order for easy scanability.
+
+Phase 5: Tests
+- Unit tests for payout calculator:
+  - deterministic result for same inputs
+  - each component contributes correctly
+  - saturation behavior for large values
+- Headful/runtime tests:
+  - End Run and timer Game Over paths use same payout function
+  - payout is not double-awarded
+- UI/render tests:
+  - Game Over payout rows are present with stable labels/tokens.
+
+Phase 6: Tuning + Manual Verification
+- Tune initial weights for:
+  - depth contribution
+  - wall-break contribution
+  - ore/coin contribution relative to score/lines
+- Manual checks:
+  - low-score run still has understandable payout
+  - resource-heavy run clearly reflects ore/coin/wall value
+  - panel remains readable and button interactions unaffected
+
+Acceptance Criteria
+- All run-end reward paths use one shared deterministic payout calculation.
+- Payout includes score, lines, ore, coins, depth, and walls broken.
+- Game Over screen shows a clear per-component reward breakdown and total.
+- No duplicate payout grant on repeated run-end transitions.
+
+Risks and Mitigations
+- Risk: economy inflation from stacking many payout components.
+  - Mitigation: conservative defaults + tuning pass with representative runs.
+- Risk: stale metrics shown if payout snapshot is not captured at transition time.
+  - Mitigation: capture immutable payout breakdown at run-end event boundary.
+- Risk: Game Over panel clutter.
+  - Mitigation: compact row layout and stable typography spacing.
+
+Open Decisions
+- Should depth payout use current depth at end-run or maximum depth reached during run?
+- Should wall-break payout be flat per wall or scaled by wall archetype tier?
+- Should payout constants be env-tunable in v1 or fixed until post-playtest tuning?

@@ -22,6 +22,7 @@ pub struct TetrisLogic {
     available_pieces: Vec<Piece>,
     gravity_enabled: bool,
     score_bonus_per_line: u32,
+    bottomwell_enabled: bool,
 }
 
 impl TetrisLogic {
@@ -31,6 +32,7 @@ impl TetrisLogic {
             available_pieces,
             gravity_enabled: false,
             score_bonus_per_line: 0,
+            bottomwell_enabled: false,
         }
     }
 
@@ -43,6 +45,11 @@ impl TetrisLogic {
         self.score_bonus_per_line = bonus;
         self
     }
+
+    pub fn with_bottomwell(mut self, enabled: bool) -> Self {
+        self.bottomwell_enabled = enabled;
+        self
+    }
 }
 
 impl GameLogic for TetrisLogic {
@@ -52,6 +59,7 @@ impl GameLogic for TetrisLogic {
     fn initial_state(&self) -> Self::State {
         let mut core = TetrisCore::new(self.seed);
         core.set_available_pieces(self.available_pieces.clone());
+        core.set_bottomwell_enabled(self.bottomwell_enabled);
         core.initialize_game();
         GameState::new(core)
     }

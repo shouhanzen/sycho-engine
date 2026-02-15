@@ -207,10 +207,28 @@ to_native_path() {
 }
 
 is_windows() {
+  if is_wsl; then
+    return 1
+  fi
   case "$(uname -s 2>/dev/null || echo "")" in
     MINGW*|MSYS*|CYGWIN*) return 0 ;;
   esac
   [[ "${OS:-}" == "Windows_NT" ]]
+}
+
+is_wsl() {
+  if [[ -n "${WSL_INTEROP:-}" ]] || [[ -n "${WSL_DISTRO_NAME:-}" ]]; then
+    return 0
+  fi
+
+  local kernel_release
+  kernel_release="$(uname -r 2>/dev/null || echo "")"
+  kernel_release="$(printf "%s" "$kernel_release" | tr '[:upper:]' '[:lower:]')"
+  case "$kernel_release" in
+    *microsoft*|*wsl*) return 0 ;;
+  esac
+
+  return 1
 }
 
 resolve_powershell() {

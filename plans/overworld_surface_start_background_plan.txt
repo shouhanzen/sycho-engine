@@ -1,0 +1,103 @@
+Overworld Surface Start Background Plan
+======================================
+
+Plan-ID: OVERWORLD_SURFACE_START_BACKGROUND_PLAN
+Depends-On: BIOME_TRANSITION_PARALLAX_LAYERS_PLAN, BOTTOMWELL_PLAN
+
+Status
+- Current: NOT_STARTED
+- Last Reviewed: 2026-02-14
+- Notes: Current background starts in underground biomes at run start because shallow depths are mapped to Dirt.
+
+Goal
+- Make a new run start in an overworld look (sky-forward palette with light cloud/haze motifs).
+- Transition into underground earth visuals only after digging begins.
+- Preserve deterministic rendering, gameplay readability, and frame pacing.
+
+Dependencies
+- `game/src/background.rs` for biome model, palettes, blend windows, and layer draw logic.
+- `game/src/tetris_ui.rs` for the depth signal passed into `draw_tile_background`.
+- `game/src/tetris_core.rs` for canonical dig-depth progression (`earth_depth`, line clear reveal flow).
+- Coordinate thresholds with `plans/performance_budget_hud_profiler_plan.txt` so visual upgrades stay budget-aware.
+
+Design Rules
+- Overworld state is the default at run start (before first dig-progress event).
+- Earth transition is smooth (no one-frame flash from sky to dirt).
+- Transition direction should visually imply digging downward (earth emerges from below).
+- Same seed + same depth + same input timeline must yield identical background output.
+- Added visuals stay within current frame budget targets.
+
+Execution Checklist
+- [ ] Phase 1: lock depth contract for "dig progress" and surface orientation.
+- [ ] Phase 2: add Overworld biome palette and low-noise sky motifs.
+- [ ] Phase 3: add Overworld -> Dirt transition band while preserving Dirt -> Stone progression.
+- [ ] Phase 4: wire depth source into tetris render path and add tuning hooks.
+- [ ] Phase 5: add tests for start-state overworld, transition timing, and determinism.
+- [ ] Phase 6: run manual readability/performance passes and tune defaults.
+- [ ] Acceptance: run starts in overworld visuals and earth appears only after digging starts.
+
+Phase 1: Depth Contract and Orientation
+- Define a canonical background depth input named `dig_progress_rows`:
+  - preferred source: `TetrisCore::earth_depth()` normalized by initial prefill rows
+  - fallback: `lines_cleared()` only if parity constraints require it
+- Add a helper API for clarity:
+  - `TetrisCore::background_depth_rows() -> u32` (or equivalent pure helper)
+- Verify vertical mapping direction in `draw_tile_layer()` and explicitly lock reveal direction:
+  - target v1: earth contribution increases from the lower board region as digging progresses.
+
+Phase 2: Overworld Biome Definition
+- Extend `BackgroundBiome` with `Overworld`.
+- Add `PALETTE_OVERWORLD` (sky base + cloud/haze accents, low contrast).
+- Keep motif density lower than Dirt/Stone to preserve board/piece readability.
+- If needed, add one simple sky motif kind (for example `Cloud`) under existing layer toggles.
+
+Phase 3: Transition Model
+- Expand biome bands to include:
+  - Overworld -> Dirt transition near surface depth
+  - Existing Dirt -> Stone transition at deeper depth
+- Keep blend-window semantics consistent with existing `BiomeBlendInfo` behavior.
+- Set default surface blend window wide enough to avoid abrupt jumps during the first few clears.
+
+Phase 4: Integration and Tuning Surface
+- Update `draw_tetris_world()` to pass canonical dig-progress depth into `draw_tile_background`.
+- Add env overrides for quick tuning:
+  - surface transition center/depth
+  - surface blend half-width
+  - optional switch to force legacy underground start for regression checks
+- Cache defaults with `OnceLock` to match current background toggle behavior.
+
+Phase 5: Tests
+- Unit tests in `game/src/background.rs`:
+  - depth 0 renders Overworld as primary biome
+  - early dig-progress increments begin increasing Dirt contribution
+  - deterministic biome/tile sampling still holds with Overworld included
+- Integration-level draw tests:
+  - frame at start differs from frame after initial digging steps in expected direction
+  - transition remains gradual across consecutive depths
+
+Phase 6: Manual Verification and Budget Check
+- Manual checks:
+  - start new run shows clear sky/overworld background
+  - earth visuals appear only after digging progression begins
+  - board readability remains clear in both states
+- Profiling checks:
+  - compare frame timing before/after Overworld addition
+  - confirm no sustained warn/critical budget status during representative play
+
+Acceptance Criteria
+- New runs begin with a clear overworld/sky visual identity.
+- Underground earth visuals are not present at depth start and appear only as digging progresses.
+- Transition to earth is smooth and deterministic.
+- No regressions in board readability, controls, or frame pacing.
+
+Risks and Mitigations
+- Risk: transition direction feels inverted relative to gameplay.
+  - Mitigation: lock orientation in Phase 1 and add explicit transition-direction tests.
+- Risk: sky palette reduces piece contrast.
+  - Mitigation: tune palette contrast and reduce motif noise before enabling by default.
+- Risk: wrong depth source triggers earth too early or too late.
+  - Mitigation: centralize depth mapping behind one helper and test first-dig boundaries.
+
+Open Decisions
+- Should earth begin appearing immediately after first reveal, or after a short grace window (for example 2-3 rows)?
+- Should v1 include a visible horizon band, or keep full-sky overworld for simplicity?

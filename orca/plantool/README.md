@@ -8,6 +8,7 @@ It treats checklist items (`- [ ]` / `- [x]`) as executable task nodes and suppo
 - ready task listing
 - task claiming with lease state
 - marking checklist items complete in-place
+- auto-archiving fully completed plans into `plans/done/`
 - looped execution with guardrails
 - live passthrough streaming of agent output per task
 - stream-json output is rendered into concise readable event lines
@@ -64,7 +65,7 @@ cargo run -p plantool -- run \
   --max-steps 100 \
   --max-minutes 60 \
   --sleep-seconds 5 \
-  --idle-timeout-seconds 300 \
+  --idle-timeout-seconds 600 \
   --exec "cursor-agent --print --output-format stream-json --stream-partial-output 'You are executing plan {plan_id} from {plan_path}.\n\nComplete as much of this plan as you can in this single run.\nIf you finish items, update checklist markers in the plan file.\nIf blocked, leave clear notes in the plan file.\n\nOpen checklist items ({pending_count}):\n{open_tasks}\n\nFull plan text:\n{plan_text}'" \
   --auto-complete-on-success
 ```
@@ -81,10 +82,12 @@ Defaults for `plan run`:
 - `--max-steps 100`
 - `--max-minutes 60`
 - `--sleep-seconds 5`
-- `--idle-timeout-seconds 300`
-- `--exec "cursor-agent --print --output-format stream-json --stream-partial-output 'You are executing plan {plan_id} from {plan_path}.\n\nComplete as much of this plan as you can in this single run.\nIf you finish items, update checklist markers in the plan file.\nIf blocked, leave clear notes in the plan file.\n\nOpen checklist items ({pending_count}):\n{open_tasks}\n\nFull plan text:\n{plan_text}'"`
+- `--idle-timeout-seconds 600`
+- `--exec "cursor-agent --print --force --output-format stream-json --stream-partial-output 'You are executing plan {plan_id} from {plan_path}.\n\nComplete as much of this plan as you can in this single run.\nIf you finish items, update checklist markers in the plan file.\nIf blocked, leave clear notes in the plan file.\n\nOpen checklist items ({pending_count}):\n{open_tasks}\n\nFull plan text:\n{plan_text}'"`
 
-On Windows, `plan run` executes task commands through native PowerShell.
+`plan run` executes task commands through `bash -lc` (native on WSL/Linux).
+
+When `plan run` is started without `--watch` and nothing is currently ready, it exits with a readiness summary (open tasks, dependency blockers, and claims) plus a hint to run `plan list --ready` or `plan run --watch`.
 
 If output is idle for `--idle-timeout-seconds`, `plan run` restarts `cursor-agent` with `--continue` and a short resume prompt asking it to diagnose the stall and continue from current state (it does not resend the full plan prompt on resume).
 

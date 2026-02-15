@@ -1,6 +1,8 @@
 Performance Budget HUD and Profiler Plan
 ========================================
 
+Plan-ID: PERFORMANCE_BUDGET_HUD_PROFILER_PLAN
+
 Status
 - Current: NOT_STARTED
 - Last Reviewed: 2026-02-14
@@ -32,6 +34,15 @@ Design Rules
 - Warnings should be visible but non-disruptive during normal play.
 - Profiling output should include pass/fail summaries for CI or scripted checks.
 - Overhead of budget checks must be negligible.
+
+Execution Checklist
+- [ ] Phase 1: add budget model types and threshold classifier logic.
+- [ ] Phase 2: add budget status lines and aggregate warning/critical summary to `DebugHud`.
+- [ ] Phase 3: add env-configurable threshold overrides with safe fallback parsing.
+- [ ] Phase 4: extend `game/src/bin/profile.rs` with budget-aware pass/fail output.
+- [ ] Phase 5: add budget health counters and include them in HUD/profile reports.
+- [ ] Phase 6: add unit/snapshot tests plus manual threshold-smoke verification.
+- [ ] Acceptance: HUD and profile outputs both expose budget status with minimal runtime overhead.
 
 Phase 1: Budget Model and Evaluation
 - Add budget types in `game/src/debug.rs` (or shared module):

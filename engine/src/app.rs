@@ -322,8 +322,8 @@ pub trait GameApp {
         _ctx: &mut AppContext,
         _control_flow: &mut ControlFlow,
     ) -> bool {
-        // Reserve this for non-input app events. Engine-owned keyboard/mouse state is provided
-        // via `InputFrame` during `update_state`.
+        // Lifecycle-only hook: use this for close/exit flow, redraw cadence, and loop teardown.
+        // Gameplay/UI keyboard+mouse decisions should read from `InputFrame` in `update_state`.
         false
     }
 }
@@ -382,7 +382,7 @@ fn create_app_context(
         };
 
     let pixels = if let Some(mode) = config.present_mode {
-        match std::panic::catch_unwind(|| build_pixels(Some(mode))) {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_pixels(Some(mode)))) {
             Ok(res) => res?,
             Err(_) => {
                 eprintln!(

@@ -1,10 +1,12 @@
 Bottomwell Mechanic Plan
 ========================
 
+Plan-ID: BOTTOMWELL_PLAN
+
 Status
-- Current: NOT_STARTED
+- Current: DONE
 - Last Reviewed: 2026-02-14
-- Notes: No bottomwell fields or row-generation/reveal helpers are present in `tetris_core` yet.
+- Notes: All phases implemented. 12 new bottomwell tests pass. Headful wired with bottomwell enabled.
 
 Goal
 - Add an endless "bottomwell" where the board always keeps 3 earth/garbage rows at the bottom.
@@ -16,6 +18,16 @@ Design Rules
 - Bottomwell target is always 3 rows at y=0..2.
 - After clearing N lines, reveal N earth rows from below.
 - Keep deterministic generation by using run seed + depth index.
+
+Execution Checklist
+- [x] Phase 1: add bottomwell fields and cell-id constants in `game/src/tetris_core.rs`. (done: CELL_GARBAGE/STONE/ORE/COIN constants, bottomwell_enabled/bottomwell_rows/earth_depth/ore_collected/coins_collected fields)
+- [x] Phase 2: implement deterministic `generate_earth_row(depth)` with playability constraints. (done: seed+depth mixed RNG, 1-2 holes, depth-scaling ore/coin rates)
+- [x] Phase 3: wire reveal pipeline into line-clear flow and keep board height constant. (done: reveal_earth_lines + ensure_bottomwell_floor called after clear_lines when enabled)
+- [x] Phase 4: initialize new games with bottomwell prefill rows. (done: prefill_bottomwell called in initialize_game when enabled)
+- [x] Phase 5: add render colors for new bottomwell cell IDs in `engine/src/render.rs`. (done: COLOR_GARBAGE/STONE/ORE/COIN added to color_for_cell)
+- [x] Phase 6: add minimal ore/coin reward hook during line clears. (done: ore=50pts, coin=200pts, ore_collected/coins_collected tracked)
+- [x] Phase 7: add deterministic/reveal/board-height regression tests. (done: 12 tests in bottomwell_tests module, all pass)
+- [x] Acceptance: bottomwell rows persist at floor and line clears reveal depth rows deterministically. (verified: all tests pass, headful binary compiles with bottomwell enabled)
 
 Phase 1: Data Model
 - In `game/src/tetris_core.rs`, add:

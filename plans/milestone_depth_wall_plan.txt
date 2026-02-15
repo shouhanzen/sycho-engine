@@ -1,6 +1,9 @@
 Milestone Depth Wall Progression Plan
 =====================================
 
+Plan-ID: MILESTONE_DEPTH_WALL_PLAN
+Depends-On: BOTTOMWELL_PLAN, BIOME_TRANSITION_PARALLAX_LAYERS_PLAN
+
 Status
 - Current: NOT_STARTED
 - Last Reviewed: 2026-02-14
@@ -32,6 +35,15 @@ Design Rules
 - Persistent progression stored in a stable save format (versioned).
 - Wall system should be data-driven so milestone list and HP can be tuned without deep code edits.
 - Paused depth progression must be obvious in HUD/feedback to avoid player confusion.
+
+Execution Checklist
+- [ ] Phase 1: add wall definition/runtime state plus persistent `broken_walls` model.
+- [ ] Phase 2: implement activation checks and trigger-to-active wall transition.
+- [ ] Phase 3: apply wall damage from line clears and unblock depth progression on break.
+- [ ] Phase 4: surface active wall state in HUD/editor snapshot fields.
+- [ ] Phase 5: expose tuning knobs for wall HP and per-line damage.
+- [ ] Phase 6: add unit/integration/manual coverage for activation, pause, break, and persistence.
+- [ ] Acceptance: milestone walls gate depth progression and stay permanently broken once cleared.
 
 Phase 1: Data Model and Persistence
 - Add wall definition model (for tuning):

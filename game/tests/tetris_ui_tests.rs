@@ -5,12 +5,16 @@ use engine::ui;
 use engine::ui_tree::{UiInput, UiTree};
 
 use game::skilltree::SkillTreeRuntime;
-use game::tetris_core::{BOARD_HEIGHT, BOARD_WIDTH, Piece, TetrisCore, Vec2i};
+use game::tetris_core::{
+    BOARD_HEIGHT, BOARD_WIDTH, DEFAULT_BOTTOMWELL_ROWS, Piece, TetrisCore, Vec2i,
+};
 use game::tetris_ui::{
     MAIN_MENU_TITLE, draw_game_over_menu, draw_main_menu, draw_main_menu_with_ui, draw_pause_menu,
-    draw_skilltree, draw_skilltree_runtime_with_ui, draw_tetris, draw_tetris_world,
+    draw_skilltree, draw_skilltree_runtime_with_ui, draw_tetris, draw_tetris_hud_with_ui,
+    draw_tetris_world,
+    draw_tetris_world_with_camera_offset,
 };
-use game::ui_ids::UI_CANVAS;
+use game::ui_ids::{UI_CANVAS, UI_TETRIS_PAUSE};
 
 #[test]
 fn draw_tetris_renders_hold_panel_outside_board_area() {
@@ -88,17 +92,23 @@ fn draw_tetris_world_background_scrolls_when_depth_increases() {
 
     let mut core_depth0 = TetrisCore::new(2026);
     core_depth0.set_available_pieces(Piece::all());
+    core_depth0.set_bottomwell_enabled(true);
     core_depth0.initialize_game();
 
     let mut core_depth1 = TetrisCore::new(2026);
     core_depth1.set_available_pieces(Piece::all());
+    core_depth1.set_bottomwell_enabled(true);
     core_depth1.initialize_game();
 
+    let target_y = DEFAULT_BOTTOMWELL_ROWS;
     for x in 0..BOARD_WIDTH {
-        core_depth1.set_cell(x, 0, 1);
+        core_depth1.set_cell(x, target_y, 1);
     }
     assert_eq!(core_depth1.clear_lines(), 1);
-    assert_eq!(core_depth1.lines_cleared(), 1);
+    assert!(
+        core_depth1.background_depth_rows() > core_depth0.background_depth_rows(),
+        "expected canonical background depth to increase after reveal"
+    );
 
     let mut gfx_depth0 = CpuRenderer::new(&mut frame_depth0, SurfaceSize::new(width, height));
     let mut gfx_depth1 = CpuRenderer::new(&mut frame_depth1, SurfaceSize::new(width, height));
@@ -108,6 +118,135 @@ fn draw_tetris_world_background_scrolls_when_depth_increases() {
     assert_ne!(
         frame_depth0, frame_depth1,
         "increasing depth should change visible background tiles"
+    );
+}
+
+#[test]
+fn draw_tetris_world_zero_camera_offset_matches_wrapper_output() {
+    let width = 800u32;
+    let height = 600u32;
+
+    let mut frame_a = vec![0u8; (width * height * 4) as usize];
+    let mut frame_b = vec![0u8; (width * height * 4) as usize];
+
+    let mut core = TetrisCore::new(7);
+    core.set_available_pieces(Piece::all());
+    core.initialize_game();
+
+    let mut gfx_a = CpuRenderer::new(&mut frame_a, SurfaceSize::new(width, height));
+    let mut gfx_b = CpuRenderer::new(&mut frame_b, SurfaceSize::new(width, height));
+    let _ = draw_tetris_world(&mut gfx_a, width, height, &core);
+    let _ = draw_tetris_world_with_camera_offset(&mut gfx_b, width, height, &core, 0);
+
+    assert_eq!(
+        frame_a, frame_b,
+        "zero world camera offset should preserve deterministic render output"
+    );
+}
+
+#[test]
+fn draw_tetris_world_nonzero_camera_offset_shifts_world_pixels() {
+    let width = 800u32;
+    let height = 600u32;
+    let mut frame_base = vec![0u8; (width * height * 4) as usize];
+    let mut frame_shifted = vec![0u8; (width * height * 4) as usize];
+
+    let mut core = TetrisCore::new(11);
+    core.set_available_pieces(Piece::all());
+    core.initialize_game();
+    core.set_cell(0, 0, 1);
+
+    let mut gfx_base = CpuRenderer::new(&mut frame_base, SurfaceSize::new(width, height));
+    let layout = draw_tetris_world(&mut gfx_base, width, height, &core);
+
+    let offset_y = CELL_SIZE as i32;
+    let mut gfx_shifted = CpuRenderer::new(&mut frame_shifted, SurfaceSize::new(width, height));
+    let _ = draw_tetris_world_with_camera_offset(&mut gfx_shifted, width, height, &core, offset_y);
+
+    let piece = color_for_cell(1);
+    let sample_x = layout.board.x + 1;
+    let sample_y_base = layout.board.y + (BOARD_HEIGHT as u32 - 1) * CELL_SIZE + 1;
+    let sample_y_shifted = sample_y_base + CELL_SIZE;
+
+    let idx_base = ((sample_y_base * width + sample_x) * 4) as usize;
+    let idx_shifted_same = ((sample_y_base * width + sample_x) * 4) as usize;
+    let idx_shifted_offset = ((sample_y_shifted * width + sample_x) * 4) as usize;
+
+    assert_eq!(
+        &frame_base[idx_base..idx_base + 4],
+        &piece,
+        "baseline should draw board cell at unshifted position"
+    );
+    assert_ne!(
+        &frame_shifted[idx_shifted_same..idx_shifted_same + 4],
+        &piece,
+        "shifted frame should not keep board cell at original position"
+    );
+    assert_eq!(
+        &frame_shifted[idx_shifted_offset..idx_shifted_offset + 4],
+        &piece,
+        "shifted frame should draw board cell at offset position"
+    );
+}
+
+#[test]
+fn world_camera_offset_keeps_hud_layout_and_pause_hit_target_stable() {
+    let width = 800u32;
+    let height = 600u32;
+    let mut frame = vec![0u8; (width * height * 4) as usize];
+
+    let mut core = TetrisCore::new(19);
+    core.set_available_pieces(Piece::all());
+    core.initialize_game();
+
+    let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
+    let layout_base = draw_tetris_world_with_camera_offset(&mut gfx, width, height, &core, 0);
+    let layout_shifted =
+        draw_tetris_world_with_camera_offset(&mut gfx, width, height, &core, CELL_SIZE as i32 * 2);
+
+    assert_eq!(
+        layout_base, layout_shifted,
+        "world camera offset should not move HUD/input anchor layout"
+    );
+
+    let pause_x = layout_base.pause_button.x + layout_base.pause_button.w / 2;
+    let pause_y = layout_base.pause_button.y + layout_base.pause_button.h / 2;
+
+    let mut ui_base = UiTree::new();
+    ui_base.ensure_canvas(UI_CANVAS, ui::Rect::from_size(width, height));
+    ui_base.add_root(UI_CANVAS);
+    let mut gfx_base = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
+    draw_tetris_hud_with_ui(&mut gfx_base, width, height, &core, layout_base, &mut ui_base);
+    let _ = ui_base.process_input(UiInput {
+        mouse_pos: Some((pause_x, pause_y)),
+        mouse_down: false,
+        mouse_up: false,
+    });
+    assert!(
+        ui_base.is_hovered(UI_TETRIS_PAUSE),
+        "pause hit target should remain at the same screen-space position"
+    );
+
+    let mut ui_shifted = UiTree::new();
+    ui_shifted.ensure_canvas(UI_CANVAS, ui::Rect::from_size(width, height));
+    ui_shifted.add_root(UI_CANVAS);
+    let mut gfx_shifted = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
+    draw_tetris_hud_with_ui(
+        &mut gfx_shifted,
+        width,
+        height,
+        &core,
+        layout_shifted,
+        &mut ui_shifted,
+    );
+    let _ = ui_shifted.process_input(UiInput {
+        mouse_pos: Some((pause_x, pause_y)),
+        mouse_down: false,
+        mouse_up: false,
+    });
+    assert!(
+        ui_shifted.is_hovered(UI_TETRIS_PAUSE),
+        "pause hit target hover should match even when world layer is offset"
     );
 }
 

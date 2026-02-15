@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 
-use game::tetris_core::{BOARD_HEIGHT, BOARD_WIDTH, NEXT_QUEUE_LEN, Piece, TetrisCore, Vec2i};
+use game::tetris_core::{
+    BOARD_HEIGHT, BOARD_WIDTH, DEFAULT_BOTTOMWELL_ROWS, NEXT_QUEUE_LEN, Piece, TetrisCore, Vec2i,
+};
 
 #[test]
 fn initializes_board_and_spawns_piece() {
@@ -140,6 +142,39 @@ fn clear_lines_removes_full_rows() {
 
     let top_row = &core.board()[BOARD_HEIGHT - 1];
     assert!(top_row.iter().all(|&cell| cell == 0));
+}
+
+#[test]
+fn background_depth_rows_uses_canonical_earth_depth() {
+    let mut core = TetrisCore::new(42);
+    core.set_available_pieces(Piece::all());
+    core.set_bottomwell_enabled(true);
+    core.initialize_game();
+
+    let depth_after_init = core.background_depth_rows();
+    assert_eq!(depth_after_init, DEFAULT_BOTTOMWELL_ROWS as u32);
+
+    let target_y = DEFAULT_BOTTOMWELL_ROWS;
+    for x in 0..BOARD_WIDTH {
+        core.set_cell(x, target_y, 1);
+    }
+    let cleared = core.clear_lines();
+    assert_eq!(cleared, 1);
+    assert_eq!(core.background_depth_rows(), depth_after_init + 1);
+}
+
+#[test]
+fn background_depth_rows_remains_zero_without_bottomwell_reveals() {
+    let mut core = TetrisCore::new(42);
+    core.set_available_pieces(Piece::all());
+    core.initialize_game();
+
+    for x in 0..BOARD_WIDTH {
+        core.set_cell(x, 0, 1);
+    }
+    let _ = core.clear_lines();
+
+    assert_eq!(core.background_depth_rows(), 0);
 }
 
 #[test]

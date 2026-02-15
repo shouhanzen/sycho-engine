@@ -1,0 +1,138 @@
+Worldspace Camera Travel Plan
+=============================
+
+Plan-ID: WORLDSPACE_CAMERA_TRAVEL_PLAN
+Depends-On: SKILLTREE_CONSTELLATION_WORLDSPACE_PLAN, DIGGING_CAMERA_DESCENT_PLAN
+
+Status
+- Current: NOT_STARTED
+- Last Reviewed: 2026-02-14
+- Notes: Current direction includes a melt-style transition into skilltree constellation space; explicit camera travel from board depth to sky anchor is not yet defined.
+
+Goal
+- Add deterministic camera travel when opening SkillTree from Game Over:
+  - start from the board world/depth context
+  - travel upward into sky/constellation anchor
+  - complete in the same shared-world transition flow (not a hard scene cut)
+- Preserve input safety, UI clarity, and frame pacing during the transition.
+
+Dependencies
+- `game/src/view.rs` and `game/src/headful/view_transitions.rs` for transition state/event flow.
+- `game/src/bin/headful/main.rs` for transition timing progression and input gating.
+- `game/src/headful/render_pipeline.rs` for layered transition rendering.
+- `game/src/headful/dig_camera.rs` for board/world depth offset baseline at transition start.
+- `game/src/tetris_ui.rs` for world draw + skilltree draw composition behavior.
+- `game/src/skilltree.rs` for constellation camera anchor/pan defaults.
+- `plans/skilltree_constellation_worldspace_plan.txt` for melt/diegetic transition base.
+- `plans/performance_budget_hud_profiler_plan.txt` for budget-aware rollout checks.
+
+Non-Goals
+- No gameplay simulation during travel (visual/navigation transition only).
+- No global free-camera system across all game views in v1.
+- No full cinematic scripting system.
+
+Design Rules
+- Shared-world continuity: board and constellation remain layers in one worldspace transition.
+- Deterministic path: same seed/input timeline produces same camera path and timing.
+- Stable controls: gameplay actions remain blocked throughout travel.
+- Readability first: transition should communicate direction and destination clearly.
+- Bounded cost: avoid per-frame allocations and expensive full-screen effects.
+
+Transition Contract (v1)
+- Trigger: `GameOver -> OpenSkillTree`.
+- Introduce (or extend) an explicit transition state with staged progress:
+  - `Travel` stage (camera reposition)
+  - `Reveal` stage (constellation prominence/melt completion)
+- Camera travel state includes:
+  - `duration_ms`
+  - `elapsed_ms`
+  - `start_anchor` (board/depth world anchor)
+  - `target_anchor` (skilltree constellation anchor)
+  - deterministic easing profile identifier
+- Completion:
+  - transition reaches end (or skip policy threshold), then enters `GameView::SkillTree`.
+
+Execution Checklist
+- [ ] Phase 1: define camera-travel transition state and timing contract.
+- [ ] Phase 2: add pure camera path helpers (anchors, easing, interpolation).
+- [ ] Phase 3: integrate travel camera transform into render pipeline composition.
+- [ ] Phase 4: stage travel with constellation reveal/melt sequencing.
+- [ ] Phase 5: add input/skip policy and state safety guards.
+- [ ] Phase 6: add deterministic/state/render tests and manual budget verification.
+- [ ] Acceptance: opening skilltree from game over performs deterministic board-to-sky camera travel with no hard cut.
+
+Phase 1: Transition State + Flow
+- Extend transition state model from melt-only into travel-capable sequence.
+- Add explicit transition data:
+  - travel progress
+  - reveal progress
+  - cached anchors captured at transition start
+- Keep side-effects explicit and testable through transition result structs/events.
+
+Phase 2: Camera Path Helpers
+- Add pure helpers for:
+  - selecting start anchor from board layout + dig camera offset
+  - selecting target anchor from skilltree camera defaults
+  - evaluating travel transform by normalized progress
+- Path shape for v1:
+  - deterministic eased vertical travel with slight horizontal alignment correction
+  - no random wobble/noise
+- Keep helper API renderer-agnostic for unit testing.
+
+Phase 3: Render Pipeline Integration
+- Update `render_pipeline` transition path to compose with travel transform:
+  - draw world background continuity
+  - draw frozen game-over/board source at travel-adjusted transform
+  - draw skilltree constellation layer with travel-aware framing
+- Avoid hard full-frame clear during active transition.
+- Keep HUD/menu overlays consistent with transition stage.
+
+Phase 4: Staging with Constellation Reveal
+- Sequence recommendation:
+  - early travel: board remains dominant
+  - mid travel: melt/dissolve of board chrome accelerates
+  - late travel: constellation layer becomes dominant
+- Preserve button/action availability policy:
+  - no gameplay actions
+  - optional skip action after minimum elapsed threshold
+- Ensure final `SkillTree` view reuses stable camera state at transition end.
+
+Phase 5: Input Safety + Skip Policy
+- Block gameplay and destructive editor actions while transition is active.
+- Add explicit skip policy:
+  - allow skip only after minimum progress (to avoid accidental instant jump)
+  - on skip, snap to deterministic end-state (no partial stale overlays)
+- Keep keyboard/mouse behavior parity between key-trigger and button-trigger entry paths.
+
+Phase 6: Tests + Performance
+- State machine tests:
+  - `GameOver -> SkillTreeTransitionTravel -> SkillTree`
+  - skip path lands in valid end-state
+- Pure helper tests:
+  - deterministic anchor/path outputs
+  - monotonic progress and stable interpolation boundaries
+- Render tests:
+  - transition frames differ over time in expected travel direction
+  - no hard-cut frame regression when transition is enabled
+- Manual checks:
+  - travel reads clearly from board depth to sky constellation
+  - frame pacing remains within budget targets during transition-heavy runs
+
+Acceptance Criteria
+- Skilltree opening from game over includes visible camera travel from board/depth context to sky constellation context.
+- Transition remains deterministic and does not process gameplay actions.
+- End-state enters normal interactable `SkillTree` view without visual discontinuity.
+- No sustained budget warning/critical regressions during representative runs.
+
+Risks and Mitigations
+- Risk: travel path feels disorienting or too long.
+  - Mitigation: tune duration/easing with playtests and keep skip policy.
+- Risk: transition state complexity introduces view-flow regressions.
+  - Mitigation: isolate state model and add focused transition tests.
+- Risk: extra composition cost spikes frame time.
+  - Mitigation: avoid heavy effects, reuse existing layers, and profile against budgets.
+
+Open Decisions
+- Default duration target (for example 700ms vs 1000ms).
+- Skip threshold (for example allow after 35% progress vs always skippable).
+- Whether to keep melt effect equally strong once travel is introduced, or reduce melt intensity in favor of camera motion.
