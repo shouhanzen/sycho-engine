@@ -52,7 +52,7 @@ enum Commands {
         watch: bool,
         #[arg(long, default_value_t = 100)]
         max_steps: usize,
-        #[arg(long, default_value_t = 60)]
+        #[arg(long, default_value_t = 300)]
         max_minutes: u64,
         #[arg(long, default_value_t = 5)]
         sleep_seconds: u64,
@@ -132,13 +132,13 @@ fn cmd_list(root: &Path, ready_only: bool) -> Result<()> {
         for task in &plan.tasks {
             if task.done {
                 if !ready_only {
-                    println!("[done] {}  {}", task.id, task.text);
+                    println!("[done] {}  {}", task.id, display_task_text(task));
                 }
                 continue;
             }
             let claimed = claims.active_claim(&task.id, now).map(|c| c.owner.clone());
             let deps_ok = graph.dependencies_completed(&task.plan_id);
-            let is_ready = deps_ok && !plan_claimed && claimed.is_none();
+            let is_ready = deps_ok && !plan_claimed && claimed.is_none() && !task.human_only;
             if ready_only && !is_ready {
                 continue;
             }
@@ -146,12 +146,14 @@ fn cmd_list(root: &Path, ready_only: bool) -> Result<()> {
                 format!("claimed:{owner}")
             } else if plan_claimed {
                 "plan_claimed".to_string()
+            } else if task.human_only {
+                "human".to_string()
             } else if deps_ok {
                 "ready".to_string()
             } else {
                 "blocked".to_string()
             };
-            println!("[{}] {}  {}", status, task.id, task.text);
+            println!("[{}] {}  {}", status, task.id, display_task_text(task));
         }
     }
     Ok(())
@@ -166,6 +168,13 @@ fn cmd_claim(root: &Path, task_id: &str, owner: &str) -> Result<()> {
         .with_context(|| format!("Unknown task id {}", task_id))?;
     if task.done {
         bail!("Task {} is already done", task_id);
+    }
+    if task.human_only && owner_is_agent(owner) {
+        bail!(
+            "Task {} is marked [human] and cannot be claimed by agent owner {}",
+            task_id,
+            owner
+        );
     }
     if !graph.dependencies_completed(&task.plan_id) {
         bail!("Task {} is blocked by incomplete dependencies", task_id);
@@ -188,6 +197,17 @@ fn cmd_complete(root: &Path, task_id: &str, owner: Option<&str>, note: Option<&s
     if task.done {
         println!("Task {} already complete", task_id);
         return Ok(());
+    }
+    if task.human_only {
+        if let Some(owner_name) = owner {
+            if owner_is_agent(owner_name) {
+                bail!(
+                    "Task {} is marked [human] and cannot be completed by agent owner {}",
+                    task_id,
+                    owner_name
+                );
+            }
+        }
     }
 
     let mut claims = ClaimStore::load(root)?;
@@ -261,7 +281,7 @@ fn cmd_run(
             }
             let diagnostics = compute_ready_diagnostics(&graph, &claims, now, owner);
             println!("No ready tasks. Exiting.");
-            print_no_ready_guidance(&diagnostics);
+            print_no_ready_guidance(&diagnostics, owner);
             break;
         };
 
@@ -672,8 +692,10 @@ struct PlanWorkItem {
 struct ReadyDiagnostics {
     open_plans: usize,
     open_tasks: usize,
+    actionable_tasks: usize,
     ready_plans: usize,
     blocked_by_dependencies: usize,
+    blocked_human_only: usize,
     claimed_by_other_owner: usize,
     claimed_by_self: usize,
 }
@@ -687,13 +709,22 @@ fn compute_ready_diagnostics(
     let mut diagnostics = ReadyDiagnostics::default();
 
     for plan in &graph.plans {
-        let open_tasks = plan.tasks.iter().filter(|task| !task.done).count();
-        if open_tasks == 0 {
+        let open_tasks: Vec<&Task> = plan.tasks.iter().filter(|task| !task.done).collect();
+        if open_tasks.is_empty() {
             continue;
         }
 
         diagnostics.open_plans += 1;
-        diagnostics.open_tasks += open_tasks;
+        diagnostics.open_tasks += open_tasks.len();
+        let actionable_tasks = open_tasks
+            .iter()
+            .filter(|task| task_executable_by_owner(task, owner))
+            .count();
+        if actionable_tasks == 0 {
+            diagnostics.blocked_human_only += 1;
+            continue;
+        }
+        diagnostics.actionable_tasks += actionable_tasks;
         let deps_ok = graph.dependencies_completed(&plan.id);
         let claim_id = plan_claim_key(&plan.id);
 
@@ -708,15 +739,18 @@ fn compute_ready_diagnostics(
     diagnostics
 }
 
-fn print_no_ready_guidance(diagnostics: &ReadyDiagnostics) {
+fn print_no_ready_guidance(diagnostics: &ReadyDiagnostics, owner: &str) {
     if diagnostics.open_plans == 0 {
         println!("All checklist items are complete in plans/*.txt and plans/*.md.");
     } else {
         println!(
-            "Open tasks: {} across {} plan(s). Ready plans: {}. Blocked by dependencies: {}. Claimed by other owners: {}. Claimed by this owner: {}.",
+            "Open tasks: {} (actionable for {}: {}) across {} plan(s). Ready plans: {}. Human-only blocked plans: {}. Blocked by dependencies: {}. Claimed by other owners: {}. Claimed by this owner: {}.",
             diagnostics.open_tasks,
+            owner,
+            diagnostics.actionable_tasks,
             diagnostics.open_plans,
             diagnostics.ready_plans,
+            diagnostics.blocked_human_only,
             diagnostics.blocked_by_dependencies,
             diagnostics.claimed_by_other_owner,
             diagnostics.claimed_by_self
@@ -729,6 +763,22 @@ fn print_no_ready_guidance(diagnostics: &ReadyDiagnostics) {
 
 fn plan_claim_key(plan_id: &str) -> String {
     format!("PLAN::{plan_id}")
+}
+
+fn owner_is_agent(owner: &str) -> bool {
+    owner.trim().to_ascii_lowercase().starts_with("agent:")
+}
+
+fn task_executable_by_owner(task: &Task, owner: &str) -> bool {
+    !(task.human_only && owner_is_agent(owner))
+}
+
+fn display_task_text(task: &Task) -> String {
+    if task.human_only {
+        format!("[human] {}", task.text)
+    } else {
+        task.text.clone()
+    }
 }
 
 fn maybe_archive_completed_plan(root: &Path, plan_id: &str) -> Result<Option<PathBuf>> {
@@ -942,17 +992,25 @@ fn select_next_ready_plan(
                 Some(claim) => claim.owner == owner,
             }
         })
-        .filter(|plan| plan.tasks.iter().any(|t| !t.done))
+        .filter(|plan| {
+            plan.tasks
+                .iter()
+                .any(|t| !t.done && task_executable_by_owner(t, owner))
+        })
         .collect();
 
     plans.sort_by(|a, b| a.id.cmp(&b.id));
     let plan = plans.into_iter().next()?;
 
-    let pending_tasks: Vec<&Task> = plan.tasks.iter().filter(|t| !t.done).collect();
+    let pending_tasks: Vec<&Task> = plan
+        .tasks
+        .iter()
+        .filter(|t| !t.done && task_executable_by_owner(t, owner))
+        .collect();
     let first_task = pending_tasks.first()?;
     let open_tasks = pending_tasks
         .iter()
-        .map(|t| format!("- [ ] {}", t.text))
+        .map(|t| format!("- [ ] {}", display_task_text(t)))
         .collect::<Vec<String>>()
         .join("\n");
     let plan_text = std::fs::read_to_string(&plan.path).unwrap_or_default();
@@ -964,7 +1022,7 @@ fn select_next_ready_plan(
         pending_count: pending_tasks.len(),
         open_tasks,
         first_task_id: first_task.id.clone(),
-        first_task_text: first_task.text.clone(),
+        first_task_text: display_task_text(first_task),
     })
 }
 
@@ -1086,6 +1144,34 @@ mod tests {
                 line_index: idx,
                 text: format!("task {id}#{}", idx + 1),
                 done: *done,
+                human_only: false,
+            })
+            .collect();
+        plans::Plan {
+            id: id.to_string(),
+            path,
+            depends_on: depends_on.iter().map(|dep| dep.to_string()).collect(),
+            tasks,
+        }
+    }
+
+    fn make_plan_with_specs(
+        id: &str,
+        depends_on: &[&str],
+        task_specs: &[(bool, bool)],
+    ) -> plans::Plan {
+        let path = PathBuf::from(format!("plans/{}.md", id.to_ascii_lowercase()));
+        let tasks = task_specs
+            .iter()
+            .enumerate()
+            .map(|(idx, (done, human_only))| Task {
+                id: format!("{id}#{}", idx + 1),
+                plan_id: id.to_string(),
+                plan_path: path.clone(),
+                line_index: idx,
+                text: format!("task {id}#{}", idx + 1),
+                done: *done,
+                human_only: *human_only,
             })
             .collect();
         plans::Plan {
@@ -1122,6 +1208,15 @@ mod tests {
     }
 
     #[test]
+    fn run_command_default_max_runtime_is_five_hours() {
+        let cli = Cli::try_parse_from(["plantool", "run"]).expect("run args should parse");
+        let Commands::Run { max_minutes, .. } = cli.command else {
+            panic!("expected run subcommand");
+        };
+        assert_eq!(max_minutes, 300);
+    }
+
+    #[test]
     fn run_command_default_idle_timeout_is_ten_minutes() {
         let cli = Cli::try_parse_from(["plantool", "run"]).expect("run args should parse");
         let Commands::Run {
@@ -1153,12 +1248,42 @@ mod tests {
             ReadyDiagnostics {
                 open_plans: 2,
                 open_tasks: 2,
+                actionable_tasks: 2,
                 ready_plans: 0,
                 blocked_by_dependencies: 1,
+                blocked_human_only: 0,
                 claimed_by_other_owner: 1,
                 claimed_by_self: 0,
             }
         );
+    }
+
+    #[test]
+    fn select_next_ready_plan_skips_human_only_plans_for_agent_owner() {
+        let graph = make_graph(vec![
+            make_plan_with_specs("A", &[], &[(false, true)]),
+            make_plan_with_specs("B", &[], &[(false, false)]),
+        ]);
+        let claims = ClaimStore::default();
+        let now = Utc::now();
+
+        let selected = select_next_ready_plan(&graph, &claims, now, "agent:cursor-agent")
+            .expect("expected actionable plan");
+        assert_eq!(selected.plan_id, "B");
+        assert_eq!(selected.pending_count, 1);
+    }
+
+    #[test]
+    fn select_next_ready_plan_allows_human_owner_to_pick_human_only_task() {
+        let graph = make_graph(vec![make_plan_with_specs("A", &[], &[(false, true)])]);
+        let claims = ClaimStore::default();
+        let now = Utc::now();
+
+        let selected =
+            select_next_ready_plan(&graph, &claims, now, "human:hanzen").expect("expected plan");
+        assert_eq!(selected.plan_id, "A");
+        assert_eq!(selected.pending_count, 1);
+        assert!(selected.open_tasks.contains("[human]"));
     }
 
     #[test]

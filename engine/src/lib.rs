@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod audio;
 pub mod app;
 pub mod editor;
 pub mod graphics;
@@ -7,6 +8,7 @@ pub mod profiling;
 pub mod recording;
 pub mod regression;
 pub mod render;
+pub mod slider;
 pub mod surface;
 pub mod ui;
 pub mod ui_tree;

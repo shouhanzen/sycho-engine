@@ -1,5 +1,5 @@
 use super::*;
-use game::tetris_core::{BOARD_WIDTH, DEFAULT_BOTTOMWELL_ROWS, TetrisCore};
+use game::tetris_core::{BOARD_HEIGHT, BOARD_WIDTH, CELL_GARBAGE, Piece, TetrisCore, Vec2i};
 
 fn make_test_headful(view: GameView) -> (HeadfulApp, HeadlessRunner<TetrisLogic>) {
     let base_logic = TetrisLogic::new(0, Piece::all()).with_bottomwell(true);
@@ -33,10 +33,10 @@ fn assert_approx_eq(actual: f32, expected: f32) {
 }
 
 fn force_depth_reveal(core: &mut TetrisCore) {
-    let target_y = DEFAULT_BOTTOMWELL_ROWS;
+    let target_y = 0;
     let depth_before = core.background_depth_rows();
     for x in 0..BOARD_WIDTH {
-        core.set_cell(x, target_y, 1);
+        core.set_cell(x, target_y, CELL_GARBAGE);
     }
     let cleared = core.clear_lines();
     assert!(cleared >= 1, "expected at least one cleared line");
@@ -44,6 +44,22 @@ fn force_depth_reveal(core: &mut TetrisCore) {
         core.background_depth_rows() > depth_before,
         "expected background depth to increase"
     );
+}
+
+fn setup_grounded_lock_delay_case(runner: &mut HeadlessRunner<TetrisLogic>) {
+    let state = runner.state_mut();
+    state.view = GameView::Tetris { paused: false };
+    state.gravity_interval = Duration::from_millis(100);
+    state.gravity_elapsed = Duration::ZERO;
+    state.tetris.set_available_pieces(vec![Piece::O]);
+    for y in 0..BOARD_HEIGHT {
+        for x in 0..BOARD_WIDTH {
+            state.tetris.set_cell(x, y, 0);
+        }
+    }
+    state
+        .tetris
+        .set_current_piece_for_test(Piece::O, Vec2i::new(4, 1), 0);
 }
 
 fn input_frame_for_keys(
@@ -289,4 +305,180 @@ fn paused_state_holds_dig_camera_motion_and_depth_impulses() {
         app.dig_camera.offset_y_px() < offset_before_pause,
         "expected resume to settle camera toward zero"
     );
+}
+
+#[test]
+fn gravity_dt_integration_locks_after_expected_timing() {
+    let (mut app, mut runner) = make_test_headful(GameView::Tetris { paused: false });
+    setup_grounded_lock_delay_case(&mut runner);
+
+    app.apply_gravity_steps(&mut runner, Duration::from_millis(400));
+    assert_eq!(runner.state().tetris.current_piece_pos(), Vec2i::new(4, 1));
+    assert_eq!(runner.state().tetris.grounded_lock_ms(), 300);
+
+    app.apply_gravity_steps(&mut runner, Duration::from_millis(100));
+    assert_eq!(runner.state().tetris.current_piece_pos(), Vec2i::new(4, 1));
+    assert_eq!(runner.state().tetris.grounded_lock_ms(), 400);
+
+    app.apply_gravity_steps(&mut runner, Duration::from_millis(100));
+    assert_eq!(
+        runner.state().tetris.current_piece_pos(),
+        Vec2i::new(4, runner.state().tetris.board().len() as i32)
+    );
+    assert_eq!(runner.state().tetris.grounded_lock_ms(), 0);
+}
+
+#[test]
+fn paused_state_does_not_advance_lock_delay() {
+    let (mut app, mut runner) = make_test_headful(GameView::Tetris { paused: false });
+    setup_grounded_lock_delay_case(&mut runner);
+
+    runner.state_mut().view = GameView::Tetris { paused: true };
+    app.apply_gravity_steps(&mut runner, Duration::from_millis(500));
+    assert_eq!(runner.state().tetris.current_piece_pos(), Vec2i::new(4, 1));
+    assert_eq!(runner.state().tetris.grounded_lock_ms(), 0);
+
+    runner.state_mut().view = GameView::Tetris { paused: false };
+    app.apply_gravity_steps(&mut runner, Duration::from_millis(400));
+    assert_eq!(runner.state().tetris.grounded_lock_ms(), 300);
+
+    runner.state_mut().view = GameView::Tetris { paused: true };
+    app.apply_gravity_steps(&mut runner, Duration::from_millis(1000));
+    assert_eq!(runner.state().tetris.current_piece_pos(), Vec2i::new(4, 1));
+    assert_eq!(runner.state().tetris.grounded_lock_ms(), 300);
+
+    runner.state_mut().view = GameView::Tetris { paused: false };
+    app.apply_gravity_steps(&mut runner, Duration::from_millis(200));
+    assert_eq!(
+        runner.state().tetris.current_piece_pos(),
+        Vec2i::new(4, runner.state().tetris.board().len() as i32)
+    );
+}
+
+#[test]
+fn grounded_move_stalls_even_when_gravity_tick_is_due_same_frame() {
+    let (mut app, mut runner) = make_test_headful(GameView::Tetris { paused: false });
+    setup_grounded_lock_delay_case(&mut runner);
+
+    {
+        let state = runner.state_mut();
+        state.gravity_interval = Duration::from_millis(500);
+        state.gravity_elapsed = Duration::from_millis(499);
+        for y in 0..=1 {
+            for x in 0..BOARD_WIDTH {
+                state.tetris.set_cell(x, y, 0);
+            }
+        }
+        state.tetris.set_current_piece_for_test(Piece::O, Vec2i::new(4, 1), 0);
+    }
+
+    runner.step_profiled(InputAction::MoveRight, &mut app.debug_hud);
+    app.apply_gravity_steps(&mut runner, Duration::from_millis(1));
+
+    assert_eq!(runner.state().tetris.current_piece_pos(), Vec2i::new(5, 1));
+    assert!(
+        runner.state().tetris.current_piece().is_some(),
+        "grounded move should preserve active piece even if gravity tick becomes due immediately"
+    );
+    assert_eq!(
+        runner.state().tetris.board()[0][5],
+        0,
+        "stalling move should not lock piece into board on same frame"
+    );
+}
+
+#[test]
+fn debug_hud_timer_toggle_disables_timer_tick_and_timeout() {
+    let (mut app, mut runner) = make_test_headful(GameView::Tetris { paused: false });
+    runner.state_mut().round_timer = RoundTimer::new(Duration::from_millis(200));
+
+    app.debug_hud.toggle_round_timer_disabled();
+    app.update_round_timer_and_game_over(&mut runner, Duration::from_secs(1));
+    assert!(
+        matches!(runner.state().view, GameView::Tetris { paused: false }),
+        "timer-disabled mode should not trigger timeout game over"
+    );
+    assert_eq!(
+        runner.state().round_timer.elapsed(),
+        Duration::ZERO,
+        "timer-disabled mode should not advance timer elapsed"
+    );
+
+    app.debug_hud.toggle_round_timer_disabled();
+    app.update_round_timer_and_game_over(&mut runner, Duration::from_millis(250));
+    assert!(
+        matches!(runner.state().view, GameView::GameOver),
+        "re-enabled timer should restore timeout game over behavior"
+    );
+}
+
+#[test]
+fn gravity_timeline_is_deterministic_for_same_inputs() {
+    fn run_timeline() -> (game::tetris_core::TetrisSnapshot, Duration, u32) {
+        let (mut app, mut runner) = make_test_headful(GameView::Tetris { paused: false });
+        setup_grounded_lock_delay_case(&mut runner);
+
+        app.apply_gravity_steps(&mut runner, Duration::from_millis(250));
+        runner.step_profiled(InputAction::MoveRight, &mut app.debug_hud);
+        app.apply_gravity_steps(&mut runner, Duration::from_millis(250));
+        runner.state_mut().view = GameView::Tetris { paused: true };
+        app.apply_gravity_steps(&mut runner, Duration::from_millis(500));
+        runner.state_mut().view = GameView::Tetris { paused: false };
+        app.apply_gravity_steps(&mut runner, Duration::from_millis(200));
+
+        (
+            runner.state().tetris.snapshot(),
+            runner.state().gravity_elapsed,
+            runner.state().tetris.grounded_lock_ms(),
+        )
+    }
+
+    let first = run_timeline();
+    let second = run_timeline();
+    assert_eq!(first, second);
+}
+
+#[test]
+fn line_clear_delay_progresses_with_frame_dt_instead_of_waiting_for_gravity_interval() {
+    let (mut app, mut runner) = make_test_headful(GameView::Tetris { paused: false });
+    {
+        let state = runner.state_mut();
+        state.view = GameView::Tetris { paused: false };
+        state.gravity_interval = Duration::from_millis(500);
+        state.gravity_elapsed = Duration::ZERO;
+        state.tetris.set_available_pieces(vec![Piece::O]);
+        state.tetris.set_line_clear_delay_ms(180);
+        for y in 0..BOARD_HEIGHT {
+            for x in 0..BOARD_WIDTH {
+                state.tetris.set_cell(x, y, 0);
+            }
+        }
+        for x in 0..BOARD_WIDTH {
+            if x == 4 || x == 5 {
+                continue;
+            }
+            state.tetris.set_cell(x, 0, 1);
+        }
+        state
+            .tetris
+            .set_current_piece_for_test(Piece::O, Vec2i::new(4, 1), 0);
+    }
+
+    runner.step_profiled(InputAction::HardDrop, &mut app.debug_hud);
+    assert!(runner.state().tetris.is_line_clear_active());
+    assert_eq!(runner.state().tetris.lines_cleared(), 0);
+
+    // Even though 100ms is below the 500ms gravity interval, clear progress should advance.
+    app.apply_gravity_steps(&mut runner, Duration::from_millis(100));
+    let progress = runner.state().tetris.line_clear_progress();
+    assert!(
+        progress > 0.0 && progress < 1.0,
+        "line clear progress should advance on frame dt; got {progress}"
+    );
+    assert!(runner.state().tetris.is_line_clear_active());
+    assert_eq!(runner.state().tetris.lines_cleared(), 0);
+
+    app.apply_gravity_steps(&mut runner, Duration::from_millis(80));
+    assert!(!runner.state().tetris.is_line_clear_active());
+    assert_eq!(runner.state().tetris.lines_cleared(), 1);
 }

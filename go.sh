@@ -23,6 +23,8 @@ Usage:
   ./go.sh --restart [--game|--editor] [--headful|--headless] [--record [PATH]] [--replay PATH] [--detach] [--release]
   ./go.sh --status [--game|--editor]
   ./go.sh --test [--release]
+  ./go.sh --test-fast [--release]
+  ./go.sh --test-light [--release]
   ./go.sh --e2e [--video] [--ffmpeg /path/to/ffmpeg] [--release]
   ./go.sh --profile [--release]
   ./go.sh --help
@@ -72,7 +74,12 @@ Lifecycle:
   --status       Prints whether a background process is running (--start --detach).
 
 Testing:
-  --test         cargo test (workspace)
+  --test         cargo test (workspace; includes editor crate)
+  --test-fast    cargo test -p engine -p game (fast default local loop)
+  --test-light   same as --test-fast but reduced local CPU pressure
+                Env knobs:
+                  ROLLOUT_TEST_LIGHT_BUILD_JOBS=4
+                  ROLLOUT_TEST_LIGHT_THREADS=1
   --e2e          cargo test -p game --test e2e_playtest_tests
   --video        (e2e) record an mp4 per test via ffmpeg (requires `ffmpeg` on PATH)
   --ffmpeg PATH  (e2e) path to ffmpeg binary (sets ROLLOUT_FFMPEG_BIN)
@@ -82,6 +89,14 @@ Testing:
                   ROLLOUT_PROFILE_WARMUP=200
                   ROLLOUT_PROFILE_WIDTH=960
                   ROLLOUT_PROFILE_HEIGHT=720
+                  ROLLOUT_BUDGET_FRAME_WARN_MS=16.67
+                  ROLLOUT_BUDGET_FRAME_CRIT_MS=22
+                  ROLLOUT_BUDGET_ENGINE_WARN_MS=6
+                  ROLLOUT_BUDGET_ENGINE_CRIT_MS=10
+                  ROLLOUT_BUDGET_DRAW_WARN_MS=6
+                  ROLLOUT_BUDGET_DRAW_CRIT_MS=10
+                  ROLLOUT_BUDGET_OVERLAY_WARN_MS=1.5
+                  ROLLOUT_BUDGET_OVERLAY_CRIT_MS=3
 EOF
 }
 
@@ -441,7 +456,7 @@ EDITOR_DEV_URL=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --start|--stop|--restart|--status|--test|--e2e|--profile)
+    --start|--stop|--restart|--status|--test|--test-fast|--test-light|--e2e|--profile)
       ACTION="$1"
       shift
       ;;
@@ -522,6 +537,7 @@ if [[ -z "$ACTION" ]]; then
 fi
 
 cd "$ROOT_DIR"
+setup_build_cache
 
 # Interpret `--record`:
 # - headful mode: state recording (passed through to the headful binary)
@@ -823,6 +839,27 @@ case "$ACTION" in
 
   --test)
     exec cargo test --workspace "${CARGO_PROFILE_ARGS[@]}"
+    ;;
+
+  --test-fast)
+    exec cargo test -p engine -p game "${CARGO_PROFILE_ARGS[@]}"
+    ;;
+
+  --test-light)
+    TEST_LIGHT_BUILD_JOBS="${ROLLOUT_TEST_LIGHT_BUILD_JOBS:-4}"
+    TEST_LIGHT_THREADS="${ROLLOUT_TEST_LIGHT_THREADS:-1}"
+    if ! is_uint "$TEST_LIGHT_BUILD_JOBS" || [[ "$TEST_LIGHT_BUILD_JOBS" -lt 1 ]]; then
+      echo "invalid ROLLOUT_TEST_LIGHT_BUILD_JOBS: $TEST_LIGHT_BUILD_JOBS" >&2
+      exit 2
+    fi
+    if ! is_uint "$TEST_LIGHT_THREADS" || [[ "$TEST_LIGHT_THREADS" -lt 1 ]]; then
+      echo "invalid ROLLOUT_TEST_LIGHT_THREADS: $TEST_LIGHT_THREADS" >&2
+      exit 2
+    fi
+    exec env \
+      CARGO_BUILD_JOBS="$TEST_LIGHT_BUILD_JOBS" \
+      RUST_TEST_THREADS="$TEST_LIGHT_THREADS" \
+      cargo test -p engine -p game "${CARGO_PROFILE_ARGS[@]}"
     ;;
 
   --e2e)

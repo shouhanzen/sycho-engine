@@ -27,6 +27,13 @@ Checklist lines become task IDs like:
 - `MY_PLAN_ID#1`
 - `MY_PLAN_ID#2`
 
+Checklist items can include execution labels immediately after the checkbox:
+
+- `- [ ] [human] run manual feel/perf pass` (alias: `[manual]`)
+- `- [ ] [agent] implement parser change`
+
+`plan run` treats `[human]`/`[manual]` items as non-actionable for `agent:*` owners, so automation skips those tasks.
+
 ## Commands
 
 From the workspace root:
@@ -63,7 +70,7 @@ cargo run -p plantool -- run \
   --owner agent:cursor \
   --watch \
   --max-steps 100 \
-  --max-minutes 60 \
+  --max-minutes 300 \
   --sleep-seconds 5 \
   --idle-timeout-seconds 600 \
   --exec "cursor-agent --print --output-format stream-json --stream-partial-output 'You are executing plan {plan_id} from {plan_path}.\n\nComplete as much of this plan as you can in this single run.\nIf you finish items, update checklist markers in the plan file.\nIf blocked, leave clear notes in the plan file.\n\nOpen checklist items ({pending_count}):\n{open_tasks}\n\nFull plan text:\n{plan_text}'" \
@@ -80,7 +87,7 @@ Defaults for `plan run`:
 
 - `--owner agent:cursor-agent`
 - `--max-steps 100`
-- `--max-minutes 60`
+- `--max-minutes 300`
 - `--sleep-seconds 5`
 - `--idle-timeout-seconds 600`
 - `--exec "cursor-agent --print --force --output-format stream-json --stream-partial-output 'You are executing plan {plan_id} from {plan_path}.\n\nComplete as much of this plan as you can in this single run.\nIf you finish items, update checklist markers in the plan file.\nIf blocked, leave clear notes in the plan file.\n\nOpen checklist items ({pending_count}):\n{open_tasks}\n\nFull plan text:\n{plan_text}'"`

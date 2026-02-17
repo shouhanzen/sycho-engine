@@ -90,6 +90,13 @@ pub fn snapshot_from_state(frame: usize, state: &GameState) -> EditorSnapshot {
     let stats = vec![
         stat("score", state.tetris.score()),
         stat("linesCleared", state.tetris.lines_cleared()),
+        stat("depthRows", state.tetris.background_depth_rows()),
+        stat("depthLocked", state.tetris.depth_progress_paused()),
+        stat_opt(
+            "activeWallId",
+            state.tetris.active_wall_id().map(ToString::to_string),
+        ),
+        stat("activeWallHp", state.tetris.active_wall_hp_remaining()),
         stat_opt(
             "currentPiece",
             state.tetris.current_piece().map(piece_label),
@@ -132,10 +139,12 @@ fn stat_opt(label: impl Into<String>, value: Option<String>) -> EditorStat {
 
 fn piece_label(piece: Piece) -> String {
     match piece {
-        Piece::I => "I",
-        Piece::O => "O",
-        Piece::T => "T",
-        Piece::S => "S",
+        Piece::I => "Wood I4",
+        Piece::O => "Stone O",
+        Piece::Glass => "Glass I3",
+        Piece::T => "Sand T",
+        Piece::S => "Dirt I2",
+        Piece::MossSeed => "Moss Seed 1x1",
         Piece::Z => "Z",
         Piece::J => "J",
         Piece::L => "L",
@@ -144,7 +153,7 @@ fn piece_label(piece: Piece) -> String {
 }
 
 fn default_tetris_palette() -> Vec<EditorPaletteEntry> {
-    // Keep the palette small and stable: 0 = background, 1..7 are the 7 tetrominoes.
+    // Keep the palette small and stable: 0 = background, 1..7 are gameplay/debug IDs.
     let mut entries = Vec::with_capacity(8);
     for value in 0u8..=7u8 {
         entries.push(EditorPaletteEntry {

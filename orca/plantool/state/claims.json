@@ -1,28 +1,22 @@
 {
   "claims": {
+    "BACKGROUND_TILE_MVP_CHECKLIST#1": {
+      "task_id": "BACKGROUND_TILE_MVP_CHECKLIST#1",
+      "owner": "agent:cursor-agent",
+      "claimed_at": "2026-02-14T20:18:23.907648300Z",
+      "lease_until": "2026-02-14T20:48:23.907648300Z"
+    },
     "PLAN::BACKGROUND_TILE_MVP_CHECKLIST": {
       "task_id": "PLAN::BACKGROUND_TILE_MVP_CHECKLIST",
       "owner": "agent:cursor-agent",
       "claimed_at": "2026-02-14T22:19:38.766339239Z",
       "lease_until": "2026-02-14T22:49:38.766339239Z"
     },
-    "PLAN::DIGGING_CAMERA_DESCENT_PLAN": {
-      "task_id": "PLAN::DIGGING_CAMERA_DESCENT_PLAN",
+    "BACKGROUND_TILE_MVP_CHECKLIST#12": {
+      "task_id": "BACKGROUND_TILE_MVP_CHECKLIST#12",
       "owner": "agent:cursor-agent",
-      "claimed_at": "2026-02-15T01:27:58.813040544Z",
-      "lease_until": "2026-02-15T01:57:58.813040544Z"
-    },
-    "BACKGROUND_TILE_MVP_CHECKLIST#10": {
-      "task_id": "BACKGROUND_TILE_MVP_CHECKLIST#10",
-      "owner": "agent:cursor-agent",
-      "claimed_at": "2026-02-14T20:22:31.212956200Z",
-      "lease_until": "2026-02-14T20:52:31.212956200Z"
-    },
-    "BACKGROUND_TILE_MVP_CHECKLIST#1": {
-      "task_id": "BACKGROUND_TILE_MVP_CHECKLIST#1",
-      "owner": "agent:cursor-agent",
-      "claimed_at": "2026-02-14T20:18:23.907648300Z",
-      "lease_until": "2026-02-14T20:48:23.907648300Z"
+      "claimed_at": "2026-02-14T20:31:08.086105800Z",
+      "lease_until": "2026-02-14T21:01:08.086105800Z"
     },
     "BACKGROUND_TILE_MVP_CHECKLIST#11": {
       "task_id": "BACKGROUND_TILE_MVP_CHECKLIST#11",
@@ -30,11 +24,11 @@
       "claimed_at": "2026-02-14T20:22:53.893316500Z",
       "lease_until": "2026-02-14T20:52:53.893316500Z"
     },
-    "BACKGROUND_TILE_MVP_CHECKLIST#12": {
-      "task_id": "BACKGROUND_TILE_MVP_CHECKLIST#12",
+    "BACKGROUND_TILE_MVP_CHECKLIST#10": {
+      "task_id": "BACKGROUND_TILE_MVP_CHECKLIST#10",
       "owner": "agent:cursor-agent",
-      "claimed_at": "2026-02-14T20:31:08.086105800Z",
-      "lease_until": "2026-02-14T21:01:08.086105800Z"
+      "claimed_at": "2026-02-14T20:22:31.212956200Z",
+      "lease_until": "2026-02-14T20:52:31.212956200Z"
     }
   }
 }

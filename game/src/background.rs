@@ -3,12 +3,12 @@
 /// Generates deterministic tile patterns behind the board that scroll as
 /// the player digs deeper. Visual only — no gameplay collision.
 ///
-/// Supports multiple parallax layers (Far, Mid, Near) and smooth biome
-/// transitions via blend windows.
+/// Supports multiple parallax layers (Far, Mid, Near) and hard biome
+/// transitions, including a jagged Overworld->Dirt separator.
 use std::sync::OnceLock;
 
 use engine::graphics::{Color, Renderer2d};
-use engine::render::CELL_SIZE;
+use engine::render::{CELL_SIZE, clip_rect_i32_to_viewport, clip_rect_to_viewport};
 use engine::ui::Rect;
 
 // ── Biome model ─────────────────────────────────────────────────────
@@ -16,20 +16,46 @@ use engine::ui::Rect;
 /// Background biome bands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackgroundBiome {
+    Overworld,
     Dirt,
     Stone,
 }
+
+/// Number of near-layer rows represented by the default board viewport.
+///
+/// Bottomwell is enabled for normal runs, so the default visible board height
+/// is 23 rows (20 core + 3 initial bottomwell rows). Calibrating the surface
+/// threshold to this runtime viewport keeps run-start dirt reveal aligned with
+/// the number of prefilled earth rows.
+const START_VIEW_NEAR_ROWS: u32 = 23;
+
+/// Number of earth-biome rows that should be visible at run start.
+const START_DIRT_ROWS: u32 = 3;
+
+/// Hard depth threshold separating Overworld from Dirt.
+///
+/// At depth 0, world rows with depth >= this threshold are Dirt. With
+/// `START_VIEW_NEAR_ROWS=20` and `START_DIRT_ROWS=3`, this is 17, so start
+/// view always includes at least 3 Dirt rows at the bottom.
+const SURFACE_DEPTH_START: u32 = START_VIEW_NEAR_ROWS - START_DIRT_ROWS;
 
 /// Hard depth threshold separating Dirt from Stone (used by the simple
 /// `biome_at_depth` helper that does not expose blend info).
 const STONE_DEPTH_START: u32 = 50;
 
-/// Total rows around the boundary where blending occurs.
-const BIOME_BLEND_BAND_ROWS: u32 = 10;
+/// Width (in near-layer columns) of each jag step in the surface separator.
+const SURFACE_JAGGED_SEGMENT_COLS: u32 = 2;
+
+/// Maximum upward raise (in rows) of the Dirt boundary from the base depth.
+///
+/// Kept at zero so the opening ground line does not start one row too high.
+/// Visual jitter is still provided by the grassline separator teeth.
+const SURFACE_JAGGED_MAX_RAISE_ROWS: u32 = 0;
 
 // ── Palette ─────────────────────────────────────────────────────────
 
 const CLEAR_COLOR: Color = [0, 0, 0, 255];
+const GRASSLINE_COLOR: Color = [94, 152, 72, 255];
 
 /// Tile palettes for each biome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +67,15 @@ pub struct BackgroundPalette {
     pub crack: Color,
     pub fossil: Color,
 }
+
+pub const PALETTE_OVERWORLD: BackgroundPalette = BackgroundPalette {
+    base: [90, 112, 144, 255],
+    accent_a: [104, 128, 162, 255],
+    accent_b: [118, 142, 176, 255],
+    vein: [136, 160, 194, 255],
+    crack: [74, 94, 124, 255],
+    fossil: [154, 178, 208, 255],
+};
 
 pub const PALETTE_DIRT: BackgroundPalette = BackgroundPalette {
     base: [26, 18, 12, 255],
@@ -60,10 +95,12 @@ pub const PALETTE_STONE: BackgroundPalette = BackgroundPalette {
     fossil: [102, 112, 128, 255],
 };
 
-pub const V1_BIOME_PALETTES: [BackgroundPalette; 2] = [PALETTE_DIRT, PALETTE_STONE];
+pub const V1_BIOME_PALETTES: [BackgroundPalette; 3] =
+    [PALETTE_OVERWORLD, PALETTE_DIRT, PALETTE_STONE];
 
 fn palette_for_biome(biome: BackgroundBiome) -> BackgroundPalette {
     match biome {
+        BackgroundBiome::Overworld => PALETTE_OVERWORLD,
         BackgroundBiome::Dirt => PALETTE_DIRT,
         BackgroundBiome::Stone => PALETTE_STONE,
     }
@@ -71,122 +108,48 @@ fn palette_for_biome(biome: BackgroundBiome) -> BackgroundPalette {
 
 // ── Biome lookup ────────────────────────────────────────────────────
 
-/// Return the primary biome for a given depth row (hard switch, no blend).
+/// Return the primary biome for a given depth row using the default
+/// Overworld->Dirt threshold.
 pub fn biome_at_depth(depth: u32) -> BackgroundBiome {
-    if depth < STONE_DEPTH_START {
+    biome_at_depth_with_surface(depth, SURFACE_DEPTH_START)
+}
+
+/// Return biome at depth using a caller-provided Overworld->Dirt threshold.
+fn biome_at_depth_with_surface(depth: u32, surface_depth_start: u32) -> BackgroundBiome {
+    if depth < surface_depth_start {
+        BackgroundBiome::Overworld
+    } else if depth < STONE_DEPTH_START {
         BackgroundBiome::Dirt
     } else {
         BackgroundBiome::Stone
     }
 }
 
-/// Biome band definition for the blend-window system.
-#[derive(Debug, Clone, Copy)]
-pub struct BiomeBand {
-    /// Depth at which the transition center lies.
-    pub center_depth: u32,
-    /// Half-width of the blend window (rows on each side of center).
-    pub half_width: u32,
-    /// Biome below the band.
-    pub biome_below: BackgroundBiome,
-    /// Biome above the band.
-    pub biome_above: BackgroundBiome,
-}
-
-/// Default v1 biome bands: Dirt -> Stone at depth 50 with 10-row blend.
-pub const V1_BIOME_BANDS: &[BiomeBand] = &[BiomeBand {
-    center_depth: STONE_DEPTH_START,
-    half_width: BIOME_BLEND_BAND_ROWS / 2,
-    biome_below: BackgroundBiome::Dirt,
-    biome_above: BackgroundBiome::Stone,
-}];
-
-/// Result of querying the biome blend at a depth.
+/// Deterministic jagged depth threshold for the Overworld->Dirt separator.
 ///
-/// `blend_alpha` is 0 when entirely in `primary`, and 255 when entirely in
-/// `secondary`. Values in between indicate a smooth transition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BiomeBlendInfo {
-    pub primary: BackgroundBiome,
-    pub secondary: BackgroundBiome,
-    /// 0 = pure primary, 255 = pure secondary.
-    pub blend_alpha: u8,
+/// `near_col` is expressed in near-layer cell columns (CELL_SIZE pixels).
+fn surface_boundary_depth_for_near_col(seed: u64, near_col: u32) -> u32 {
+    let segment = near_col / SURFACE_JAGGED_SEGMENT_COLS.max(1);
+    let hash = tile_hash(seed ^ 0x9E37_79B9_7F4A_7C15, 0, segment, 0);
+    let raise = hash % (SURFACE_JAGGED_MAX_RAISE_ROWS + 1);
+    SURFACE_DEPTH_START.saturating_sub(raise)
 }
 
-impl BiomeBlendInfo {
-    /// Convenience: a single-biome result with no blending.
-    pub const fn pure(biome: BackgroundBiome) -> Self {
-        Self {
-            primary: biome,
-            secondary: biome,
-            blend_alpha: 0,
-        }
-    }
-}
-
-/// Compute the blended biome pair for a given depth, using the band table.
+/// Resolve biome for a world depth and near-layer column.
 ///
-/// Returns `(primary, secondary, blend_alpha)` where `blend_alpha` is 0..255.
-/// Outside any blend window the result is a single biome with alpha 0.
-pub fn biome_blend_at_depth(depth: u32) -> BiomeBlendInfo {
-    biome_blend_at_depth_with_bands(depth, V1_BIOME_BANDS)
-}
-
-/// Testable version that accepts an explicit band table.
-pub fn biome_blend_at_depth_with_bands(depth: u32, bands: &[BiomeBand]) -> BiomeBlendInfo {
-    for band in bands {
-        let band_start = band.center_depth.saturating_sub(band.half_width);
-        let band_end = band.center_depth.saturating_add(band.half_width);
-
-        if depth < band_start {
-            return BiomeBlendInfo::pure(band.biome_below);
-        }
-        if depth >= band_end {
-            // Past this band — continue to next band (or fall through to last biome).
-            continue;
-        }
-
-        // Inside the blend window.
-        // Use (width - 1) as denominator so alpha reaches 255 at the last
-        // row of the window, making the transition to the pure upper biome
-        // seamless (no abrupt jump).
-        let width = band_end.saturating_sub(band_start).max(1);
-        let pos = depth.saturating_sub(band_start);
-        let denom = width.saturating_sub(1).max(1) as u64;
-        let alpha_255 = ((pos as u64).saturating_mul(255)) / denom;
-        return BiomeBlendInfo {
-            primary: band.biome_below,
-            secondary: band.biome_above,
-            blend_alpha: alpha_255.min(255) as u8,
-        };
-    }
-
-    // Past all bands: use the last band's upper biome.
-    let last_biome = bands
-        .last()
-        .map(|b| b.biome_above)
-        .unwrap_or(BackgroundBiome::Dirt);
-    BiomeBlendInfo::pure(last_biome)
-}
-
-/// Legacy probabilistic transition: picks a single biome for a tile
-/// using the blend window and a hash-based probabilistic roll.
-///
-/// Used in tests and available for callers that need a single biome
-/// rather than a blended palette.
-#[allow(dead_code)]
-pub(crate) fn biome_with_transition(depth: u32, hash: u32) -> BackgroundBiome {
-    let blend = biome_blend_at_depth(depth);
-    if blend.blend_alpha == 0 {
-        return blend.primary;
-    }
-    // Probabilistic: use hash bits to pick one biome weighted by blend_alpha.
-    let roll = (hash >> 8) & 0xFF;
-    if roll <= blend.blend_alpha as u32 {
-        blend.secondary
+/// This is the canonical hard-transition algorithm used at render-time.
+fn biome_for_world_depth_at_near_col(
+    world_depth: u32,
+    near_col: u32,
+    seed: u64,
+    legacy_underground_start: bool,
+) -> BackgroundBiome {
+    let surface_depth_start = if legacy_underground_start {
+        0
     } else {
-        blend.primary
-    }
+        surface_boundary_depth_for_near_col(seed, near_col)
+    };
+    biome_at_depth_with_surface(world_depth, surface_depth_start)
 }
 
 // ── Depth offset ────────────────────────────────────────────────────
@@ -206,6 +169,7 @@ pub fn depth_to_background_row_offset(depth_rows: u32) -> u32 {
 pub enum BackgroundTileKind {
     /// No special motif — base biome fill only.
     Empty,
+    Cloud,
     DirtA,
     DirtB,
     RockA,
@@ -221,6 +185,11 @@ impl BackgroundTileKind {
         let roll = (hash & 0xFF) as u8;
 
         match biome {
+            BackgroundBiome::Overworld => match roll {
+                0..228 => BackgroundTileKind::Empty,
+                228..250 => BackgroundTileKind::Cloud,
+                _ => BackgroundTileKind::Empty,
+            },
             BackgroundBiome::Dirt => match roll {
                 0..160 => BackgroundTileKind::Empty,
                 160..210 => BackgroundTileKind::DirtA,
@@ -347,8 +316,8 @@ const GRID_OVERLAY_ENV: &str = "ROLLOUT_TILE_GRID_OVERLAY";
 const DISABLE_LAYER_FAR_ENV: &str = "ROLLOUT_DISABLE_LAYER_FAR";
 const DISABLE_LAYER_MID_ENV: &str = "ROLLOUT_DISABLE_LAYER_MID";
 const DISABLE_LAYER_NEAR_ENV: &str = "ROLLOUT_DISABLE_LAYER_NEAR";
-const FORCE_BLEND_ALPHA_ENV: &str = "ROLLOUT_FORCE_BLEND_ALPHA";
 const BLEND_DEBUG_ENV: &str = "ROLLOUT_BLEND_DEBUG";
+const LEGACY_UNDERGROUND_START_ENV: &str = "ROLLOUT_BG_FORCE_LEGACY_UNDERGROUND_START";
 
 /// Environment-controlled kill switch for quick debugging.
 ///
@@ -360,12 +329,13 @@ pub fn tile_background_enabled() -> bool {
 
 /// Force all tiles to render as a specific biome.
 ///
-/// Set `ROLLOUT_FORCE_BIOME=dirt` or `ROLLOUT_FORCE_BIOME=stone` to override.
+/// Set `ROLLOUT_FORCE_BIOME=overworld|dirt|stone` to override.
 fn forced_biome() -> Option<BackgroundBiome> {
     static FORCED: OnceLock<Option<BackgroundBiome>> = OnceLock::new();
     *FORCED.get_or_init(|| {
         std::env::var(FORCE_BIOME_ENV).ok().and_then(|v| {
             match v.trim().to_ascii_lowercase().as_str() {
+                "overworld" | "sky" | "surface" => Some(BackgroundBiome::Overworld),
                 "dirt" => Some(BackgroundBiome::Dirt),
                 "stone" => Some(BackgroundBiome::Stone),
                 _ => None,
@@ -411,19 +381,6 @@ fn layer_disabled(layer_id: BackgroundLayerId) -> bool {
     }
 }
 
-/// Force blend alpha override (0..255). `None` = use computed blend.
-///
-/// Set `ROLLOUT_FORCE_BLEND_ALPHA=128` to force half-blend everywhere.
-fn forced_blend_alpha() -> Option<u8> {
-    static VAL: OnceLock<Option<u8>> = OnceLock::new();
-    *VAL.get_or_init(|| {
-        std::env::var(FORCE_BLEND_ALPHA_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse::<u16>().ok())
-            .map(|v| v.min(255) as u8)
-    })
-}
-
 /// Enable debug overlay showing biome pair and blend alpha.
 ///
 /// Set `ROLLOUT_BLEND_DEBUG=1` to enable.
@@ -432,36 +389,13 @@ fn blend_debug_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag(BLEND_DEBUG_ENV))
 }
 
-// ── Color blending utilities ────────────────────────────────────────
-
-/// Linearly interpolate two colors by `t` (0..255). `t=0` returns `a`, `t=255` returns `b`.
-fn lerp_color(a: Color, b: Color, t: u8) -> Color {
-    if t == 0 {
-        return a;
-    }
-    if t == 255 {
-        return b;
-    }
-    let t16 = t as u16;
-    let inv = 255u16 - t16;
-    [
-        ((a[0] as u16 * inv + b[0] as u16 * t16) / 255) as u8,
-        ((a[1] as u16 * inv + b[1] as u16 * t16) / 255) as u8,
-        ((a[2] as u16 * inv + b[2] as u16 * t16) / 255) as u8,
-        ((a[3] as u16 * inv + b[3] as u16 * t16) / 255) as u8,
-    ]
-}
-
-/// Blend two palettes by `t` (0..255).
-fn lerp_palette(a: BackgroundPalette, b: BackgroundPalette, t: u8) -> BackgroundPalette {
-    BackgroundPalette {
-        base: lerp_color(a.base, b.base, t),
-        accent_a: lerp_color(a.accent_a, b.accent_a, t),
-        accent_b: lerp_color(a.accent_b, b.accent_b, t),
-        vein: lerp_color(a.vein, b.vein, t),
-        crack: lerp_color(a.crack, b.crack, t),
-        fossil: lerp_color(a.fossil, b.fossil, t),
-    }
+/// Force old behavior where runs start underground (Dirt).
+///
+/// Set `ROLLOUT_BG_FORCE_LEGACY_UNDERGROUND_START=1` to bypass the Overworld
+/// surface region entirely.
+fn legacy_underground_start_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_flag(LEGACY_UNDERGROUND_START_ENV))
 }
 
 // ── Draw entry point ────────────────────────────────────────────────
@@ -475,56 +409,202 @@ pub fn draw_tile_background(
     depth_rows: u32,
     seed: u64,
 ) {
+    draw_tile_background_in_viewport(frame, width, height, board_rect, depth_rows, seed, 0);
+}
+
+/// Draw the background into a fixed viewport while applying a vertical content offset.
+///
+/// Positive `content_offset_y_px` moves world content downward inside `viewport_rect`.
+pub fn draw_tile_background_in_viewport(
+    frame: &mut dyn Renderer2d,
+    width: u32,
+    height: u32,
+    viewport_rect: Rect,
+    depth_rows: u32,
+    seed: u64,
+    content_offset_y_px: i32,
+) {
     draw_tile_background_impl(
         frame,
         width,
         height,
-        board_rect,
+        viewport_rect,
         depth_rows,
         seed,
         tile_background_enabled(),
+        content_offset_y_px,
     );
+}
+
+/// Draw only the Overworld->Dirt grassline separator in board viewport space.
+///
+/// This is used as an overlay pass so the separator remains visible above
+/// bottomwell/locked board cells.
+pub fn draw_surface_grass_overlay_in_viewport(
+    frame: &mut dyn Renderer2d,
+    viewport_rect: Rect,
+    depth_rows: u32,
+    seed: u64,
+    content_offset_y_px: i32,
+) {
+    if viewport_rect.w == 0 || viewport_rect.h == 0 || !tile_background_enabled() {
+        return;
+    }
+    if layer_disabled(BackgroundLayerId::Near) || legacy_underground_start_enabled() {
+        return;
+    }
+    if forced_biome().is_some() {
+        return;
+    }
+
+    draw_surface_grass_overlay_impl(frame, viewport_rect, depth_rows, seed, content_offset_y_px);
 }
 
 fn draw_tile_background_impl(
     frame: &mut dyn Renderer2d,
     width: u32,
     height: u32,
-    board_rect: Rect,
+    viewport_rect: Rect,
     depth_rows: u32,
     seed: u64,
     enabled: bool,
+    content_offset_y_px: i32,
 ) {
     frame.fill_rect(Rect::from_size(width, height), CLEAR_COLOR);
-    if !enabled || board_rect.w == 0 || board_rect.h == 0 {
+    if !enabled || viewport_rect.w == 0 || viewport_rect.h == 0 {
         return;
     }
 
     // Draw back-to-front: Far, Mid, Near.
     for layer in &V1_LAYERS {
         if !layer_disabled(layer.layer_id) {
-            draw_tile_layer(frame, board_rect, depth_rows, seed, *layer);
+            draw_tile_layer(
+                frame,
+                viewport_rect,
+                depth_rows,
+                seed,
+                *layer,
+                content_offset_y_px,
+            );
         }
     }
 
     // Optional blend-debug overlay.
     if blend_debug_enabled() {
-        draw_blend_debug_overlay(frame, board_rect, depth_rows);
+        draw_blend_debug_overlay(frame, viewport_rect, depth_rows, seed);
+    }
+}
+
+fn draw_surface_grass_overlay_impl(
+    frame: &mut dyn Renderer2d,
+    viewport_rect: Rect,
+    depth_rows: u32,
+    seed: u64,
+    content_offset_y_px: i32,
+) {
+    let tile_px = LAYER_NEAR.tile_px.max(1);
+    let visible_cols = viewport_rect.w.div_ceil(tile_px);
+    if visible_cols == 0 || viewport_rect.h == 0 {
+        return;
+    }
+
+    let tile_px_i32 = tile_px.min(i32::MAX as u32) as i32;
+    let viewport_h_i32 = viewport_rect.h.min(i32::MAX as u32) as i32;
+    let layer_offset = depth_to_background_row_offset(depth_rows) / LAYER_NEAR.depth_divisor.max(1);
+    let viewport_max_x = viewport_rect.x.saturating_add(viewport_rect.w);
+    let layer_id_u32 = BackgroundLayerId::Near as u32;
+
+    // Match background row coverage so overlay remains aligned under camera offsets.
+    let first_visible_row = (-content_offset_y_px - tile_px_i32).div_euclid(tile_px_i32) + 1;
+    let last_visible_row = (viewport_h_i32 - content_offset_y_px - 1).div_euclid(tile_px_i32);
+    let draw_row_start = first_visible_row.saturating_sub(1);
+    let draw_row_end = last_visible_row.saturating_add(1);
+
+    for tile_row in draw_row_start..=draw_row_end {
+        let y_i32 = (viewport_rect.y as i32)
+            .saturating_add(content_offset_y_px)
+            .saturating_add(tile_row.saturating_mul(tile_px_i32));
+        let Some(clipped_row_rect) = clip_rect_i32_to_viewport(
+            viewport_rect.x as i32,
+            y_i32,
+            viewport_rect.w,
+            tile_px,
+            viewport_rect,
+        ) else {
+            continue;
+        };
+
+        let world_depth = world_depth_for_tile_row(layer_offset, tile_row);
+
+        for tile_x in 0..visible_cols {
+            let x = viewport_rect
+                .x
+                .saturating_add(tile_x.saturating_mul(tile_px));
+            if x >= viewport_max_x {
+                continue;
+            }
+            let w = viewport_max_x.saturating_sub(x).min(tile_px);
+            if w == 0 {
+                continue;
+            }
+
+            let hash = tile_hash(seed, world_depth, tile_x, layer_id_u32);
+            let near_col = near_col_for_tile(viewport_rect, x, w);
+            if biome_for_world_depth_at_near_col(world_depth, near_col, seed, false)
+                != BackgroundBiome::Dirt
+                || world_depth != surface_boundary_depth_for_near_col(seed, near_col)
+            {
+                continue;
+            }
+
+            let unclipped_tile = Rect::new(x, clipped_row_rect.y, w, clipped_row_rect.h);
+            let Some(tile_rect) = clip_rect_to_viewport(unclipped_tile, viewport_rect) else {
+                continue;
+            };
+            draw_grassline_separator(frame, tile_rect, LAYER_NEAR.alpha, hash);
+        }
     }
 }
 
 // ── Per-layer rendering (Phase 4) ───────────────────────────────────
 
+/// Convert a layer-local tile row index into world depth.
+///
+/// `tile_row_from_top` increases downward in screen space, which keeps deeper
+/// biomes entering from the lower board region as dig-progress increases.
+fn world_depth_for_tile_row(layer_offset: u32, tile_row_from_top: i32) -> u32 {
+    if tile_row_from_top >= 0 {
+        layer_offset.saturating_add(tile_row_from_top as u32)
+    } else {
+        layer_offset.saturating_sub(tile_row_from_top.unsigned_abs())
+    }
+}
+
+fn near_col_for_tile(viewport_rect: Rect, tile_x: u32, tile_w: u32) -> u32 {
+    let rel_center_x = tile_x
+        .saturating_sub(viewport_rect.x)
+        .saturating_add(tile_w / 2);
+    rel_center_x / CELL_SIZE.max(1)
+}
+
 fn draw_tile_layer(
     frame: &mut dyn Renderer2d,
-    board_rect: Rect,
+    viewport_rect: Rect,
     depth_rows: u32,
     seed: u64,
     layer: BackgroundLayerSpec,
+    content_offset_y_px: i32,
 ) {
     let tile_px = layer.tile_px.max(1);
-    let visible_cols = board_rect.w.div_ceil(tile_px);
-    let visible_rows = board_rect.h.div_ceil(tile_px);
+    let visible_cols = viewport_rect.w.div_ceil(tile_px);
+    if visible_cols == 0 || viewport_rect.h == 0 {
+        return;
+    }
+
+    let tile_px_i32 = tile_px.min(i32::MAX as u32) as i32;
+    let viewport_h_i32 = viewport_rect.h.min(i32::MAX as u32) as i32;
+    let legacy_underground_start = legacy_underground_start_enabled();
+    let forced = forced_biome();
 
     // Apply parallax multiplier override for non-near layers.
     let effective_divisor = if layer.layer_id != BackgroundLayerId::Near && layer.depth_divisor > 1
@@ -535,97 +615,134 @@ fn draw_tile_layer(
         layer.depth_divisor.max(1)
     };
     let layer_offset = depth_to_background_row_offset(depth_rows) / effective_divisor;
-    let board_max_x = board_rect.x.saturating_add(board_rect.w);
-    let board_max_y = board_rect.y.saturating_add(board_rect.h);
+    let viewport_max_x = viewport_rect.x.saturating_add(viewport_rect.w);
     let layer_id_u32 = layer.layer_id as u32;
 
-    for tile_y in 0..visible_rows {
-        let y = board_rect.y.saturating_add(tile_y.saturating_mul(tile_px));
-        if y >= board_max_y {
-            continue;
-        }
-        let h = board_max_y.saturating_sub(y).min(tile_px);
-        if h == 0 {
-            continue;
-        }
+    // Draw one extra row above and below the visible range so edge content persists
+    // until fully clipped out under partial camera offsets.
+    let first_visible_row = (-content_offset_y_px - tile_px_i32).div_euclid(tile_px_i32) + 1;
+    let last_visible_row = (viewport_h_i32 - content_offset_y_px - 1).div_euclid(tile_px_i32);
+    let draw_row_start = first_visible_row.saturating_sub(1);
+    let draw_row_end = last_visible_row.saturating_add(1);
 
-        let row_from_bottom = visible_rows.saturating_sub(1).saturating_sub(tile_y);
-        let world_depth = layer_offset.saturating_add(row_from_bottom);
-
-        // Compute blend info once per row (all tiles in a row share the same depth).
-        let blend = if let Some(forced) = forced_biome() {
-            BiomeBlendInfo::pure(forced)
-        } else {
-            let mut info = biome_blend_at_depth(world_depth);
-            if let Some(forced_alpha) = forced_blend_alpha() {
-                info.blend_alpha = forced_alpha;
-                // When forcing alpha, ensure secondary differs from primary for
-                // visibility. If we only have one band, set secondary to Stone.
-                if info.primary == info.secondary && forced_alpha > 0 {
-                    info.secondary = match info.primary {
-                        BackgroundBiome::Dirt => BackgroundBiome::Stone,
-                        BackgroundBiome::Stone => BackgroundBiome::Dirt,
-                    };
-                }
-            }
-            info
+    for tile_row in draw_row_start..=draw_row_end {
+        let y_i32 = (viewport_rect.y as i32)
+            .saturating_add(content_offset_y_px)
+            .saturating_add(tile_row.saturating_mul(tile_px_i32));
+        let Some(clipped_row_rect) = clip_rect_i32_to_viewport(
+            viewport_rect.x as i32,
+            y_i32,
+            viewport_rect.w,
+            tile_px,
+            viewport_rect,
+        ) else {
+            continue;
         };
 
-        // Pre-compute the effective palette for this row (blend primary+secondary).
-        // Phase 6: this avoids per-tile palette blending when blend_alpha is 0.
-        let palette = if blend.blend_alpha == 0 {
-            palette_for_biome(blend.primary)
-        } else {
-            let pa = palette_for_biome(blend.primary);
-            let pb = palette_for_biome(blend.secondary);
-            lerp_palette(pa, pb, blend.blend_alpha)
-        };
+        let world_depth = world_depth_for_tile_row(layer_offset, tile_row);
 
-        // Choose the biome for tile-kind sampling. For blended rows, use
-        // probabilistic selection per-tile (keeps motif variety across the
-        // transition window while the palette smoothly interpolates).
         for tile_x in 0..visible_cols {
-            let x = board_rect.x.saturating_add(tile_x.saturating_mul(tile_px));
-            if x >= board_max_x {
+            let x = viewport_rect
+                .x
+                .saturating_add(tile_x.saturating_mul(tile_px));
+            if x >= viewport_max_x {
                 continue;
             }
-            let w = board_max_x.saturating_sub(x).min(tile_px);
+            let w = viewport_max_x.saturating_sub(x).min(tile_px);
             if w == 0 {
                 continue;
             }
 
             let hash = tile_hash(seed, world_depth, tile_x, layer_id_u32);
-            let sample_biome = if blend.blend_alpha == 0 {
-                blend.primary
+            let near_col = near_col_for_tile(viewport_rect, x, w);
+            let biome = if let Some(forced_biome) = forced {
+                forced_biome
             } else {
-                // Use hash bits for probabilistic biome selection.
-                let roll = (hash >> 8) & 0xFF;
-                if roll <= blend.blend_alpha as u32 {
-                    blend.secondary
-                } else {
-                    blend.primary
-                }
+                biome_for_world_depth_at_near_col(
+                    world_depth,
+                    near_col,
+                    seed,
+                    legacy_underground_start,
+                )
             };
+            let palette = palette_for_biome(biome);
 
-            let tile_rect = Rect::new(x, y, w, h);
+            let unclipped_tile = Rect::new(x, clipped_row_rect.y, w, clipped_row_rect.h);
+            let Some(tile_rect) = clip_rect_to_viewport(unclipped_tile, viewport_rect) else {
+                continue;
+            };
             draw_tile_rect(frame, tile_rect, palette.base, layer.alpha);
 
             if layer.motif_enabled {
-                let kind = BackgroundTileKind::from_hash(hash, sample_biome);
+                let kind = BackgroundTileKind::from_hash(hash, biome);
                 draw_tile_motif(frame, tile_rect, kind, palette, layer.alpha);
+            }
+
+            // Draw only the Overworld->Dirt separator as a jagged grassline.
+            if forced.is_none()
+                && !legacy_underground_start
+                && layer.layer_id == BackgroundLayerId::Near
+                && biome == BackgroundBiome::Dirt
+                && world_depth == surface_boundary_depth_for_near_col(seed, near_col)
+            {
+                draw_grassline_separator(frame, tile_rect, layer.alpha, hash);
             }
 
             if grid_overlay_enabled() {
                 const GRID_COLOR: Color = [255, 255, 255, 255];
                 const GRID_ALPHA: u8 = 30;
-                frame.blend_rect(Rect::new(x, y, w, 1), GRID_COLOR, GRID_ALPHA);
-                frame.blend_rect(Rect::new(x, y, 1, h), GRID_COLOR, GRID_ALPHA);
+                frame.blend_rect(
+                    Rect::new(tile_rect.x, tile_rect.y, tile_rect.w, 1),
+                    GRID_COLOR,
+                    GRID_ALPHA,
+                );
+                frame.blend_rect(
+                    Rect::new(tile_rect.x, tile_rect.y, 1, tile_rect.h),
+                    GRID_COLOR,
+                    GRID_ALPHA,
+                );
             }
         }
     }
 }
 
 // ── Tile drawing helpers ────────────────────────────────────────────
+
+fn draw_grassline_separator(frame: &mut dyn Renderer2d, rect: Rect, alpha: u8, hash: u32) {
+    if rect.w == 0 || rect.h == 0 {
+        return;
+    }
+    let top_h = (rect.h / 8).max(1).min(3);
+    draw_tile_rect(
+        frame,
+        Rect::new(rect.x, rect.y, rect.w, top_h),
+        GRASSLINE_COLOR,
+        alpha,
+    );
+
+    // Add tiny deterministic "teeth" to avoid a perfectly straight stripe.
+    if rect.h > top_h + 1 {
+        let tooth_h = (rect.h / 10).max(1).min(2);
+        let half_w = (rect.w / 2).max(1);
+        let y = rect.y.saturating_add(top_h);
+        if (hash & 0b01) != 0 {
+            draw_tile_rect(
+                frame,
+                Rect::new(rect.x, y, half_w, tooth_h),
+                GRASSLINE_COLOR,
+                alpha,
+            );
+        }
+        if (hash & 0b10) != 0 {
+            draw_tile_rect(
+                frame,
+                Rect::new(rect.x + rect.w.saturating_sub(half_w), y, half_w, tooth_h),
+                GRASSLINE_COLOR,
+                alpha,
+            );
+        }
+    }
+}
 
 fn draw_tile_rect(frame: &mut dyn Renderer2d, rect: Rect, color: Color, alpha: u8) {
     if alpha >= 255 {
@@ -652,6 +769,31 @@ fn draw_tile_motif(
 
     match kind {
         BackgroundTileKind::Empty => {}
+        BackgroundTileKind::Cloud => {
+            let cloud_alpha = ((alpha as u16).saturating_mul(160) / 255).max(20) as u8;
+            let span_w = (rect.w.saturating_mul(2) / 3).max(2).min(rect.w);
+            let puff_h = (rect.h / 6).max(1);
+            let x0 = rect.x + rect.w.saturating_sub(span_w) / 2;
+            let y0 = rect.y + rect.h / 3;
+            draw_tile_rect(
+                frame,
+                Rect::new(x0, y0, span_w, puff_h),
+                palette.accent_a,
+                cloud_alpha,
+            );
+
+            if rect.h > puff_h + 1 {
+                let y1 = y0.saturating_add(puff_h.saturating_add(1));
+                let inner_w = (span_w.saturating_mul(2) / 3).max(1);
+                let x1 = x0 + span_w.saturating_sub(inner_w) / 2;
+                draw_tile_rect(
+                    frame,
+                    Rect::new(x1, y1, inner_w, puff_h),
+                    palette.accent_b,
+                    cloud_alpha,
+                );
+            }
+        }
         BackgroundTileKind::DirtA | BackgroundTileKind::RockA => {
             let x = cx.saturating_sub(dot);
             let y = cy.saturating_sub(dot);
@@ -728,23 +870,37 @@ fn draw_tile_motif(
 
 // ── Blend debug overlay (Phase 5) ───────────────────────────────────
 
-fn draw_blend_debug_overlay(frame: &mut dyn Renderer2d, board_rect: Rect, depth_rows: u32) {
-    // Show current blend info as a small text overlay at the top of the board.
-    let blend = biome_blend_at_depth(depth_to_background_row_offset(depth_rows));
+fn draw_blend_debug_overlay(
+    frame: &mut dyn Renderer2d,
+    board_rect: Rect,
+    depth_rows: u32,
+    seed: u64,
+) {
+    // Show current biome state for the center column.
+    let sample_depth = depth_to_background_row_offset(depth_rows);
+    let center_col = board_rect
+        .w
+        .saturating_div(CELL_SIZE.max(1))
+        .saturating_div(2);
+    let legacy = legacy_underground_start_enabled();
+    let surface_depth = if legacy {
+        0
+    } else {
+        surface_boundary_depth_for_near_col(seed, center_col)
+    };
+    let biome = biome_for_world_depth_at_near_col(sample_depth, center_col, seed, legacy);
     let biome_name = |b: BackgroundBiome| match b {
+        BackgroundBiome::Overworld => "OVERWORLD",
         BackgroundBiome::Dirt => "DIRT",
         BackgroundBiome::Stone => "STONE",
     };
-    let text = if blend.blend_alpha == 0 {
-        format!("BG: {} a=0", biome_name(blend.primary))
-    } else {
-        format!(
-            "BG: {}+{} a={}",
-            biome_name(blend.primary),
-            biome_name(blend.secondary),
-            blend.blend_alpha
-        )
-    };
+    let text = format!(
+        "BG: {} d={} surf={} stone={}",
+        biome_name(biome),
+        sample_depth,
+        surface_depth,
+        STONE_DEPTH_START
+    );
     let tx = board_rect.x + 4;
     let ty = board_rect.y + 4;
     frame.draw_text(tx, ty, &text, [255, 255, 0, 255]);
@@ -822,14 +978,21 @@ mod tests {
     // -- biome_at_depth ------------------------------------------------------
 
     #[test]
-    fn biome_dirt_below_threshold() {
-        for d in 0..STONE_DEPTH_START {
+    fn biome_overworld_below_surface_threshold() {
+        for d in 0..SURFACE_DEPTH_START {
+            assert_eq!(biome_at_depth(d), BackgroundBiome::Overworld);
+        }
+    }
+
+    #[test]
+    fn biome_dirt_between_surface_and_stone_thresholds() {
+        for d in SURFACE_DEPTH_START..STONE_DEPTH_START {
             assert_eq!(biome_at_depth(d), BackgroundBiome::Dirt);
         }
     }
 
     #[test]
-    fn biome_stone_at_and_above_threshold() {
+    fn biome_stone_at_and_above_stone_threshold() {
         assert_eq!(biome_at_depth(STONE_DEPTH_START), BackgroundBiome::Stone);
         assert_eq!(
             biome_at_depth(STONE_DEPTH_START + 100),
@@ -838,118 +1001,84 @@ mod tests {
         assert_eq!(biome_at_depth(u32::MAX), BackgroundBiome::Stone);
     }
 
-    // -- biome_blend_at_depth ------------------------------------------------
+    // -- hard surface separator ----------------------------------------------
 
     #[test]
-    fn blend_pure_dirt_well_below_boundary() {
-        let info = biome_blend_at_depth(0);
-        assert_eq!(info.primary, BackgroundBiome::Dirt);
-        assert_eq!(info.blend_alpha, 0);
+    fn surface_boundary_is_deterministic_for_same_seed_and_column() {
+        let a = surface_boundary_depth_for_near_col(1234, 7);
+        let b = surface_boundary_depth_for_near_col(1234, 7);
+        assert_eq!(a, b);
     }
 
     #[test]
-    fn blend_pure_stone_well_above_boundary() {
-        let info = biome_blend_at_depth(STONE_DEPTH_START + 100);
-        assert_eq!(info.primary, BackgroundBiome::Stone);
-        assert_eq!(info.blend_alpha, 0);
-    }
-
-    #[test]
-    fn blend_nonzero_at_boundary_center() {
-        let info = biome_blend_at_depth(STONE_DEPTH_START);
-        // At the center of a 10-row band, alpha should be ~128.
-        assert!(
-            info.blend_alpha > 100 && info.blend_alpha < 200,
-            "blend_alpha at center should be roughly half, got {}",
-            info.blend_alpha
-        );
-        assert_eq!(info.primary, BackgroundBiome::Dirt);
-        assert_eq!(info.secondary, BackgroundBiome::Stone);
-    }
-
-    #[test]
-    fn blend_alpha_increases_through_window() {
-        let half = BIOME_BLEND_BAND_ROWS / 2;
-        let start = STONE_DEPTH_START.saturating_sub(half);
-        let end = STONE_DEPTH_START.saturating_add(half);
-
-        let mut prev_alpha = 0u8;
-        for d in start..end {
-            let info = biome_blend_at_depth(d);
-            assert!(
-                info.blend_alpha >= prev_alpha,
-                "blend_alpha should be monotonically non-decreasing through window: \
-                 depth={d}, alpha={}, prev={}",
-                info.blend_alpha,
-                prev_alpha
-            );
-            prev_alpha = info.blend_alpha;
+    fn surface_boundary_stays_flat_when_row_raise_is_disabled() {
+        let mut seen = std::collections::BTreeSet::new();
+        for col in 0..32 {
+            seen.insert(surface_boundary_depth_for_near_col(1234, col));
         }
-        // Alpha should reach a meaningful value by the end of the window.
         assert!(
-            prev_alpha > 200,
-            "blend_alpha should be close to 255 at end of window, got {prev_alpha}"
+            seen.len() == 1,
+            "surface boundary row should stay fixed when row-raise jitter is disabled"
         );
     }
 
     #[test]
-    fn blend_no_abrupt_visual_jumps() {
-        // Check that the effective blended palette base color never jumps
-        // abruptly between consecutive depths. Raw alpha can reset at the
-        // window edge (e.g. from 255 to 0), but the visual output is smooth
-        // because both sides of the boundary produce the same biome palette.
-        let max_channel_jump = 12u16; // per channel, per row
-
-        let effective_base = |d: u32| -> Color {
-            let info = biome_blend_at_depth(d);
-            if info.blend_alpha == 0 {
-                palette_for_biome(info.primary).base
-            } else {
-                let pa = palette_for_biome(info.primary);
-                let pb = palette_for_biome(info.secondary);
-                lerp_palette(pa, pb, info.blend_alpha).base
-            }
-        };
-
-        for d in 1..200 {
-            let a = effective_base(d - 1);
-            let b = effective_base(d);
-            for ch in 0..4 {
-                let diff = (b[ch] as i16 - a[ch] as i16).unsigned_abs();
-                assert!(
-                    diff <= max_channel_jump,
-                    "base color channel {} jumped by {} between depth {} and {} ({:?}->{:?})",
-                    ch,
-                    diff,
-                    d - 1,
-                    d,
-                    a,
-                    b
+    fn start_view_has_bottom_three_rows_in_dirt_for_all_columns() {
+        let seed = 42u64;
+        let bottom_three = [
+            SURFACE_DEPTH_START,
+            SURFACE_DEPTH_START + 1,
+            SURFACE_DEPTH_START + 2,
+        ];
+        for col in 0..48 {
+            for &depth in &bottom_three {
+                assert_eq!(
+                    biome_for_world_depth_at_near_col(depth, col, seed, false),
+                    BackgroundBiome::Dirt,
+                    "expected start bottom rows to be Dirt at col={col}, depth={depth}"
                 );
             }
         }
     }
 
     #[test]
-    fn blend_with_custom_bands() {
-        let bands = &[BiomeBand {
-            center_depth: 100,
-            half_width: 20,
-            biome_below: BackgroundBiome::Dirt,
-            biome_above: BackgroundBiome::Stone,
-        }];
-        let below = biome_blend_at_depth_with_bands(50, bands);
-        assert_eq!(below.primary, BackgroundBiome::Dirt);
-        assert_eq!(below.blend_alpha, 0);
+    fn separator_moves_up_one_row_per_depth_step_in_near_layer() {
+        let seed = 77u64;
+        let col = 5u32;
+        let boundary = surface_boundary_depth_for_near_col(seed, col);
+        assert!(
+            boundary >= 1,
+            "boundary must support a one-step upward move"
+        );
 
-        let mid = biome_blend_at_depth_with_bands(100, bands);
-        assert_eq!(mid.primary, BackgroundBiome::Dirt);
-        assert_eq!(mid.secondary, BackgroundBiome::Stone);
-        assert!(mid.blend_alpha > 100);
+        let row_at_depth0 = boundary;
+        let row_at_depth1 = boundary - 1;
+        assert_eq!(row_at_depth1 + 1, row_at_depth0);
 
-        let above = biome_blend_at_depth_with_bands(200, bands);
-        assert_eq!(above.primary, BackgroundBiome::Stone);
-        assert_eq!(above.blend_alpha, 0);
+        // At depth_rows=0, row_at_depth0 is first Dirt row.
+        assert_eq!(
+            biome_for_world_depth_at_near_col(row_at_depth0, col, seed, false),
+            BackgroundBiome::Dirt
+        );
+        assert_eq!(
+            biome_for_world_depth_at_near_col(row_at_depth0 - 1, col, seed, false),
+            BackgroundBiome::Overworld
+        );
+
+        // At depth_rows=1, separator shifts up by one row.
+        let world_depth_new_separator = 1 + row_at_depth1;
+        assert_eq!(
+            world_depth_new_separator, boundary,
+            "new separator row should map to the same boundary depth"
+        );
+    }
+
+    #[test]
+    fn legacy_underground_start_skips_overworld() {
+        assert_eq!(
+            biome_for_world_depth_at_near_col(0, 0, 1, true),
+            BackgroundBiome::Dirt
+        );
     }
 
     // -- depth_to_background_row_offset --------------------------------------
@@ -976,6 +1105,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn world_depth_increases_from_top_to_bottom_rows() {
+        let layer_offset = 7u32;
+        let top_row_depth = world_depth_for_tile_row(layer_offset, 0);
+        let bottom_row_depth = world_depth_for_tile_row(layer_offset, 19);
+        assert!(
+            bottom_row_depth > top_row_depth,
+            "deeper biome contribution should grow toward lower board rows"
+        );
+    }
+
     // -- tile kind from hash -------------------------------------------------
 
     #[test]
@@ -984,6 +1124,13 @@ mod tests {
         let a = BackgroundTileKind::from_hash(h, BackgroundBiome::Dirt);
         let b = BackgroundTileKind::from_hash(h, BackgroundBiome::Dirt);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn tile_kind_covers_all_rolls_overworld() {
+        for roll in 0u32..=255 {
+            let _ = BackgroundTileKind::from_hash(roll, BackgroundBiome::Overworld);
+        }
     }
 
     #[test]
@@ -1008,6 +1155,20 @@ mod tests {
             })
             .count();
         assert!(empties > 128, "Dirt biome should be majority Empty tiles");
+    }
+
+    #[test]
+    fn tile_kind_distribution_overworld_is_low_noise() {
+        let empties = (0u32..256)
+            .filter(|&r| {
+                BackgroundTileKind::from_hash(r, BackgroundBiome::Overworld)
+                    == BackgroundTileKind::Empty
+            })
+            .count();
+        assert!(
+            empties > 200,
+            "Overworld should remain mostly empty to keep readability"
+        );
     }
 
     #[test]
@@ -1106,42 +1267,49 @@ mod tests {
         assert_ne!(far_offset, near_offset);
     }
 
-    // -- color blending ------------------------------------------------------
-
-    #[test]
-    fn lerp_color_endpoints() {
-        let a: Color = [0, 0, 0, 255];
-        let b: Color = [255, 255, 255, 255];
-        assert_eq!(lerp_color(a, b, 0), a);
-        assert_eq!(lerp_color(a, b, 255), b);
-    }
-
-    #[test]
-    fn lerp_color_midpoint() {
-        let a: Color = [0, 0, 0, 255];
-        let b: Color = [254, 254, 254, 255];
-        let mid = lerp_color(a, b, 128);
-        // Should be roughly halfway.
-        for i in 0..3 {
-            assert!(
-                (mid[i] as i16 - 127).abs() < 5,
-                "channel {} should be ~127, got {}",
-                i,
-                mid[i]
-            );
-        }
-    }
-
     // -- draw_tile_background ------------------------------------------------
 
+    const TEST_FRAME_W: u32 = 480;
+    const TEST_FRAME_H: u32 = 360;
+
+    fn test_board_rect() -> Rect {
+        Rect::new(120, 0, 240, 360)
+    }
+
     fn draw_background_frame(seed: u64, depth_rows: u32) -> Vec<u8> {
-        let width = 480;
-        let height = 360;
-        let board_rect = Rect::new(120, 0, 240, 360);
-        let mut frame = vec![0u8; (width * height * 4) as usize];
-        let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
-        draw_tile_background_impl(&mut gfx, width, height, board_rect, depth_rows, seed, true);
+        draw_background_frame_with_offset(seed, depth_rows, 0)
+    }
+
+    fn draw_background_frame_with_offset(
+        seed: u64,
+        depth_rows: u32,
+        content_offset_y_px: i32,
+    ) -> Vec<u8> {
+        let mut frame = vec![0u8; (TEST_FRAME_W * TEST_FRAME_H * 4) as usize];
+        let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(TEST_FRAME_W, TEST_FRAME_H));
+        draw_tile_background_impl(
+            &mut gfx,
+            TEST_FRAME_W,
+            TEST_FRAME_H,
+            test_board_rect(),
+            depth_rows,
+            seed,
+            true,
+            content_offset_y_px,
+        );
         frame
+    }
+
+    fn frame_diff_count(a: &[u8], b: &[u8]) -> usize {
+        a.chunks_exact(4)
+            .zip(b.chunks_exact(4))
+            .filter(|(pa, pb)| pa != pb)
+            .count()
+    }
+
+    fn pixel_at(frame: &[u8], frame_w: u32, x: u32, y: u32) -> [u8; 4] {
+        let idx = ((y * frame_w + x) * 4) as usize;
+        [frame[idx], frame[idx + 1], frame[idx + 2], frame[idx + 3]]
     }
 
     #[test]
@@ -1159,39 +1327,33 @@ mod tests {
     }
 
     #[test]
-    fn draw_tile_background_differs_at_biome_boundary() {
-        // Compare a frame well in Dirt vs one well in Stone.
-        let dirt = draw_background_frame(42, 10);
+    fn draw_tile_background_differs_between_surface_and_deep_depths() {
+        let surface = draw_background_frame(42, 0);
         let stone = draw_background_frame(42, 80);
         assert_ne!(
-            dirt, stone,
-            "background should look different between Dirt and Stone depths"
+            surface, stone,
+            "background should look different between Overworld and deep Stone depths"
         );
     }
 
     #[test]
-    fn draw_tile_background_blend_transition_is_smooth() {
-        // Frames at consecutive depths through the blend window should change
-        // gradually (no identical adjacent frames that suddenly jump).
-        let half = BIOME_BLEND_BAND_ROWS / 2;
-        let start = STONE_DEPTH_START.saturating_sub(half);
-        let end = STONE_DEPTH_START.saturating_add(half);
-
-        let mut prev = draw_background_frame(42, start);
-        let mut identical_count = 0u32;
-        for d in (start + 1)..=end {
-            let current = draw_background_frame(42, d);
-            if current == prev {
-                identical_count += 1;
-            }
-            prev = current;
-        }
-        // It's ok if a few adjacent frames happen to be identical (probabilistic
-        // sampling can collide), but a majority should differ.
-        let window_size = end - start;
+    fn draw_tile_background_first_dig_step_changes_surface_frame() {
+        let start = draw_background_frame(42, 0);
+        let progressed = draw_background_frame(42, 1);
         assert!(
-            identical_count < window_size / 2,
-            "too many identical frames in blend window ({identical_count}/{window_size})"
+            frame_diff_count(&start, &progressed) > 0,
+            "first dig step should change the rendered background frame"
+        );
+    }
+
+    #[test]
+    fn draw_tile_background_positive_offset_keeps_top_edge_filled() {
+        let shifted = draw_background_frame_with_offset(42, 0, (CELL_SIZE as i32) / 2);
+        let board = test_board_rect();
+        let sample = pixel_at(&shifted, TEST_FRAME_W, board.x + 1, board.y + 1);
+        assert_ne!(
+            sample, CLEAR_COLOR,
+            "top edge should remain background-filled while content is partially offset"
         );
     }
 
@@ -1214,11 +1376,11 @@ mod tests {
         let col = 7u32;
         for layer in BackgroundLayerId::ALL {
             let h = tile_hash(seed, depth, col, layer as u32);
-            let biome = biome_with_transition(depth, h);
+            let biome = biome_for_world_depth_at_near_col(depth, col, seed, false);
             let kind = BackgroundTileKind::from_hash(h, biome);
 
             let h2 = tile_hash(seed, depth, col, layer as u32);
-            let biome2 = biome_with_transition(depth, h2);
+            let biome2 = biome_for_world_depth_at_near_col(depth, col, seed, false);
             let kind2 = BackgroundTileKind::from_hash(h2, biome2);
 
             assert_eq!(biome, biome2);

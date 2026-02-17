@@ -1,7 +1,9 @@
+use std::time::Duration;
+
 use engine::GameLogic;
 
 use crate::state::GameState;
-use crate::tetris_core::{Piece, RotationDir, TetrisCore, Vec2i};
+use crate::tetris_core::{BottomwellRunMods, DepthWallDef, Piece, RotationDir, TetrisCore, Vec2i};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputAction {
@@ -9,6 +11,7 @@ pub enum InputAction {
     MoveLeft,
     MoveRight,
     SoftDrop,
+    GravityTick { dt_ms: u32 },
     RotateCw,
     RotateCcw,
     Rotate180,
@@ -16,16 +19,23 @@ pub enum InputAction {
     Hold,
 }
 
+fn duration_to_ms_u32(duration: Duration) -> u32 {
+    duration.as_millis().min(u128::from(u32::MAX)) as u32
+}
+
 #[derive(Debug, Clone)]
-pub struct TetrisLogic {
+pub struct BlockLogic {
     seed: u64,
     available_pieces: Vec<Piece>,
     gravity_enabled: bool,
     score_bonus_per_line: u32,
     bottomwell_enabled: bool,
+    bottomwell_run_mods: BottomwellRunMods,
+    depth_wall_defs_override: Option<Vec<DepthWallDef>>,
+    depth_wall_damage_tuning: Option<(u32, u32)>,
 }
 
-impl TetrisLogic {
+impl BlockLogic {
     pub fn new(seed: u64, available_pieces: Vec<Piece>) -> Self {
         Self {
             seed,
@@ -33,6 +43,9 @@ impl TetrisLogic {
             gravity_enabled: false,
             score_bonus_per_line: 0,
             bottomwell_enabled: false,
+            bottomwell_run_mods: BottomwellRunMods::default(),
+            depth_wall_defs_override: None,
+            depth_wall_damage_tuning: None,
         }
     }
 
@@ -50,9 +63,28 @@ impl TetrisLogic {
         self.bottomwell_enabled = enabled;
         self
     }
+
+    pub fn with_bottomwell_run_mods(mut self, mods: BottomwellRunMods) -> Self {
+        self.bottomwell_run_mods = mods;
+        self
+    }
+
+    pub fn with_depth_wall_defs(mut self, defs: Vec<DepthWallDef>) -> Self {
+        self.depth_wall_defs_override = Some(defs);
+        self
+    }
+
+    pub fn with_depth_wall_damage_tuning(
+        mut self,
+        per_line_damage: u32,
+        multi_bonus_percent: u32,
+    ) -> Self {
+        self.depth_wall_damage_tuning = Some((per_line_damage, multi_bonus_percent));
+        self
+    }
 }
 
-impl GameLogic for TetrisLogic {
+impl GameLogic for BlockLogic {
     type State = GameState;
     type Input = InputAction;
 
@@ -60,6 +92,13 @@ impl GameLogic for TetrisLogic {
         let mut core = TetrisCore::new(self.seed);
         core.set_available_pieces(self.available_pieces.clone());
         core.set_bottomwell_enabled(self.bottomwell_enabled);
+        core.set_bottomwell_run_mods(self.bottomwell_run_mods);
+        if let Some(defs) = self.depth_wall_defs_override.as_ref() {
+            core.set_depth_wall_defs(defs.clone());
+        }
+        if let Some((per_line_damage, multi_bonus_percent)) = self.depth_wall_damage_tuning {
+            core.set_depth_wall_damage_tuning(per_line_damage, multi_bonus_percent);
+        }
         core.initialize_game();
         GameState::new(core)
     }
@@ -79,6 +118,11 @@ impl GameLogic for TetrisLogic {
             }
             InputAction::SoftDrop => {
                 next.tetris.move_piece_down();
+                apply_gravity = false;
+            }
+            InputAction::GravityTick { dt_ms } => {
+                next.tetris.advance_with_gravity(dt_ms);
+                apply_gravity = false;
             }
             InputAction::RotateCw => {
                 next.tetris.rotate_piece(RotationDir::Cw);
@@ -99,8 +143,11 @@ impl GameLogic for TetrisLogic {
         }
 
         if apply_gravity {
-            next.tetris.move_piece_down();
+            next.tetris
+                .advance_with_gravity(duration_to_ms_u32(state.gravity_interval));
         }
+
+        next.tetris.advance_material_turn();
 
         let delta_lines = next.tetris.lines_cleared().saturating_sub(prev_lines);
         if delta_lines > 0 && self.score_bonus_per_line > 0 {
@@ -111,6 +158,9 @@ impl GameLogic for TetrisLogic {
         next
     }
 }
+
+// Compatibility alias while gameplay terminology migrates away from "tetris".
+pub type TetrisLogic = BlockLogic;
 
 #[cfg(test)]
 mod tests {
@@ -125,6 +175,7 @@ mod tests {
         core.set_available_pieces(vec![Piece::O]);
         core.initialize_game();
         let mut state = GameState::new(core);
+        state.tetris.set_line_clear_delay_ms(0);
 
         for x in 0..BOARD_WIDTH {
             if x == 4 || x == 5 {
@@ -144,9 +195,15 @@ mod tests {
         state
             .tetris
             .set_current_piece_for_test(Piece::O, Vec2i::new(4, 1), 0);
+        // This test verifies score math, not clear-animation timing.
+        state.tetris.set_line_clear_delay_ms(0);
 
         let logic_no_bonus = TetrisLogic::new(0, vec![Piece::O]);
-        let next_no_bonus = logic_no_bonus.step(&state, InputAction::HardDrop);
+        let next_no_bonus_pending = logic_no_bonus.step(&state, InputAction::HardDrop);
+        let next_no_bonus = logic_no_bonus.step(
+            &next_no_bonus_pending,
+            InputAction::GravityTick { dt_ms: 0 },
+        );
         assert_eq!(next_no_bonus.tetris.lines_cleared(), 1);
         assert_eq!(
             next_no_bonus.tetris.score(),
@@ -155,7 +212,8 @@ mod tests {
         );
 
         let logic_bonus = TetrisLogic::new(0, vec![Piece::O]).with_score_bonus_per_line(100);
-        let next_bonus = logic_bonus.step(&state, InputAction::HardDrop);
+        let next_bonus_pending = logic_bonus.step(&state, InputAction::HardDrop);
+        let next_bonus = logic_bonus.step(&next_bonus_pending, InputAction::GravityTick { dt_ms: 0 });
         assert_eq!(next_bonus.tetris.lines_cleared(), 1);
         assert_eq!(
             next_bonus.tetris.score(),
@@ -178,6 +236,71 @@ mod tests {
         assert_eq!(
             next_bonus.tetris.current_piece_pos(),
             Vec2i::new(4, BOARD_HEIGHT as i32)
+        );
+    }
+
+    #[test]
+    fn soft_drop_with_gravity_enabled_moves_exactly_one_row() {
+        let logic = TetrisLogic::new(0, vec![Piece::O]).with_gravity(true);
+        let mut state = logic.initial_state();
+        state
+            .tetris
+            .set_current_piece_for_test(Piece::O, Vec2i::new(4, 10), 0);
+
+        let next = logic.step(&state, InputAction::SoftDrop);
+        assert_eq!(
+            next.tetris.current_piece_pos(),
+            Vec2i::new(4, 9),
+            "soft drop should move by one row, not apply an additional gravity move in the same step"
+        );
+    }
+
+    #[test]
+    fn soft_drop_ground_contact_does_not_lock_in_same_step() {
+        let logic = TetrisLogic::new(0, vec![Piece::O]).with_gravity(true);
+        let mut state = logic.initial_state();
+        state
+            .tetris
+            .set_current_piece_for_test(Piece::O, Vec2i::new(4, 2), 0);
+
+        let next = logic.step(&state, InputAction::SoftDrop);
+        assert_eq!(
+            next.tetris.current_piece_pos(),
+            Vec2i::new(4, 1),
+            "soft drop should land the piece without locking in the same step"
+        );
+        assert!(
+            next.tetris.current_piece().is_some(),
+            "active piece should still be present right after soft-drop ground contact"
+        );
+        assert_eq!(
+            next.tetris.board()[0][4],
+            0,
+            "piece should not have been locked into the board on the soft-drop contact step"
+        );
+    }
+
+    #[test]
+    fn grounded_horizontal_move_can_stall_without_locking_same_step() {
+        let logic = TetrisLogic::new(0, vec![Piece::O]).with_gravity(true);
+        let mut state = logic.initial_state();
+        state
+            .tetris
+            .set_current_piece_for_test(Piece::O, Vec2i::new(4, 1), 0);
+
+        let next = logic.step(&state, InputAction::MoveRight);
+        assert_eq!(
+            next.tetris.current_piece_pos(),
+            Vec2i::new(5, 1),
+            "grounded horizontal adjustment should move the piece for lock-delay stalling"
+        );
+        assert!(
+            next.tetris.current_piece().is_some(),
+            "move-right stall should keep the active piece alive after the same-step gravity phase"
+        );
+        assert_eq!(
+            next.tetris.board()[0][5], 0,
+            "piece should not lock into the board on the same step as a valid grounded horizontal move"
         );
     }
 }

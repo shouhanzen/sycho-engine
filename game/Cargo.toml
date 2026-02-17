@@ -20,4 +20,5 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 http-body-util = "0.1"
 
 [dev-dependencies]
+png = "0.18.1"
 tower = "0.5"

@@ -12,6 +12,7 @@ pub struct Task {
     pub line_index: usize,
     pub text: String,
     pub done: bool,
+    pub human_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -324,6 +325,7 @@ fn parse_plan_file(path: &Path) -> Result<Plan> {
                 line_index: idx,
                 text: task.text,
                 done: task.done,
+                human_only: task.human_only,
             });
         }
     }
@@ -344,6 +346,7 @@ fn parse_plan_file(path: &Path) -> Result<Plan> {
 struct ParsedTaskLine {
     done: bool,
     text: String,
+    human_only: bool,
 }
 
 fn parse_task_line(line: &str) -> Option<ParsedTaskLine> {
@@ -351,24 +354,67 @@ fn parse_task_line(line: &str) -> Option<ParsedTaskLine> {
         return None;
     }
     if let Some(rest) = line.strip_prefix("- [x]") {
+        let (text, human_only) = parse_task_text_metadata(rest.trim());
         return Some(ParsedTaskLine {
             done: true,
-            text: rest.trim().to_string(),
+            text,
+            human_only,
         });
     }
     if let Some(rest) = line.strip_prefix("- [X]") {
+        let (text, human_only) = parse_task_text_metadata(rest.trim());
         return Some(ParsedTaskLine {
             done: true,
-            text: rest.trim().to_string(),
+            text,
+            human_only,
         });
     }
     if let Some(rest) = line.strip_prefix("- [ ]") {
+        let (text, human_only) = parse_task_text_metadata(rest.trim());
         return Some(ParsedTaskLine {
             done: false,
-            text: rest.trim().to_string(),
+            text,
+            human_only,
         });
     }
     None
+}
+
+fn parse_task_text_metadata(raw: &str) -> (String, bool) {
+    let mut text = raw.trim();
+    let mut human_only = false;
+
+    loop {
+        if let Some(rest) = strip_task_label_prefix(text, "[human]") {
+            human_only = true;
+            text = rest;
+            continue;
+        }
+        if let Some(rest) = strip_task_label_prefix(text, "[manual]") {
+            human_only = true;
+            text = rest;
+            continue;
+        }
+        if let Some(rest) = strip_task_label_prefix(text, "[agent]") {
+            text = rest;
+            continue;
+        }
+        break;
+    }
+
+    (text.trim().to_string(), human_only)
+}
+
+fn strip_task_label_prefix<'a>(text: &'a str, label: &str) -> Option<&'a str> {
+    if text.len() < label.len() {
+        return None;
+    }
+    let (prefix, rest) = text.split_at(label.len());
+    if prefix.eq_ignore_ascii_case(label) {
+        Some(rest.trim_start())
+    } else {
+        None
+    }
 }
 
 fn infer_plan_id(path: &Path) -> String {
@@ -484,5 +530,27 @@ mod tests {
             graph.dependency_errors().is_empty(),
             "NONE marker should not trigger dependency errors"
         );
+    }
+
+    #[test]
+    fn parse_task_line_extracts_human_labels() {
+        let parsed = parse_task_line("- [ ] [human] run feel tuning").expect("expected task");
+        assert!(!parsed.done);
+        assert!(parsed.human_only);
+        assert_eq!(parsed.text, "run feel tuning");
+
+        let parsed = parse_task_line("- [x] [manual] verify on target hardware")
+            .expect("expected done task");
+        assert!(parsed.done);
+        assert!(parsed.human_only);
+        assert_eq!(parsed.text, "verify on target hardware");
+    }
+
+    #[test]
+    fn parse_task_line_strips_agent_label_without_marking_human_only() {
+        let parsed = parse_task_line("- [ ] [agent] write regression test").expect("expected task");
+        assert!(!parsed.done);
+        assert!(!parsed.human_only);
+        assert_eq!(parsed.text, "write regression test");
     }
 }

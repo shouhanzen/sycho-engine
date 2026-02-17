@@ -197,8 +197,8 @@ fn main_menu_button_rects(width: u32, height: u32) -> Option<(ui::Rect, ui::Rect
     let title_button_gap = 28u32;
     let stack_h = title_h
         .saturating_add(title_button_gap)
-        .saturating_add(button_size.h.saturating_mul(3))
-        .saturating_add(button_gap.saturating_mul(2));
+        .saturating_add(button_size.h.saturating_mul(4))
+        .saturating_add(button_gap.saturating_mul(3));
     let top_y = content
         .y
         .saturating_add(content.h.saturating_sub(stack_h) / 2);
@@ -223,11 +223,20 @@ fn main_menu_button_rects(width: u32, height: u32) -> Option<(ui::Rect, ui::Rect
         w: start_button.w,
         h: start_button.h,
     };
-    let quit_button = ui::Rect {
+    let settings_button = ui::Rect {
         x: start_button.x,
         y: skilltree_editor_button
             .y
             .saturating_add(skilltree_editor_button.h)
+            .saturating_add(button_gap),
+        w: start_button.w,
+        h: start_button.h,
+    };
+    let quit_button = ui::Rect {
+        x: start_button.x,
+        y: settings_button
+            .y
+            .saturating_add(settings_button.h)
             .saturating_add(button_gap),
         w: start_button.w,
         h: start_button.h,
@@ -245,7 +254,7 @@ fn pause_menu_button_rects(width: u32, height: u32) -> Option<(ui::Rect, ui::Rec
         return None;
     }
 
-    let panel_size = ui::Size::new(360, 260).clamp_max(safe.size());
+    let panel_size = ui::Size::new(380, 320).clamp_max(safe.size());
     if panel_size.w == 0 || panel_size.h == 0 {
         return None;
     }
@@ -261,11 +270,19 @@ fn pause_menu_button_rects(width: u32, height: u32) -> Option<(ui::Rect, ui::Rec
         w: resume_ui.w,
         h: resume_ui.h,
     };
-    let end_run_button = ui::Rect {
+    let settings_button = ui::Rect {
         x: resume_button.x,
         y: resume_button
             .y
             .saturating_sub(resume_button.h.saturating_add(gap)),
+        w: resume_button.w,
+        h: resume_button.h,
+    };
+    let end_run_button = ui::Rect {
+        x: resume_button.x,
+        y: settings_button
+            .y
+            .saturating_sub(settings_button.h.saturating_add(gap)),
         w: resume_button.w,
         h: resume_button.h,
     };

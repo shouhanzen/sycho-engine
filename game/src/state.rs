@@ -55,4 +55,12 @@ impl GameState {
     pub fn tetris_mut(&mut self) -> &mut TetrisCore {
         &mut self.tetris
     }
+
+    pub fn core(&self) -> &TetrisCore {
+        &self.tetris
+    }
+
+    pub fn core_mut(&mut self) -> &mut TetrisCore {
+        &mut self.tetris
+    }
 }

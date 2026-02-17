@@ -131,6 +131,236 @@
       }
     },
     {
+      "id": "deepShaft1",
+      "name": "DEEP SHAFT I",
+      "pos": { "x": -10, "y": -2 },
+      "shape": [{ "x": 0, "y": 0 }],
+      "color": 4,
+      "cost": 30,
+      "requires": ["start"],
+      "effect": { "type": "addDeepShaftRows", "rows": 1 }
+    },
+    {
+      "id": "deepShaft2",
+      "name": "DEEP SHAFT II",
+      "pos": { "x": -10, "y": -4 },
+      "shape": [{ "x": 0, "y": 0 }],
+      "color": 4,
+      "cost": 60,
+      "requires": ["deepShaft1"],
+      "effect": { "type": "addDeepShaftRows", "rows": 1 }
+    },
+    {
+      "id": "deepShaft3",
+      "name": "DEEP SHAFT III",
+      "pos": { "x": -10, "y": -6 },
+      "shape": [{ "x": 0, "y": 0 }],
+      "color": 4,
+      "cost": 100,
+      "requires": ["deepShaft2"],
+      "effect": { "type": "addDeepShaftRows", "rows": 1 }
+    },
+    {
+      "id": "oreMagnet1",
+      "name": "ORE MAGNET I",
+      "pos": { "x": -4, "y": -2 },
+      "shape": [{ "x": 0, "y": 0 }],
+      "color": 6,
+      "cost": 25,
+      "requires": ["start"],
+      "effect": { "type": "addOreWeight", "points": 2 }
+    },
+    {
+      "id": "oreMagnet2",
+      "name": "ORE MAGNET II",
+      "pos": { "x": -4, "y": -4 },
+      "shape": [{ "x": 0, "y": 0 }],
+      "color": 6,
+      "cost": 55,
+      "requires": ["oreMagnet1"],
+      "effect": { "type": "addOreWeight", "points": 2 }
+    },
+    {
+      "id": "oreMagnet3",
+      "name": "ORE MAGNET III",
+      "pos": { "x": -4, "y": -6 },
+      "shape": [{ "x": 0, "y": 0 }],
+      "color": 6,
+      "cost": 90,
+      "requires": ["oreMagnet2"],
+      "effect": { "type": "addOreWeight", "points": 2 }
+    },
+    {
+      "id": "coinSeams1",
+      "name": "COIN SEAMS I",
+      "pos": { "x": 0, "y": -2 },
+      "shape": [{ "x": 0, "y": 0 }],
+      "color": 5,
+      "cost": 25,
+      "requires": ["start"],
+      "effect": { "type": "addCoinWeight", "points": 1 }
+    },
+    {
+      "id": "coinSeams2",
+      "name": "COIN SEAMS II",
+      "pos": { "x": 0, "y": -4 },
+      "shape": [{ "x": 0, "y": 0 }],
+      "color": 5,
+      "cost": 55,
+      "requires": ["coinSeams1"],
+      "effect": { "type": "addCoinWeight", "points": 1 }
+    },
+    {
+      "id": "coinSeams3",
+      "name": "COIN SEAMS III",
+      "pos": { "x": 0, "y": -6 },
+      "shape": [{ "x": 0, "y": 0 }],
+      "color": 5,
+      "cost": 90,
+      "requires": ["coinSeams2"],
+      "effect": { "type": "addCoinWeight", "points": 1 }
+    },
+    {
+      "id": "refinery1",
+      "name": "REFINERY I",
+      "pos": { "x": -2, "y": -8 },
+      "shape": [{ "x": 0, "y": 0 }, { "x": 1, "y": 0 }],
+      "color": 2,
+      "cost": 120,
+      "requires": ["oreMagnet2", "coinSeams2"],
+      "effect": { "type": "addOreScoreValue", "points": 25 }
+    },
+    {
+      "id": "refinery1Coin",
+      "name": "REFINERY I (COIN)",
+      "pos": { "x": 0, "y": -8 },
+      "shape": [{ "x": 0, "y": 0 }],
+      "color": 2,
+      "cost": 0,
+      "requires": ["refinery1"],
+      "effect": { "type": "addCoinScoreValue", "points": 60 }
+    },
+    {
+      "id": "refinery1MoneyOre",
+      "name": "REFINERY I (ORE MONEY)",
+      "pos": { "x": 1, "y": -8 },
+      "shape": [{ "x": 0, "y": 0 }],
+      "color": 2,
+      "cost": 0,
+      "requires": ["refinery1Coin"],
+      "effect": { "type": "addOreMoneyValue", "points": 1 }
+    },
+    {
+      "id": "refinery1MoneyCoin",
+      "name": "REFINERY I (COIN MONEY)",
+      "pos": { "x": 2, "y": -8 },
+      "shape": [{ "x": 0, "y": 0 }],
+      "color": 2,
+      "cost": 0,
+      "requires": ["refinery1MoneyOre"],
+      "effect": { "type": "addCoinMoneyValue", "points": 3 }
+    },
+    {
+      "id": "refinery2",
+      "name": "REFINERY II",
+      "pos": { "x": -2, "y": -10 },
+      "shape": [{ "x": 0, "y": 0 }, { "x": 1, "y": 0 }],
+      "color": 2,
+      "cost": 180,
+      "requires": ["refinery1MoneyCoin"],
+      "effect": { "type": "addOreScoreValue", "points": 25 }
+    },
+    {
+      "id": "refinery2Coin",
+      "name": "REFINERY II (COIN)",
+      "pos": { "x": 0, "y": -10 },
+      "shape": [{ "x": 0, "y": 0 }],
+      "color": 2,
+      "cost": 0,
+      "requires": ["refinery2"],
+      "effect": { "type": "addCoinScoreValue", "points": 60 }
+    },
+    {
+      "id": "refinery2MoneyOre",
+      "name": "REFINERY II (ORE MONEY)",
+      "pos": { "x": 1, "y": -10 },
+      "shape": [{ "x": 0, "y": 0 }],
+      "color": 2,
+      "cost": 0,
+      "requires": ["refinery2Coin"],
+      "effect": { "type": "addOreMoneyValue", "points": 1 }
+    },
+    {
+      "id": "refinery2MoneyCoin",
+      "name": "REFINERY II (COIN MONEY)",
+      "pos": { "x": 2, "y": -10 },
+      "shape": [{ "x": 0, "y": 0 }],
+      "color": 2,
+      "cost": 0,
+      "requires": ["refinery2MoneyOre"],
+      "effect": { "type": "addCoinMoneyValue", "points": 3 }
+    },
+    {
+      "id": "backfill1",
+      "name": "BACKFILL I",
+      "pos": { "x": 6, "y": -2 },
+      "shape": [{ "x": 0, "y": 0 }],
+      "color": 7,
+      "cost": 35,
+      "requires": ["start"],
+      "effect": { "type": "addHolePatchChanceBp", "basisPoints": 3500 }
+    },
+    {
+      "id": "backfill2",
+      "name": "BACKFILL II",
+      "pos": { "x": 6, "y": -4 },
+      "shape": [{ "x": 0, "y": 0 }],
+      "color": 7,
+      "cost": 70,
+      "requires": ["backfill1"],
+      "effect": { "type": "addHolePatchChanceBp", "basisPoints": 3500 }
+    },
+    {
+      "id": "backfill3",
+      "name": "BACKFILL III",
+      "pos": { "x": 6, "y": -6 },
+      "shape": [{ "x": 0, "y": 0 }],
+      "color": 7,
+      "cost": 110,
+      "requires": ["backfill2"],
+      "effect": { "type": "addHolePatchChanceBp", "basisPoints": 3000 }
+    },
+    {
+      "id": "guideRails1",
+      "name": "GUIDE RAILS I",
+      "pos": { "x": 9, "y": -4 },
+      "shape": [{ "x": 0, "y": 0 }],
+      "color": 1,
+      "cost": 45,
+      "requires": ["backfill2"],
+      "effect": { "type": "addHoleAlignChanceBp", "basisPoints": 4000 }
+    },
+    {
+      "id": "guideRails2",
+      "name": "GUIDE RAILS II",
+      "pos": { "x": 9, "y": -6 },
+      "shape": [{ "x": 0, "y": 0 }],
+      "color": 1,
+      "cost": 85,
+      "requires": ["guideRails1"],
+      "effect": { "type": "addHoleAlignChanceBp", "basisPoints": 3500 }
+    },
+    {
+      "id": "guideRails3",
+      "name": "GUIDE RAILS III",
+      "pos": { "x": 9, "y": -8 },
+      "shape": [{ "x": 0, "y": 0 }],
+      "color": 1,
+      "cost": 130,
+      "requires": ["guideRails2"],
+      "effect": { "type": "addHoleAlignChanceBp", "basisPoints": 2500 }
+    },
+    {
       "id": "weirdDisconnected",
       "name": "ODD",
       "pos": {

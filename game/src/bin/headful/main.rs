@@ -11,32 +11,39 @@ use engine::app::{
     ReplayConfig, RunMode, default_recording_path, parse_capture_cli_with_default_path, run_game,
     run_game_with_profile, run_game_with_recording, run_game_with_replay,
 };
-use engine::editor::{EditorSnapshot, EditorTimeline};
 use engine::ui_tree::{UiEvent, UiInput, UiTree};
+use engine::audio::{MusicRuntime, Quantize, Scene, StepPattern, Track, Waveform};
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
+#[cfg(test)]
+use winit::event::VirtualKeyCode;
 use winit::{
     dpi::PhysicalSize,
-    event::{Event, MouseButton, VirtualKeyCode, WindowEvent},
+    event::{Event, MouseButton, WindowEvent},
     event_loop::ControlFlow,
 };
 
 use game::debug::DebugHud;
 use game::headful::dig_camera as headful_dig_camera;
 use game::headful::input_adapter as headful_input;
+use game::headful::remote_control as headful_remote;
 use game::headful::render_pipeline::{RenderCache, render_frame as render_headful_frame};
 use game::headful::skilltree_camera as headful_camera;
 use game::headful::view_transitions as headful_view;
-use game::headful_editor_api::{RemoteCmd, RemoteServer};
+use game::headful_editor_api::RemoteServer;
 use game::playtest::{InputAction, TetrisLogic};
 use game::round_timer::RoundTimer;
-use game::sfx::{ACTION_SFX_VOLUME, MUSIC_VOLUME};
+use game::settings::{AudioSettings, PlayerSettings, SettingsStore};
+use game::sfx::{ACTION_SFX_VOLUME, GLASS_BREAK_SFX_VOLUME, MUSIC_VOLUME};
 use game::skilltree::{SkillTreeEditorTool, SkillTreeRunMods, SkillTreeRuntime};
 use game::state::{DEFAULT_GRAVITY_INTERVAL, DEFAULT_ROUND_LIMIT, GameState};
-use game::tetris_core::{Piece, Vec2i};
-use game::tetris_ui::{
-    GameOverMenuLayout, MainMenuLayout, PauseMenuLayout, Rect, SkillTreeLayout, UiLayout,
+use game::tetris_core::{
+    BottomwellRunMods, DEFAULT_DEPTH_WALL_DAMAGE_PER_LINE, DEFAULT_DEPTH_WALL_MULTI_CLEAR_BONUS_PERCENT,
+    Piece, default_depth_wall_defs,
 };
-use game::ui_ids::*;
+use game::tetris_ui::{
+    GameOverMenuLayout, MainMenuLayout, PauseMenuLayout, Rect, SettingsMenuLayout, SkillTreeLayout,
+    UiLayout,
+};
 use game::view::GameView;
 use game::view_tree::{
     GameUiAction, build_hud_view_tree, build_menu_view_tree, build_skilltree_toolbar_view_tree,
@@ -55,6 +62,7 @@ struct HeadfulApp {
     last_pause_menu: PauseMenuLayout,
     last_skilltree: SkillTreeLayout,
     last_game_over_menu: GameOverMenuLayout,
+    last_settings_menu: SettingsMenuLayout,
     mouse_x: u32,
     mouse_y: u32,
     skilltree_cam_input: SkillTreeCameraInput,
@@ -68,6 +76,27 @@ struct HeadfulApp {
     mouse_release_was_drag: bool,
     consume_next_mouse_up: bool,
     render_state: Option<GameState>,
+    settings_store: SettingsStore,
+    player_settings: PlayerSettings,
+    settings_open: bool,
+    settings_origin: SettingsOrigin,
+    active_settings_slider: Option<ActiveSettingsSlider>,
+    settings_dirty: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum SettingsOrigin {
+    #[default]
+    MainMenu,
+    PauseMenu,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveSettingsSlider {
+    Master,
+    Music,
+    Sfx,
+    ScreenShake,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -113,7 +142,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         present_mode: env_present_mode("ROLLOUT_HEADFUL_PRESENT_MODE"),
     };
 
-    let base_logic = TetrisLogic::new(0, Piece::all()).with_bottomwell(true);
+    let mut base_logic = TetrisLogic::new(0, Piece::all()).with_bottomwell(true);
+    if let Some(override_hp) = env_u32("ROLLOUT_DEPTH_WALL_HP").map(|hp| hp.max(1)) {
+        let defs = default_depth_wall_defs()
+            .into_iter()
+            .map(|mut def| {
+                def.hp = override_hp;
+                def
+            })
+            .collect();
+        base_logic = base_logic.with_depth_wall_defs(defs);
+    }
+    let per_line_damage =
+        env_u32("ROLLOUT_DEPTH_WALL_DAMAGE_PER_LINE").unwrap_or(DEFAULT_DEPTH_WALL_DAMAGE_PER_LINE);
+    let multi_bonus_percent = env_u32("ROLLOUT_DEPTH_WALL_MULTI_BONUS_PERCENT")
+        .unwrap_or(DEFAULT_DEPTH_WALL_MULTI_CLEAR_BONUS_PERCENT);
+    base_logic = base_logic.with_depth_wall_damage_tuning(per_line_damage, multi_bonus_percent);
     let app = HeadfulApp::new(base_logic, DEFAULT_ROUND_LIMIT, DEFAULT_GRAVITY_INTERVAL);
 
     if let Some(path) = replay_path {
@@ -139,6 +183,8 @@ impl HeadfulApp {
         base_round_limit: Duration,
         base_gravity_interval: Duration,
     ) -> Self {
+        let settings_store = SettingsStore::from_env();
+        let player_settings = settings_store.load();
         let sfx = match Sfx::new() {
             Ok(sfx) => Some(sfx),
             Err(err) => {
@@ -167,19 +213,24 @@ impl HeadfulApp {
                 }
             },
         };
-        Self {
+        let mut debug_hud = DebugHud::new();
+        if env_bool("ROLLOUT_DEBUG_DISABLE_ROUND_TIMER").unwrap_or(false) {
+            debug_hud.set_round_timer_disabled(true);
+        }
+        let app = Self {
             profile_mode: false,
             base_logic,
             base_round_limit,
             base_gravity_interval,
             sfx,
-            debug_hud: DebugHud::new(),
+            debug_hud,
             ui_tree: UiTree::new(),
             last_layout: UiLayout::default(),
             last_main_menu: MainMenuLayout::default(),
             last_pause_menu: PauseMenuLayout::default(),
             last_skilltree: SkillTreeLayout::default(),
             last_game_over_menu: GameOverMenuLayout::default(),
+            last_settings_menu: SettingsMenuLayout::default(),
             mouse_x: 0,
             mouse_y: 0,
             skilltree_cam_input: SkillTreeCameraInput::default(),
@@ -193,12 +244,147 @@ impl HeadfulApp {
             mouse_release_was_drag: false,
             consume_next_mouse_up: false,
             render_state: None,
-        }
+            settings_store,
+            player_settings,
+            settings_open: false,
+            settings_origin: SettingsOrigin::default(),
+            active_settings_slider: None,
+            settings_dirty: false,
+        };
+        app.apply_audio_settings();
+        app
     }
 
     fn play_click_sfx(&self) {
         if let Some(sfx) = self.sfx.as_ref() {
-            sfx.play_click(ACTION_SFX_VOLUME);
+            let gain = self.player_settings.audio.effective_sfx_gain();
+            sfx.play_click(ACTION_SFX_VOLUME * gain);
+        }
+    }
+
+    fn apply_audio_settings(&self) {
+        if let Some(sfx) = self.sfx.as_ref() {
+            sfx.apply_audio_settings(self.player_settings.audio);
+        }
+    }
+
+    fn mark_settings_dirty(&mut self) {
+        self.settings_dirty = true;
+    }
+
+    fn save_settings_if_dirty(&mut self) {
+        if !self.settings_dirty {
+            return;
+        }
+        self.player_settings = self.player_settings.clone().sanitized();
+        match self.settings_store.save(&self.player_settings) {
+            Ok(()) => {
+                self.settings_dirty = false;
+            }
+            Err(err) => {
+                eprintln!("warning: failed to save settings: {err}");
+            }
+        }
+    }
+
+    fn open_settings_from_view(&mut self, view: GameView) -> bool {
+        let origin = match view {
+            GameView::MainMenu => SettingsOrigin::MainMenu,
+            GameView::Tetris { paused: true } => SettingsOrigin::PauseMenu,
+            _ => return false,
+        };
+        self.settings_open = true;
+        self.settings_origin = origin;
+        self.active_settings_slider = None;
+        true
+    }
+
+    fn close_settings(&mut self) {
+        self.settings_open = false;
+        self.active_settings_slider = None;
+        self.save_settings_if_dirty();
+    }
+
+    fn toggle_music_enabled(&mut self) {
+        self.player_settings.audio.music_enabled = !self.player_settings.audio.music_enabled;
+        self.apply_audio_settings();
+        self.mark_settings_dirty();
+    }
+
+    fn settings_slider_from_pointer(&self, x: u32, y: u32) -> Option<ActiveSettingsSlider> {
+        let layout = self.last_settings_menu;
+        if layout.master_track.contains(x, y) {
+            Some(ActiveSettingsSlider::Master)
+        } else if layout.music_track.contains(x, y) {
+            Some(ActiveSettingsSlider::Music)
+        } else if layout.sfx_track.contains(x, y) {
+            Some(ActiveSettingsSlider::Sfx)
+        } else if layout.shake_track.contains(x, y) {
+            Some(ActiveSettingsSlider::ScreenShake)
+        } else {
+            None
+        }
+    }
+
+    fn apply_settings_slider_x(&mut self, slider: ActiveSettingsSlider, x: u32) {
+        let mut changed = false;
+        match slider {
+            ActiveSettingsSlider::Master => {
+                let slider = engine::slider::Slider::new(
+                    self.last_settings_menu.master_track,
+                    0.0,
+                    1.0,
+                    self.player_settings.audio.master_volume,
+                );
+                let next = slider.value_from_x(x);
+                if (next - self.player_settings.audio.master_volume).abs() > 1e-4 {
+                    self.player_settings.audio.master_volume = next;
+                    changed = true;
+                }
+            }
+            ActiveSettingsSlider::Music => {
+                let slider = engine::slider::Slider::new(
+                    self.last_settings_menu.music_track,
+                    0.0,
+                    1.0,
+                    self.player_settings.audio.music_volume,
+                );
+                let next = slider.value_from_x(x);
+                if (next - self.player_settings.audio.music_volume).abs() > 1e-4 {
+                    self.player_settings.audio.music_volume = next;
+                    changed = true;
+                }
+            }
+            ActiveSettingsSlider::Sfx => {
+                let slider = engine::slider::Slider::new(
+                    self.last_settings_menu.sfx_track,
+                    0.0,
+                    1.0,
+                    self.player_settings.audio.sfx_volume,
+                );
+                let next = slider.value_from_x(x);
+                if (next - self.player_settings.audio.sfx_volume).abs() > 1e-4 {
+                    self.player_settings.audio.sfx_volume = next;
+                    changed = true;
+                }
+            }
+            ActiveSettingsSlider::ScreenShake => {
+                let slider = engine::slider::Slider::new(
+                    self.last_settings_menu.shake_track,
+                    0.0,
+                    100.0,
+                    self.player_settings.video.screen_shake_percent as f32,
+                );
+                let next = slider.value_from_x(x).round().clamp(0.0, 100.0) as u8;
+                if next != self.player_settings.video.screen_shake_percent {
+                    self.player_settings.video.screen_shake_percent = next;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.apply_audio_settings();
+            self.mark_settings_dirty();
         }
     }
 
@@ -214,76 +400,47 @@ impl HeadfulApp {
             .reset(state.state().tetris.background_depth_rows());
     }
 
-    fn snapshot(runner: &HeadlessRunner<TetrisLogic>) -> EditorSnapshot {
-        let frame = runner.frame();
-        game::editor_api::snapshot_from_state(frame, runner.state())
-    }
-
-    fn timeline(runner: &HeadlessRunner<TetrisLogic>) -> EditorTimeline {
-        let tm = runner.timemachine();
-        EditorTimeline {
-            frame: runner.frame(),
-            history_len: runner.history().len(),
-            can_rewind: tm.can_rewind(),
-            can_forward: tm.can_forward(),
-        }
-    }
-
-    fn handle_remote_command(&mut self, state: &mut HeadlessRunner<TetrisLogic>, cmd: RemoteCmd) {
-        match cmd {
-            RemoteCmd::GetState { respond } => {
-                let _ = respond.send(Self::snapshot(state));
-            }
-            RemoteCmd::GetTimeline { respond } => {
-                let _ = respond.send(Self::timeline(state));
-            }
-            RemoteCmd::Step { action_id, respond } => {
-                match game::editor_api::action_from_id(&action_id) {
-                    Some(action) => {
-                        state.step(action);
-                        let _ = respond.send(Ok(Self::snapshot(state)));
-                    }
-                    None => {
-                        let _ = respond.send(Err(format!("unknown actionId: {action_id}")));
-                    }
+    fn apply_input_commands(
+        &mut self,
+        runner: &mut HeadlessRunner<TetrisLogic>,
+        commands: Vec<headful_input::HeadfulInputCommand>,
+    ) {
+        for command in commands {
+            match command {
+                headful_input::HeadfulInputCommand::ToggleDebugHud => {
+                    self.debug_hud.toggle();
                 }
-            }
-            RemoteCmd::Rewind { frames, respond } => {
-                state.rewind(frames);
-                let _ = respond.send(Self::snapshot(state));
-            }
-            RemoteCmd::Forward { frames, respond } => {
-                state.forward(frames);
-                let _ = respond.send(Self::snapshot(state));
-            }
-            RemoteCmd::Seek { frame, respond } => {
-                state.seek(frame);
-                let _ = respond.send(Self::snapshot(state));
-            }
-            RemoteCmd::Reset { respond } => {
-                self.reset_active_run(state);
-                let _ = respond.send(Self::snapshot(state));
+                headful_input::HeadfulInputCommand::ToggleMusic => {
+                    self.toggle_music_enabled();
+                }
+                headful_input::HeadfulInputCommand::ExitRequested => {
+                    self.exit_requested = true;
+                }
+                headful_input::HeadfulInputCommand::PlayClick => {
+                    self.play_click_sfx();
+                }
+                headful_input::HeadfulInputCommand::ResetRun => {
+                    self.reset_active_run(runner);
+                }
+                headful_input::HeadfulInputCommand::ApplyAction(action) => {
+                    apply_action(
+                        runner,
+                        self.sfx.as_ref(),
+                        self.player_settings.audio,
+                        &mut self.debug_hud,
+                        action,
+                    );
+                }
             }
         }
     }
 
     fn drain_remote_commands(&mut self, state: &mut HeadlessRunner<TetrisLogic>) {
-        loop {
-            let next_cmd = {
-                let Some(remote) = self.remote_editor_api.as_mut() else {
-                    return;
-                };
-                match remote.rx.try_recv() {
-                    Ok(cmd) => Some(cmd),
-                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => None,
-                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => None,
-                }
-            };
-            let Some(cmd) = next_cmd else {
-                break;
-            };
-            self.handle_remote_command(state, cmd);
-        }
+        let mut remote_editor_api = self.remote_editor_api.take();
+        headful_remote::drain_remote_commands(remote_editor_api.as_mut(), state, |runner| {
+            self.reset_active_run(runner);
+        });
+        self.remote_editor_api = remote_editor_api;
     }
 
     fn handle_viewtree_action(
@@ -367,6 +524,7 @@ impl HeadfulApp {
                     apply_action(
                         state,
                         self.sfx.as_ref(),
+                        self.player_settings.audio,
                         &mut self.debug_hud,
                         InputAction::Hold,
                     );
@@ -457,10 +615,15 @@ impl HeadfulApp {
         let mut trigger_game_over = false;
         {
             let state = state.state_mut();
-            state
-                .round_timer
-                .tick_if_running(dt, state.view.is_tetris_playing());
-            if state.view.is_tetris_playing() && state.round_timer.is_up() {
+            if !self.debug_hud.round_timer_disabled() {
+                state
+                    .round_timer
+                    .tick_if_running(dt, state.view.is_tetris_playing());
+            }
+            if !self.debug_hud.round_timer_disabled()
+                && state.view.is_tetris_playing()
+                && state.round_timer.is_up()
+            {
                 let earned = money_earned_from_run(state);
                 if earned > 0 {
                     state.skilltree.add_money(earned);
@@ -478,26 +641,52 @@ impl HeadfulApp {
 
     fn apply_gravity_steps(&mut self, state: &mut HeadlessRunner<TetrisLogic>, dt: Duration) {
         let mut gravity_steps = 0usize;
+        let mut gravity_step_ms = 0u32;
+        let mut line_clear_dt_ms = 0u32;
         {
             let state = state.state_mut();
             if state.view.is_tetris_playing() {
-                state.gravity_elapsed = state.gravity_elapsed.saturating_add(dt);
-                while state.gravity_elapsed >= state.gravity_interval {
-                    state.gravity_elapsed =
-                        state.gravity_elapsed.saturating_sub(state.gravity_interval);
-                    gravity_steps = gravity_steps.saturating_add(1);
+                if state.tetris.is_line_clear_active() {
+                    // Drive clear animation by frame dt so clear timing does not
+                    // quantize to the gravity interval.
+                    line_clear_dt_ms = duration_to_ms_u32(dt);
+                } else {
+                    gravity_step_ms = duration_to_ms_u32(state.gravity_interval);
+                    state.gravity_elapsed = state.gravity_elapsed.saturating_add(dt);
+                    while state.gravity_elapsed >= state.gravity_interval {
+                        state.gravity_elapsed =
+                            state.gravity_elapsed.saturating_sub(state.gravity_interval);
+                        gravity_steps = gravity_steps.saturating_add(1);
+                    }
                 }
             } else {
                 state.gravity_elapsed = Duration::ZERO;
             }
         }
+        if line_clear_dt_ms > 0 {
+            let gravity_start = Instant::now();
+            state.step_profiled(
+                InputAction::GravityTick {
+                    dt_ms: line_clear_dt_ms,
+                },
+                &mut self.debug_hud,
+            );
+            self.debug_hud.record_gravity(gravity_start.elapsed());
+            return;
+        }
         for _ in 0..gravity_steps {
             let gravity_start = Instant::now();
-            state.step_profiled(InputAction::SoftDrop, &mut self.debug_hud);
+            state.step_profiled(
+                InputAction::GravityTick {
+                    dt_ms: gravity_step_ms,
+                },
+                &mut self.debug_hud,
+            );
             self.debug_hud.record_gravity(gravity_start.elapsed());
         }
     }
 
+    #[cfg(test)]
     fn sync_horizontal_repeat_from_frame(
         &mut self,
         runner: &mut HeadlessRunner<TetrisLogic>,
@@ -512,7 +701,13 @@ impl HeadfulApp {
             |action| immediate_actions.push(action),
         );
         for action in immediate_actions {
-            apply_action(runner, self.sfx.as_ref(), &mut self.debug_hud, action);
+            apply_action(
+                runner,
+                self.sfx.as_ref(),
+                self.player_settings.audio,
+                &mut self.debug_hud,
+                action,
+            );
         }
     }
 
@@ -522,219 +717,16 @@ impl HeadfulApp {
         input: &InputFrame,
         now: Instant,
     ) {
-        let pressed = |key| input.keys_pressed.contains(&key);
-
-        if pressed(VirtualKeyCode::F3) {
-            self.debug_hud.toggle();
-        }
-        if pressed(VirtualKeyCode::M) {
-            if let Some(sfx) = self.sfx.as_ref() {
-                sfx.toggle_music();
-            }
-        }
-
-        let mut view = runner.state().view;
-        match view {
-            GameView::MainMenu => {
-                if pressed(VirtualKeyCode::Return) || pressed(VirtualKeyCode::Space) {
-                    let transition = headful_view::start_game(view);
-                    view = transition.next_view;
-                    runner.state_mut().view = view;
-                    if transition.reset_tetris {
-                        reset_run(
-                            runner,
-                            &self.base_logic,
-                            self.base_round_limit,
-                            self.base_gravity_interval,
-                            &mut self.horizontal_repeat,
-                        );
-                    }
-                    self.play_click_sfx();
-                } else if pressed(VirtualKeyCode::K) {
-                    let transition = headful_view::open_skilltree_editor(view);
-                    view = transition.next_view;
-                    runner.state_mut().view = view;
-                    self.horizontal_repeat.clear();
-                    let skilltree = &mut runner.state_mut().skilltree;
-                    if !skilltree.editor.enabled {
-                        skilltree.editor_toggle();
-                    }
-                    self.play_click_sfx();
-                } else if pressed(VirtualKeyCode::Escape) {
-                    self.exit_requested = true;
-                }
-            }
-            GameView::SkillTree => {
-                if pressed(VirtualKeyCode::F4) {
-                    let skilltree = &mut runner.state_mut().skilltree;
-                    skilltree.editor_toggle();
-                    self.play_click_sfx();
-                    return;
-                }
-
-                let skilltree_editor_enabled = runner.state().skilltree.editor.enabled;
-                if skilltree_editor_enabled {
-                    if pressed(VirtualKeyCode::Escape) {
-                        {
-                            let skilltree = &mut runner.state_mut().skilltree;
-                            skilltree.editor_toggle();
-                        }
-                        let transition = headful_view::back(view);
-                        view = transition.next_view;
-                        runner.state_mut().view = view;
-                        self.horizontal_repeat.clear();
-                        self.play_click_sfx();
-                        return;
-                    }
-
-                    let skilltree = &mut runner.state_mut().skilltree;
-                    if pressed(VirtualKeyCode::Tab) {
-                        skilltree.editor_cycle_tool();
-                    }
-                    if pressed(VirtualKeyCode::Left) {
-                        skilltree.camera.pan.x -= 1.0;
-                        skilltree.camera.target_pan = skilltree.camera.pan;
-                    }
-                    if pressed(VirtualKeyCode::Right) {
-                        skilltree.camera.pan.x += 1.0;
-                        skilltree.camera.target_pan = skilltree.camera.pan;
-                    }
-                    if pressed(VirtualKeyCode::Up) {
-                        skilltree.camera.pan.y += 1.0;
-                        skilltree.camera.target_pan = skilltree.camera.pan;
-                    }
-                    if pressed(VirtualKeyCode::Down) {
-                        skilltree.camera.pan.y -= 1.0;
-                        skilltree.camera.target_pan = skilltree.camera.pan;
-                    }
-                    if pressed(VirtualKeyCode::Minus) {
-                        skilltree.camera.cell_px =
-                            (skilltree.camera.cell_px - 2.0).max(SKILLTREE_CAMERA_MIN_CELL_PX);
-                        skilltree.camera.target_cell_px = skilltree.camera.cell_px;
-                    }
-                    if pressed(VirtualKeyCode::Equals) {
-                        skilltree.camera.cell_px =
-                            (skilltree.camera.cell_px + 2.0).min(SKILLTREE_CAMERA_MAX_CELL_PX);
-                        skilltree.camera.target_cell_px = skilltree.camera.cell_px;
-                    }
-                    if pressed(VirtualKeyCode::N) {
-                        if let Some(world) = skilltree_world_cell_at_screen(
-                            skilltree,
-                            self.last_skilltree,
-                            self.mouse_x,
-                            self.mouse_y,
-                        ) {
-                            skilltree.editor_create_node_at(world);
-                        }
-                    }
-                    if pressed(VirtualKeyCode::Delete) {
-                        let _ = skilltree.editor_delete_selected();
-                    }
-                    if pressed(VirtualKeyCode::S) {
-                        match skilltree.save_def() {
-                            Ok(()) => {
-                                skilltree.editor.dirty = false;
-                                skilltree.editor.status = Some("SAVED".to_string());
-                            }
-                            Err(e) => {
-                                skilltree.editor.status = Some(format!("SAVE FAILED: {e}"));
-                            }
-                        }
-                    }
-                    if pressed(VirtualKeyCode::R) {
-                        skilltree.reload_def();
-                        skilltree.editor.dirty = false;
-                        skilltree.editor.status = Some("RELOADED".to_string());
-                    }
-                } else if pressed(VirtualKeyCode::Escape) {
-                    let transition = headful_view::back(view);
-                    view = transition.next_view;
-                    runner.state_mut().view = view;
-                    self.horizontal_repeat.clear();
-                    self.play_click_sfx();
-                } else if pressed(VirtualKeyCode::Return) || pressed(VirtualKeyCode::Space) {
-                    let transition = headful_view::start_game(view);
-                    view = transition.next_view;
-                    runner.state_mut().view = view;
-                    if transition.reset_tetris {
-                        reset_run(
-                            runner,
-                            &self.base_logic,
-                            self.base_round_limit,
-                            self.base_gravity_interval,
-                            &mut self.horizontal_repeat,
-                        );
-                    }
-                    self.play_click_sfx();
-                }
-            }
-            GameView::GameOver => {
-                if pressed(VirtualKeyCode::Escape) {
-                    let transition = headful_view::back(view);
-                    view = transition.next_view;
-                    runner.state_mut().view = view;
-                    self.horizontal_repeat.clear();
-                    self.play_click_sfx();
-                } else if pressed(VirtualKeyCode::Return) || pressed(VirtualKeyCode::Space) {
-                    let transition = headful_view::start_game(view);
-                    view = transition.next_view;
-                    runner.state_mut().view = view;
-                    if transition.reset_tetris {
-                        reset_run(
-                            runner,
-                            &self.base_logic,
-                            self.base_round_limit,
-                            self.base_gravity_interval,
-                            &mut self.horizontal_repeat,
-                        );
-                    }
-                    self.play_click_sfx();
-                } else if pressed(VirtualKeyCode::K) {
-                    let transition = headful_view::open_skilltree(view);
-                    view = transition.next_view;
-                    runner.state_mut().view = view;
-                    self.horizontal_repeat.clear();
-                    self.play_click_sfx();
-                }
-            }
-            GameView::Tetris { paused } => {
-                if pressed(VirtualKeyCode::Escape) {
-                    let transition = headful_view::toggle_pause(view);
-                    view = transition.next_view;
-                    {
-                        let state = runner.state_mut();
-                        state.view = view;
-                        state.gravity_elapsed = Duration::ZERO;
-                    }
-                    self.horizontal_repeat.clear();
-                    self.play_click_sfx();
-                    return;
-                }
-
-                if paused {
-                    return;
-                }
-
-                self.sync_horizontal_repeat_from_frame(runner, input, now);
-                for key in [
-                    VirtualKeyCode::Down,
-                    VirtualKeyCode::S,
-                    VirtualKeyCode::Up,
-                    VirtualKeyCode::W,
-                    VirtualKeyCode::Z,
-                    VirtualKeyCode::X,
-                    VirtualKeyCode::A,
-                    VirtualKeyCode::Space,
-                    VirtualKeyCode::C,
-                ] {
-                    if pressed(key) {
-                        if let Some(action) = map_key_to_action(key) {
-                            apply_action(runner, self.sfx.as_ref(), &mut self.debug_hud, action);
-                        }
-                    }
-                }
-            }
-        }
+        let commands = headful_input::process_keyboard_frame(
+            runner,
+            input,
+            now,
+            &mut self.horizontal_repeat,
+            self.last_skilltree,
+            self.mouse_x,
+            self.mouse_y,
+        );
+        self.apply_input_commands(runner, commands);
     }
 
     fn update_skilltree_drag_from_frame(
@@ -779,6 +771,10 @@ impl GameApp for HeadfulApp {
             GameView::MainMenu
         };
         state.skilltree = SkillTreeRuntime::load_default();
+        if let Some(warning) = state.skilltree.load_warning_message() {
+            self.debug_hud.log_warning(warning.to_string());
+            eprintln!("warning: skilltree load issue: {warning}");
+        }
         state.round_timer = RoundTimer::new(self.base_round_limit);
         state.gravity_interval = self.base_gravity_interval;
         state.gravity_elapsed = Duration::ZERO;
@@ -839,13 +835,34 @@ impl GameApp for HeadfulApp {
             self.skilltree_cam_input.left_down = false;
             self.skilltree_cam_input.drag_started = false;
             self.skilltree_cam_input.drag_started_in_view = false;
+            if self.player_settings.gameplay.auto_pause_on_focus_loss
+                && matches!(state.state().view, GameView::Tetris { paused: false })
+            {
+                let state = state.state_mut();
+                state.view = GameView::Tetris { paused: true };
+                state.gravity_elapsed = Duration::ZERO;
+            }
         }
 
         let left_mouse_pressed = input.mouse_buttons_pressed.contains(&MouseButton::Left);
         let left_mouse_released = input.mouse_buttons_released.contains(&MouseButton::Left);
         let left_mouse_down = input.mouse_buttons_down.contains(&MouseButton::Left);
+        let pressed = |key| input.keys_pressed.contains(&key);
 
-        self.process_keyboard_frame(state, &input, now);
+        if self.settings_open {
+            if pressed(winit::event::VirtualKeyCode::Escape) {
+                self.close_settings();
+                self.play_click_sfx();
+            }
+        } else if pressed(winit::event::VirtualKeyCode::O) {
+            if self.open_settings_from_view(state.state().view) {
+                self.play_click_sfx();
+            }
+        }
+
+        if !self.settings_open {
+            self.process_keyboard_frame(state, &input, now);
+        }
 
         if left_mouse_pressed {
             let size = ctx.renderer.size();
@@ -854,6 +871,14 @@ impl GameApp for HeadfulApp {
                     .handle_click(self.mouse_x, self.mouse_y, size.width, size.height);
             if debug_clicked {
                 self.consume_next_mouse_up = true;
+            } else if self.settings_open {
+                if let Some(slider) = self.settings_slider_from_pointer(self.mouse_x, self.mouse_y)
+                {
+                    self.active_settings_slider = Some(slider);
+                    self.apply_settings_slider_x(slider, self.mouse_x);
+                } else {
+                    self.active_settings_slider = None;
+                }
             } else {
                 let _ = self.ui_tree.process_input(UiInput {
                     mouse_pos: pointer_pos,
@@ -875,19 +900,34 @@ impl GameApp for HeadfulApp {
             }
         }
 
-        self.update_skilltree_drag_from_frame(state, left_mouse_down);
+        if self.settings_open {
+            if left_mouse_down {
+                if let Some(active) = self.active_settings_slider {
+                    self.apply_settings_slider_x(active, self.mouse_x);
+                }
+            }
+        } else {
+            self.update_skilltree_drag_from_frame(state, left_mouse_down);
+        }
 
         if left_mouse_released || (self.skilltree_cam_input.left_down && !left_mouse_down) {
             self.mouse_release_was_drag = self.skilltree_cam_input.drag_started;
             self.skilltree_cam_input.left_down = false;
             self.skilltree_cam_input.drag_started = false;
             self.skilltree_cam_input.drag_started_in_view = false;
+            self.active_settings_slider = None;
         }
 
         let view = state.state().view;
         if view.is_tetris_playing() {
             if let Some(action) = self.horizontal_repeat.next_repeat_action(now) {
-                apply_action(state, self.sfx.as_ref(), &mut self.debug_hud, action);
+                apply_action(
+                    state,
+                    self.sfx.as_ref(),
+                    self.player_settings.audio,
+                    &mut self.debug_hud,
+                    action,
+                );
             }
         }
 
@@ -898,13 +938,86 @@ impl GameApp for HeadfulApp {
         }
 
         let mut ui_handled = false;
-        if left_mouse_released && allow_ui {
+        if left_mouse_released && allow_ui && self.settings_open {
+            let l = self.last_settings_menu;
+            if l.back_button.contains(self.mouse_x, self.mouse_y) {
+                self.close_settings();
+                self.play_click_sfx();
+                ui_handled = true;
+            } else if l.reset_button.contains(self.mouse_x, self.mouse_y) {
+                self.player_settings = PlayerSettings::default();
+                self.apply_audio_settings();
+                self.mark_settings_dirty();
+                self.save_settings_if_dirty();
+                self.play_click_sfx();
+                ui_handled = true;
+            } else if l.mute_toggle.contains(self.mouse_x, self.mouse_y) {
+                self.player_settings.audio.mute_all = !self.player_settings.audio.mute_all;
+                self.apply_audio_settings();
+                self.mark_settings_dirty();
+                self.play_click_sfx();
+                ui_handled = true;
+            } else if l.music_toggle.contains(self.mouse_x, self.mouse_y) {
+                self.player_settings.audio.music_enabled =
+                    !self.player_settings.audio.music_enabled;
+                self.apply_audio_settings();
+                self.mark_settings_dirty();
+                self.play_click_sfx();
+                ui_handled = true;
+            } else if l.show_timer_toggle.contains(self.mouse_x, self.mouse_y) {
+                self.player_settings.gameplay.show_round_timer =
+                    !self.player_settings.gameplay.show_round_timer;
+                self.mark_settings_dirty();
+                self.play_click_sfx();
+                ui_handled = true;
+            } else if l.auto_pause_toggle.contains(self.mouse_x, self.mouse_y) {
+                self.player_settings.gameplay.auto_pause_on_focus_loss =
+                    !self.player_settings.gameplay.auto_pause_on_focus_loss;
+                self.mark_settings_dirty();
+                self.play_click_sfx();
+                ui_handled = true;
+            } else if l.high_contrast_toggle.contains(self.mouse_x, self.mouse_y) {
+                self.player_settings.accessibility.high_contrast_ui =
+                    !self.player_settings.accessibility.high_contrast_ui;
+                self.mark_settings_dirty();
+                self.play_click_sfx();
+                ui_handled = true;
+            } else if l.reduce_motion_toggle.contains(self.mouse_x, self.mouse_y) {
+                self.player_settings.accessibility.reduce_motion =
+                    !self.player_settings.accessibility.reduce_motion;
+                self.mark_settings_dirty();
+                self.play_click_sfx();
+                ui_handled = true;
+            }
+            self.save_settings_if_dirty();
+        }
+
+        if left_mouse_released && allow_ui && !ui_handled && !self.settings_open {
+            let view = state.state().view;
+            let clicked_settings = match view {
+                GameView::MainMenu => self
+                    .last_main_menu
+                    .settings_button
+                    .contains(self.mouse_x, self.mouse_y),
+                GameView::Tetris { paused: true } => self
+                    .last_pause_menu
+                    .settings_button
+                    .contains(self.mouse_x, self.mouse_y),
+                _ => false,
+            };
+            if clicked_settings && self.open_settings_from_view(view) {
+                self.play_click_sfx();
+                ui_handled = true;
+            }
+        }
+
+        if left_mouse_released && allow_ui && !ui_handled && !self.settings_open {
             if let Some(action) = actions.first().copied() {
                 ui_handled = self.handle_viewtree_action(state, action);
             }
         }
 
-        if left_mouse_released && allow_ui && !ui_handled {
+        if left_mouse_released && allow_ui && !ui_handled && !self.settings_open {
             let ui_events = self.ui_tree.process_input(UiInput {
                 mouse_pos: pointer_pos,
                 mouse_down: left_mouse_pressed,
@@ -916,162 +1029,24 @@ impl GameApp for HeadfulApp {
                     ..
                 } = event
                 {
-                    match action {
-                        ACTION_SKILLTREE_START_RUN => {
-                            let view = state.state().view;
-                            let skilltree_editor_enabled = state.state().skilltree.editor.enabled;
-                            if matches!(view, GameView::SkillTree) && !skilltree_editor_enabled {
-                                let transition = headful_view::start_game(view);
-                                state.state_mut().view = transition.next_view;
-                                if transition.reset_tetris {
-                                    reset_run(
-                                        state,
-                                        &self.base_logic,
-                                        self.base_round_limit,
-                                        self.base_gravity_interval,
-                                        &mut self.horizontal_repeat,
-                                    );
-                                }
-                                if let Some(sfx) = self.sfx.as_ref() {
-                                    sfx.play_click(ACTION_SFX_VOLUME);
-                                }
-                                ui_handled = true;
-                            }
-                        }
-                        ACTION_SKILLTREE_TOOL_SELECT
-                        | ACTION_SKILLTREE_TOOL_MOVE
-                        | ACTION_SKILLTREE_TOOL_ADD_CELL
-                        | ACTION_SKILLTREE_TOOL_REMOVE_CELL
-                        | ACTION_SKILLTREE_TOOL_LINK => {}
-                        _ => {}
+                    let result = headful_input::handle_ui_tree_click_action(state, action);
+                    self.apply_input_commands(state, result.commands);
+                    if result.handled {
+                        ui_handled = true;
                     }
                 }
             }
         }
 
-        if left_mouse_released && allow_ui && !ui_handled {
-            let view = state.state().view;
-            if matches!(view, GameView::SkillTree) && !self.mouse_release_was_drag {
-                let skilltree_editor_enabled = state.state().skilltree.editor.enabled;
-                if skilltree_editor_enabled {
-                    if let Some(world) = skilltree_world_cell_at_screen(
-                        &state.state().skilltree,
-                        self.last_skilltree,
-                        self.mouse_x,
-                        self.mouse_y,
-                    ) {
-                        let skilltree = &mut state.state_mut().skilltree;
-                        let hit_id =
-                            skilltree_node_at_world(skilltree, world).map(|s| s.to_string());
-
-                        match skilltree.editor.tool {
-                            SkillTreeEditorTool::Select => {
-                                if let Some(id) = hit_id {
-                                    skilltree.editor_select(&id, None);
-                                    if let Some(sfx) = self.sfx.as_ref() {
-                                        sfx.play_click(ACTION_SFX_VOLUME);
-                                    }
-                                } else {
-                                    skilltree.editor_clear_selection();
-                                }
-                            }
-                            SkillTreeEditorTool::Move => {
-                                if let Some(id) = hit_id {
-                                    if let Some(idx) = skilltree.node_index(&id) {
-                                        let pos = skilltree.def.nodes[idx].pos;
-                                        let grab = Vec2i::new(world.x - pos.x, world.y - pos.y);
-                                        skilltree.editor_select(&id, Some(grab));
-                                    } else {
-                                        skilltree.editor_select(&id, None);
-                                    }
-                                    if let Some(sfx) = self.sfx.as_ref() {
-                                        sfx.play_click(ACTION_SFX_VOLUME);
-                                    }
-                                } else {
-                                    let grab = skilltree
-                                        .editor
-                                        .move_grab_offset
-                                        .unwrap_or(Vec2i::new(0, 0));
-                                    let new_pos = Vec2i::new(world.x - grab.x, world.y - grab.y);
-                                    if skilltree.editor_move_selected_to(new_pos) {
-                                        if let Some(sfx) = self.sfx.as_ref() {
-                                            sfx.play_click(ACTION_SFX_VOLUME);
-                                        }
-                                    }
-                                }
-                            }
-                            SkillTreeEditorTool::AddCell => {
-                                if let Some(id) = hit_id {
-                                    let already =
-                                        skilltree.editor.selected.as_deref() == Some(id.as_str());
-                                    if !already {
-                                        skilltree.editor_select(&id, None);
-                                        if let Some(sfx) = self.sfx.as_ref() {
-                                            sfx.play_click(ACTION_SFX_VOLUME);
-                                        }
-                                    } else {
-                                        if skilltree.editor_add_cell_at_world(world) {
-                                            if let Some(sfx) = self.sfx.as_ref() {
-                                                sfx.play_click(ACTION_SFX_VOLUME);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            SkillTreeEditorTool::RemoveCell => {
-                                if let Some(id) = hit_id {
-                                    if skilltree.editor.selected.as_deref() != Some(id.as_str()) {
-                                        skilltree.editor_select(&id, None);
-                                    }
-                                    if skilltree.editor_remove_cell_at_world(world) {
-                                        if let Some(sfx) = self.sfx.as_ref() {
-                                            sfx.play_click(ACTION_SFX_VOLUME);
-                                        }
-                                    }
-                                }
-                            }
-                            SkillTreeEditorTool::ConnectPrereqs => {
-                                if let Some(id) = hit_id {
-                                    if let Some(from) = skilltree.editor.connect_from.clone() {
-                                        if skilltree.editor_toggle_prereq(&from, &id) {
-                                            if let Some(sfx) = self.sfx.as_ref() {
-                                                sfx.play_click(ACTION_SFX_VOLUME);
-                                            }
-                                        }
-                                    } else {
-                                        skilltree.editor.connect_from = Some(id);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else if let Some(world) = skilltree_world_cell_at_screen(
-                    &state.state().skilltree,
-                    self.last_skilltree,
-                    self.mouse_x,
-                    self.mouse_y,
-                ) {
-                    let hit_id = state.state().skilltree.def.nodes.iter().find_map(|node| {
-                        node.shape.iter().find_map(|rel| {
-                            let wx = node.pos.x + rel.x;
-                            let wy = node.pos.y + rel.y;
-                            if wx == world.x && wy == world.y {
-                                Some(node.id.clone())
-                            } else {
-                                None
-                            }
-                        })
-                    });
-                    if let Some(id) = hit_id {
-                        let transition = headful_view::open_skilltree(state.state().view);
-                        state.state_mut().view = transition.next_view;
-                        state.state_mut().skilltree.try_buy(&id);
-                        if let Some(sfx) = self.sfx.as_ref() {
-                            sfx.play_click(ACTION_SFX_VOLUME);
-                        }
-                    }
-                }
-            }
+        if left_mouse_released && allow_ui && !ui_handled && !self.settings_open {
+            let commands = headful_input::handle_skilltree_world_click(
+                state,
+                self.last_skilltree,
+                self.mouse_x,
+                self.mouse_y,
+                self.mouse_release_was_drag,
+            );
+            self.apply_input_commands(state, commands);
         }
 
         if left_mouse_released {
@@ -1122,7 +1097,14 @@ impl GameApp for HeadfulApp {
             last_pause_menu: self.last_pause_menu,
             last_skilltree: self.last_skilltree,
             last_game_over_menu: self.last_game_over_menu,
+            last_settings_menu: self.last_settings_menu,
         };
+        let mut camera_offset = self.dig_camera.offset_y_px();
+        if self.player_settings.accessibility.reduce_motion {
+            camera_offset = 0.0;
+        } else {
+            camera_offset *= self.player_settings.video.clamped_screen_shake() as f32 / 100.0;
+        }
         render_headful_frame(
             renderer,
             &mut self.ui_tree,
@@ -1131,14 +1113,17 @@ impl GameApp for HeadfulApp {
             self.mouse_x,
             self.mouse_y,
             &mut cache,
-            self.dig_camera.offset_y_px().round() as i32,
+            camera_offset.round() as i32,
             self.last_frame_dt,
+            self.settings_open.then_some(&self.player_settings),
+            self.player_settings.gameplay.show_round_timer,
         );
         self.last_layout = cache.last_layout;
         self.last_main_menu = cache.last_main_menu;
         self.last_pause_menu = cache.last_pause_menu;
         self.last_skilltree = cache.last_skilltree;
         self.last_game_over_menu = cache.last_game_over_menu;
+        self.last_settings_menu = cache.last_settings_menu;
     }
 
     fn handle_event(
@@ -1173,6 +1158,7 @@ impl GameApp for HeadfulApp {
                 self.next_redraw = now + self.frame_interval;
             }
             Event::LoopDestroyed => {
+                self.save_settings_if_dirty();
                 if let Some(remote) = self.remote_editor_api.as_mut() {
                     remote.shutdown();
                 }
@@ -1189,22 +1175,6 @@ impl GameApp for HeadfulApp {
 fn money_earned_from_run(state: &GameState) -> u32 {
     headful_view::money_earned_from_run(state)
 }
-
-fn skilltree_world_cell_at_screen(
-    skilltree: &SkillTreeRuntime,
-    layout: SkillTreeLayout,
-    sx: u32,
-    sy: u32,
-) -> Option<Vec2i> {
-    headful_camera::skilltree_world_cell_at_screen(skilltree, layout, sx, sy)
-}
-
-fn skilltree_node_at_world<'a>(skilltree: &'a SkillTreeRuntime, world: Vec2i) -> Option<&'a str> {
-    headful_camera::skilltree_node_at_world(skilltree, world)
-}
-
-const SKILLTREE_CAMERA_MIN_CELL_PX: f32 = headful_camera::SKILLTREE_CAMERA_MIN_CELL_PX;
-const SKILLTREE_CAMERA_MAX_CELL_PX: f32 = headful_camera::SKILLTREE_CAMERA_MAX_CELL_PX;
 
 type SkillTreeCameraInput = headful_camera::SkillTreeCameraInput;
 
@@ -1225,6 +1195,24 @@ fn gravity_interval_from_percent(base: Duration, faster_percent: u32) -> Duratio
     let base_ms = base.as_millis() as u64;
     let ms = base_ms.saturating_mul(100u64.saturating_sub(pct)) / 100;
     Duration::from_millis(ms.max(25))
+}
+
+fn duration_to_ms_u32(duration: Duration) -> u32 {
+    duration.as_millis().min(u128::from(u32::MAX)) as u32
+}
+
+fn bottomwell_run_mods_from_skill_mods(mods: SkillTreeRunMods) -> BottomwellRunMods {
+    BottomwellRunMods {
+        deep_shaft_rows: mods.deep_shaft_rows,
+        ore_weight_points: mods.ore_weight_points,
+        coin_weight_points: mods.coin_weight_points,
+        ore_score_bonus: mods.ore_score_bonus,
+        coin_score_bonus: mods.coin_score_bonus,
+        ore_money_bonus: mods.ore_money_bonus,
+        coin_money_bonus: mods.coin_money_bonus,
+        hole_patch_chance_bp: mods.hole_patch_chance_bp,
+        hole_align_chance_bp: mods.hole_align_chance_bp,
+    }
 }
 
 fn run_tuning_from_mods(
@@ -1257,7 +1245,8 @@ fn reset_run(
 
     let logic = base_logic
         .clone()
-        .with_score_bonus_per_line(tuning.score_bonus_per_line);
+        .with_score_bonus_per_line(tuning.score_bonus_per_line)
+        .with_bottomwell_run_mods(bottomwell_run_mods_from_skill_mods(mods));
     let mut next_runner = HeadlessRunner::new(logic);
     {
         let state = next_runner.state_mut();
@@ -1341,17 +1330,85 @@ Flags:
 struct BgMusic {
     sample_rate: u32,
     channels: u16,
-    frame: u64,
     chan: u16,
+    last_sample: f32,
+    runtime: MusicRuntime,
 }
 
 impl BgMusic {
     fn new() -> Self {
+        let notes = vec![
+            Some(220.0),
+            Some(261.63),
+            Some(329.63),
+            Some(261.63),
+            Some(196.0),
+            Some(246.94),
+            Some(293.66),
+            Some(246.94),
+        ];
+        let arp = Track::new(
+            "arp",
+            StepPattern::from_notes(notes, 0.5).with_envelope(0.04, 0.12),
+        )
+        .with_gain(0.14)
+        .with_waveform(Waveform::Sine)
+        .with_harmonic_mix(0.30);
+
+        let bass = Track::new(
+            "bass",
+            StepPattern::from_notes(
+                vec![Some(110.0), None, Some(98.0), None, Some(123.47), None, Some(98.0), None],
+                0.5,
+            )
+            .with_envelope(0.02, 0.10),
+        )
+        .with_gain(0.10)
+        .with_waveform(Waveform::Triangle);
+
+        let kick = Track::new(
+            "kick",
+            StepPattern::from_notes(
+                vec![
+                    Some(55.0),
+                    None,
+                    None,
+                    None,
+                    Some(55.0),
+                    None,
+                    None,
+                    None,
+                    Some(55.0),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(55.0),
+                    None,
+                ],
+                0.25,
+            )
+            .with_envelope(0.001, 0.08),
+        )
+        .with_gain(0.16)
+        .with_waveform(Waveform::Sine);
+
+        let mut runtime = MusicRuntime::new(48_000, 120.0);
+        let _ = runtime.add_scene(
+            Scene::new("main")
+                .with_track(arp)
+                .with_track(bass)
+                .with_track(kick)
+        );
+        let _ = runtime.schedule_scene_switch("main", Quantize::Immediate);
+
         Self {
             sample_rate: 48_000,
             channels: 2,
-            frame: 0,
             chan: 0,
+            last_sample: 0.0,
+            runtime,
         }
     }
 }
@@ -1360,43 +1417,15 @@ impl Iterator for BgMusic {
     type Item = f32;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // A tiny procedural "music" loop: an arpeggio with a basic envelope to avoid clicks.
-        // This avoids shipping a large binary music asset while still giving the game background audio.
-        const NOTES_HZ: [f32; 8] = [220.0, 261.63, 329.63, 261.63, 196.0, 246.94, 293.66, 246.94];
-
-        let note_len_frames: u64 = (self.sample_rate as u64) / 4; // 0.25s per note @ 48kHz
-        let note_i = ((self.frame / note_len_frames) % (NOTES_HZ.len() as u64)) as usize;
-        let freq_hz = NOTES_HZ[note_i];
-
-        let pos_in_note = self.frame % note_len_frames;
-        let t = pos_in_note as f32 / self.sample_rate as f32;
-        let phase = 2.0 * std::f32::consts::PI * freq_hz * t;
-
-        let attack_frames: u64 = (self.sample_rate as u64) / 100; // 10ms
-        let release_frames: u64 = (self.sample_rate as u64) / 40; // 25ms
-        let release_start = note_len_frames.saturating_sub(release_frames);
-
-        let env = if pos_in_note < attack_frames {
-            pos_in_note as f32 / attack_frames.max(1) as f32
-        } else if pos_in_note >= release_start {
-            let remaining = note_len_frames.saturating_sub(pos_in_note);
-            remaining as f32 / release_frames.max(1) as f32
+        // Reuse each mono sample for L/R channels.
+        if self.chan == 0 {
+            self.chan = 1;
+            self.last_sample = self.runtime.next_mono_sample();
+            Some(self.last_sample)
         } else {
-            1.0
-        };
-
-        let base = phase.sin();
-        let harmonic = (phase * 2.0).sin() * 0.30;
-        let sample = (base + harmonic) * 0.20 * env;
-
-        // Advance in interleaved (stereo) sample space.
-        self.chan += 1;
-        if self.chan >= self.channels {
             self.chan = 0;
-            self.frame = self.frame.wrapping_add(1);
+            Some(self.last_sample)
         }
-
-        Some(sample)
     }
 }
 
@@ -1415,6 +1444,85 @@ impl rodio::Source for BgMusic {
 
     fn total_duration(&self) -> Option<Duration> {
         None
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GlassBreakNoise {
+    sample_rate: u32,
+    channels: u16,
+    frame: u64,
+    chan: u16,
+    state: u32,
+}
+
+impl GlassBreakNoise {
+    const DURATION_MS: u64 = 180;
+
+    fn new(seed: u32) -> Self {
+        Self {
+            sample_rate: 48_000,
+            channels: 2,
+            frame: 0,
+            chan: 0,
+            state: seed.max(1),
+        }
+    }
+
+    fn total_frames(&self) -> u64 {
+        self.sample_rate as u64 * Self::DURATION_MS / 1_000
+    }
+
+    fn next_noise(&mut self) -> f32 {
+        // Xorshift32 pseudo-noise for a light "glassy" burst.
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.state = x;
+        let unit = (x as f32) / (u32::MAX as f32);
+        unit * 2.0 - 1.0
+    }
+}
+
+impl Iterator for GlassBreakNoise {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.frame >= self.total_frames() {
+            return None;
+        }
+        let t = self.frame as f32 / self.sample_rate as f32;
+        let progress = self.frame as f32 / self.total_frames() as f32;
+        let env = (1.0 - progress).max(0.0).powf(2.2);
+        let chirp = (2.0 * std::f32::consts::PI * (1_800.0 * t + 900.0 * t * t)).sin();
+        let noise = self.next_noise();
+        let sample = (chirp * 0.35 + noise * 0.65) * env * 0.45;
+
+        self.chan += 1;
+        if self.chan >= self.channels {
+            self.chan = 0;
+            self.frame = self.frame.saturating_add(1);
+        }
+        Some(sample)
+    }
+}
+
+impl rodio::Source for GlassBreakNoise {
+    fn current_frame_len(&self) -> Option<usize> {
+        Some(self.total_frames().saturating_sub(self.frame) as usize)
+    }
+
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        Some(Duration::from_millis(Self::DURATION_MS))
     }
 }
 
@@ -1456,17 +1564,28 @@ impl Sfx {
         sink.detach();
     }
 
-    fn toggle_music(&self) {
+    fn play_glass_break(&self, volume: f32) {
+        let Ok(sink) = Sink::try_new(&self.handle) else {
+            return;
+        };
+        sink.set_volume(volume);
+        sink.append(GlassBreakNoise::new(0xA53F_91C7));
+        sink.detach();
+    }
+
+    fn apply_audio_settings(&self, audio: AudioSettings) {
         let Some(sink) = self.music_sink.as_ref() else {
             return;
         };
 
-        if self.music_playing.get() {
-            sink.pause();
-            self.music_playing.set(false);
-        } else {
+        let gain = MUSIC_VOLUME * audio.effective_music_gain();
+        sink.set_volume(gain);
+        if audio.music_enabled && !audio.mute_all {
             sink.play();
             self.music_playing.set(true);
+        } else {
+            sink.pause();
+            self.music_playing.set(false);
         }
     }
 }
@@ -1478,6 +1597,7 @@ type DigCameraController = headful_dig_camera::DigCameraController;
 #[cfg(test)]
 type DigCameraConfig = headful_dig_camera::DigCameraConfig;
 
+#[cfg(test)]
 fn map_key_to_action(key: VirtualKeyCode) -> Option<InputAction> {
     headful_input::map_key_to_action(key)
 }
@@ -1489,16 +1609,22 @@ fn should_play_action_sfx(action: InputAction) -> bool {
 fn apply_action(
     runner: &mut HeadlessRunner<TetrisLogic>,
     sfx: Option<&Sfx>,
+    audio: AudioSettings,
     debug_hud: &mut DebugHud,
     action: InputAction,
 ) {
     let input_start = Instant::now();
+    let before_glass_shatters = runner.state().tetris.glass_shatter_count();
 
     runner.step_profiled(action, debug_hud);
 
     if let Some(sfx) = sfx {
         if should_play_action_sfx(action) {
-            sfx.play_click(ACTION_SFX_VOLUME);
+            sfx.play_click(ACTION_SFX_VOLUME * audio.effective_sfx_gain());
+        }
+        let after_glass_shatters = runner.state().tetris.glass_shatter_count();
+        if after_glass_shatters > before_glass_shatters {
+            sfx.play_glass_break(GLASS_BREAK_SFX_VOLUME * audio.effective_sfx_gain());
         }
     }
 

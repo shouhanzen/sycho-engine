@@ -54,3 +54,20 @@ fn go_sh_help_mentions_build_cache_knobs_for_worktrees() {
         "go.sh help should mention CARGO_TARGET_DIR / shared target dir for multi-worktree builds"
     );
 }
+
+#[test]
+fn go_sh_help_mentions_fast_and_light_test_modes() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let go_sh_path = manifest_dir.join("..").join("go.sh");
+
+    let go_sh = fs::read_to_string(&go_sh_path).expect("read go.sh");
+
+    assert!(
+        go_sh.contains("--test-fast"),
+        "go.sh help should mention --test-fast for engine+game local loops"
+    );
+    assert!(
+        go_sh.contains("--test-light"),
+        "go.sh help should mention --test-light for reduced local CPU pressure"
+    );
+}

@@ -4,11 +4,12 @@ use engine::graphics::Renderer2d;
 use engine::ui_tree::UiTree;
 
 use crate::debug::DebugHud;
+use crate::settings::PlayerSettings;
 use crate::state::GameState;
 use crate::tetris_ui::{
-    GameOverMenuLayout, MainMenuLayout, PauseMenuLayout, Rect, SkillTreeLayout, UiLayout,
-    draw_game_over_menu_with_ui, draw_main_menu_with_ui, draw_pause_menu_with_ui,
-    draw_skilltree_runtime_with_ui_and_mouse, draw_tetris_hud_view,
+    GameOverMenuLayout, MainMenuLayout, PauseMenuLayout, Rect, SettingsMenuLayout, SkillTreeLayout,
+    UiLayout, draw_game_over_menu_with_ui, draw_main_menu_with_ui, draw_pause_menu_with_ui,
+    draw_settings_menu_with_ui, draw_skilltree_runtime_with_ui_and_mouse, draw_tetris_hud_view,
     draw_tetris_world_with_camera_offset,
 };
 use crate::ui_ids::UI_CANVAS;
@@ -21,6 +22,7 @@ pub struct RenderCache {
     pub last_pause_menu: PauseMenuLayout,
     pub last_skilltree: SkillTreeLayout,
     pub last_game_over_menu: GameOverMenuLayout,
+    pub last_settings_menu: SettingsMenuLayout,
 }
 
 pub fn render_frame(
@@ -33,6 +35,8 @@ pub fn render_frame(
     cache: &mut RenderCache,
     world_offset_y_px: i32,
     last_frame_dt: Duration,
+    settings_overlay: Option<&PlayerSettings>,
+    show_round_timer: bool,
 ) {
     let frame_start = Instant::now();
     let board_start = Instant::now();
@@ -68,7 +72,7 @@ pub fn render_frame(
         cache.last_layout = tetris_layout;
     }
 
-    if view.is_tetris() {
+    if view.is_tetris() && show_round_timer {
         let hud_x = cache.last_layout.pause_button.x.saturating_sub(180);
         let hud_y = cache
             .last_layout
@@ -76,9 +80,19 @@ pub fn render_frame(
             .y
             .saturating_add(6)
             .saturating_add(28);
-        let remaining_s = state.round_timer.remaining().as_secs_f32();
-        let timer_text = format!("TIME {remaining_s:>4.1}");
-        renderer.draw_text(hud_x, hud_y, &timer_text, [235, 235, 245, 255]);
+        let timer_disabled = debug_hud.round_timer_disabled();
+        let timer_text = if timer_disabled {
+            "TIME OFF".to_string()
+        } else {
+            let remaining_s = state.round_timer.remaining().as_secs_f32();
+            format!("TIME {remaining_s:>4.1}")
+        };
+        let timer_color = if timer_disabled {
+            [245, 198, 92, 255]
+        } else {
+            [235, 235, 245, 255]
+        };
+        renderer.draw_text(hud_x, hud_y, &timer_text, timer_color);
     }
 
     let draw_dt = draw_start.elapsed();
@@ -91,6 +105,7 @@ pub fn render_frame(
             cache.last_pause_menu = PauseMenuLayout::default();
             cache.last_skilltree = SkillTreeLayout::default();
             cache.last_game_over_menu = GameOverMenuLayout::default();
+            cache.last_settings_menu = SettingsMenuLayout::default();
         }
         GameView::SkillTree => {
             cache.last_main_menu = MainMenuLayout::default();
@@ -104,6 +119,7 @@ pub fn render_frame(
                 Some((mouse_x, mouse_y)),
             );
             cache.last_game_over_menu = GameOverMenuLayout::default();
+            cache.last_settings_menu = SettingsMenuLayout::default();
         }
         GameView::Tetris { paused: true } => {
             cache.last_main_menu = MainMenuLayout::default();
@@ -111,12 +127,14 @@ pub fn render_frame(
                 draw_pause_menu_with_ui(renderer, size.width, size.height, ui_tree);
             cache.last_skilltree = SkillTreeLayout::default();
             cache.last_game_over_menu = GameOverMenuLayout::default();
+            cache.last_settings_menu = SettingsMenuLayout::default();
         }
         GameView::Tetris { paused: false } => {
             cache.last_main_menu = MainMenuLayout::default();
             cache.last_pause_menu = PauseMenuLayout::default();
             cache.last_skilltree = SkillTreeLayout::default();
             cache.last_game_over_menu = GameOverMenuLayout::default();
+            cache.last_settings_menu = SettingsMenuLayout::default();
         }
         GameView::GameOver => {
             cache.last_main_menu = MainMenuLayout::default();
@@ -124,7 +142,14 @@ pub fn render_frame(
             cache.last_skilltree = SkillTreeLayout::default();
             cache.last_game_over_menu =
                 draw_game_over_menu_with_ui(renderer, size.width, size.height, ui_tree);
+            cache.last_settings_menu = SettingsMenuLayout::default();
         }
+    }
+    if let Some(settings) = settings_overlay {
+        cache.last_settings_menu =
+            draw_settings_menu_with_ui(renderer, size.width, size.height, ui_tree, settings);
+    } else {
+        cache.last_settings_menu = SettingsMenuLayout::default();
     }
     debug_hud.draw_overlay(renderer, size.width, size.height);
     let overlay_dt = overlay_start.elapsed();

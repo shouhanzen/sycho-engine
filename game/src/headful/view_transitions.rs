@@ -44,12 +44,14 @@ pub fn money_earned_from_run(state: &GameState) -> u32 {
     // Tunable later; for now it makes the buy-loop visible quickly.
     let score = state.tetris.score();
     let lines = state.tetris.lines_cleared();
-    score / 10 + lines.saturating_mul(5)
+    let base = score / 10 + lines.saturating_mul(5);
+    base.saturating_add(state.tetris.refinery_money_from_collected_resources())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tetris_core::{BottomwellRunMods, Piece, TetrisCore};
 
     #[test]
     fn start_game_requests_reset_from_menu() {
@@ -66,5 +68,31 @@ mod tests {
         let result = back(GameView::GameOver);
         assert!(matches!(result.next_view, GameView::MainMenu));
         assert!(!result.reset_tetris);
+    }
+
+    #[test]
+    fn money_earned_from_run_includes_refinery_bonus() {
+        let mut core = TetrisCore::new(0);
+        core.set_available_pieces(Piece::all());
+        core.set_bottomwell_enabled(true);
+        core.set_bottomwell_run_mods(BottomwellRunMods {
+            ore_money_bonus: 2,
+            coin_money_bonus: 3,
+            ..BottomwellRunMods::default()
+        });
+        core.initialize_game();
+        core.add_score(500);
+        // Clearing one mixed reward row collects 1 ore + 1 coin.
+        let y = 3;
+        for x in 0..10 {
+            core.set_cell(x, y, 1);
+        }
+        core.set_cell(0, y, 10);
+        core.set_cell(1, y, 11);
+        let _ = core.clear_lines();
+
+        let state = GameState::new(core);
+        // base (score/10 + lines*5) + refinery (2 + 3)
+        assert_eq!(money_earned_from_run(&state), 95);
     }
 }

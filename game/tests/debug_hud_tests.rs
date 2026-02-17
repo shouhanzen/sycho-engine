@@ -115,6 +115,14 @@ fn debug_hud_emits_lines_with_expected_labels() {
         lowercase.iter().any(|l| l.contains("present")),
         "expected a present line, got: {lines:?}"
     );
+    assert!(
+        lines.iter().any(|l| l.starts_with("BUD FRAME")),
+        "expected a budget frame line, got: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("BUD NOW")),
+        "expected a budget summary line, got: {lines:?}"
+    );
 }
 
 #[test]
@@ -144,4 +152,44 @@ fn debug_hud_minimize_collapses_overlay_lines() {
         expanded_again.len() > 1,
         "expected overlay to expand after toggling again"
     );
+}
+
+#[test]
+fn debug_hud_exposes_timer_toggle_line() {
+    let hud = DebugHud::new();
+    let lines = hud.overlay_lines();
+    assert!(
+        lines.iter().any(|l| l.starts_with("TIMER ON [CLICK]")),
+        "expected timer toggle line in overlay, got: {lines:?}"
+    );
+}
+
+#[test]
+fn clicking_timer_line_toggles_round_timer_override() {
+    let mut hud = DebugHud::new();
+    let width = 640;
+    let height = 360;
+
+    assert!(!hud.round_timer_disabled());
+    let rect = hud
+        .timer_toggle_rect(width, height)
+        .expect("expected timer toggle rect when expanded");
+    assert!(hud.handle_click(
+        rect.x.saturating_add(1),
+        rect.y.saturating_add(1),
+        width,
+        height
+    ));
+    assert!(hud.round_timer_disabled());
+
+    let rect = hud
+        .timer_toggle_rect(width, height)
+        .expect("expected timer toggle rect after first toggle");
+    assert!(hud.handle_click(
+        rect.x.saturating_add(1),
+        rect.y.saturating_add(1),
+        width,
+        height
+    ));
+    assert!(!hud.round_timer_disabled());
 }

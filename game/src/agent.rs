@@ -15,12 +15,12 @@ pub enum TetrisAction {
 }
 
 #[derive(Debug, Clone)]
-pub struct TetrisGame {
+pub struct BlockGame {
     seed: u64,
     available_pieces: Vec<Piece>,
 }
 
-impl TetrisGame {
+impl BlockGame {
     pub fn new(seed: u64, available_pieces: Vec<Piece>) -> Self {
         Self {
             seed,
@@ -33,7 +33,7 @@ impl TetrisGame {
     }
 }
 
-impl GameLogic for TetrisGame {
+impl GameLogic for BlockGame {
     type State = GameState;
     type Input = TetrisAction;
 
@@ -50,6 +50,9 @@ impl GameLogic for TetrisGame {
         next
     }
 }
+
+pub type BlockAction = TetrisAction;
+pub type TetrisGame = BlockGame;
 
 fn apply_action(core: &mut TetrisCore, action: TetrisAction) {
     match action {
@@ -73,4 +76,5 @@ fn apply_action(core: &mut TetrisCore, action: TetrisAction) {
         }
         TetrisAction::Noop => {}
     }
+    core.advance_material_turn();
 }
