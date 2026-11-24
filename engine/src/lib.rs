@@ -3,6 +3,7 @@ pub mod app;
 pub mod audio;
 pub mod embedded;
 pub mod graphics;
+mod offscreen;
 pub mod pixels_renderer;
 pub mod profiling;
 pub mod recording;

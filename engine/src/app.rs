@@ -19,9 +19,10 @@ use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{Window, WindowBuilder};
 
 use crate::embedded::{
-    EditorEvent, GameLink, PREVIEW_BYTES, PREVIEW_HEIGHT, PREVIEW_WIDTH, TimelineStatus,
+    EditorEvent, GPU_PREVIEW_EXIT_CODE, GameLink, PREVIEW_HEIGHT, PREVIEW_WIDTH, TimelineStatus,
 };
-use crate::graphics::{CpuRenderer, Renderer2d};
+use crate::graphics::Renderer2d;
+use crate::offscreen::{GpuPreview, PreviewWorker};
 use crate::pixels_renderer::PixelsRenderer2d;
 use crate::reload::{self, ProcessCommand, RELOAD_EXIT_CODE};
 use crate::surface::SurfaceSize;
@@ -461,10 +462,22 @@ pub fn run_app<H: AppHandler + 'static>(
 /// Hooks for a game whose simulation can continue from a recorded snapshot.
 pub trait TimelineGame: GameApp {
     type Snapshot: Clone + Send + Serialize + DeserializeOwned + 'static;
+    type PreviewSnapshot: Send + 'static;
+    type PreviewFeedback: Send + 'static;
     const SCHEMA: StateSchema;
 
     fn snapshot(state: &Self::State) -> &Self::Snapshot;
     fn restore_state(&mut self, snapshot: Self::Snapshot) -> Self::State;
+
+    /// Capture the data that the editor preview can draw independently of gameplay.
+    fn preview_snapshot(&self, state: &Self::State) -> Self::PreviewSnapshot;
+
+    fn draw_preview(
+        snapshot: Self::PreviewSnapshot,
+        renderer: &mut dyn Renderer2d,
+    ) -> Self::PreviewFeedback;
+
+    fn apply_preview_feedback(&mut self, _state: &Self::State, _feedback: Self::PreviewFeedback) {}
 
     fn timeline_command(&self, _input: &InputFrame) -> Option<TimelineCommand> {
         None
@@ -491,7 +504,20 @@ where
     if let Some(cursor) = timeline.cursor() {
         println!("restored checkpoint {cursor}");
     }
-    let editor = GameLink::connect()?;
+    let editor = match GameLink::connect()? {
+        Some((link, publisher)) => {
+            match GpuPreview::new(publisher).and_then(|gpu| Ok(gpu.spawn(G::draw_preview)?)) {
+                Ok(preview) => Some((link, preview)),
+                Err(err) => {
+                    eprintln!("could not initialize the editor GPU preview: {err}");
+                    drop(link);
+                    drop(timeline);
+                    std::process::exit(GPU_PREVIEW_EXIT_CODE);
+                }
+            }
+        }
+        None => None,
+    };
     let session = TimelineSession {
         paused: timeline.is_paused(),
         cursor: timeline.position(),
@@ -506,8 +532,8 @@ where
         last_checkpoint: Instant::now(),
         overseer: reload::listen_for_overseer(),
     };
-    if let Some(editor) = editor {
-        run_embedded(game, session, editor)
+    if let Some((editor, preview)) = editor {
+        run_embedded(game, session, editor, preview)
     } else {
         run_live(config, game, session)
     }
@@ -834,14 +860,15 @@ fn run_embedded<G: TimelineGame>(
     mut game: G,
     mut session: TimelineSession<G::Snapshot>,
     editor: GameLink,
+    preview: PreviewWorker<G::PreviewSnapshot, G::PreviewFeedback>,
 ) -> Result<(), Box<dyn Error>> {
     let size = SurfaceSize::new(PREVIEW_WIDTH, PREVIEW_HEIGHT);
     let mut ctx = AppContext { surface_size: size };
     let mut state = session.start(&mut game, &mut ctx)?;
     game.on_run_mode(RunMode::Timeline, &mut state, &mut ctx);
     let mut input = InputFrame::default();
-    let mut pixels = vec![0; PREVIEW_BYTES];
     let mut last_frame = Instant::now();
+    let mut deadline = last_frame;
     let interval = Duration::from_secs_f64(1.0 / 60.0);
     let exit_code = 'game: loop {
         if let Some(command) =
@@ -853,6 +880,16 @@ fn run_embedded<G: TimelineGame>(
         }
         if game.exit_requested() {
             break exit_for_command::<G>(&mut session, &state, ProcessCommand::Stop).unwrap_or(0);
+        }
+
+        match preview.take_feedback() {
+            Ok(Some(feedback)) => game.apply_preview_feedback(&state, feedback),
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("could not draw the editor GPU preview: {err}");
+                exit_for_command::<G>(&mut session, &state, ProcessCommand::Stop);
+                break GPU_PREVIEW_EXIT_CODE;
+            }
         }
 
         let now = Instant::now();
@@ -895,16 +932,16 @@ fn run_embedded<G: TimelineGame>(
             last_frame = Instant::now();
             None
         };
-        pixels.fill(0);
-        let view = game.build_view(&state, &ctx);
-        game.render(&state, &view, &mut CpuRenderer::new(&mut pixels, size));
         let status = LiveSession::<G>::timeline_status(&session).unwrap_or_default();
-        editor.publish(status, &mut pixels);
+        preview.publish(status, game.preview_snapshot(&state));
         if let Some(effects) = effects {
             game.handle_effects(effects, &mut ctx);
         }
         input.clear_frame_transients();
-        std::thread::sleep(interval.saturating_sub(now.elapsed()));
+        // Keep oversleep from accumulating across frames, and skip missed deadlines.
+        let finished = Instant::now();
+        deadline = (deadline + interval).max(finished);
+        std::thread::sleep(deadline.saturating_duration_since(finished));
     };
     game.shutdown();
     if exit_code != 0 {

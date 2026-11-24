@@ -18,7 +18,7 @@ use winit::dpi::LogicalSize;
 use winit::event::{
     ElementState, Event, MouseButton, MouseScrollDelta, VirtualKeyCode, WindowEvent,
 };
-use winit::event_loop::{ControlFlow, EventLoop};
+use winit::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use winit::platform::run_return::EventLoopExtRunReturn;
 use winit::window::WindowBuilder;
 
@@ -32,7 +32,7 @@ const BACK: Rect = Rect::new(138, 817, 86, 32);
 const PLAY: Rect = Rect::new(234, 817, 92, 32);
 const NEXT: Rect = Rect::new(336, 817, 86, 32);
 const RESUME: Rect = Rect::new(880, 817, 162, 32);
-const TICK: Duration = Duration::from_millis(16);
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const SEEK_INTERVAL: Duration = Duration::from_millis(55);
 
 const CANVAS: Color = [232, 222, 204, 255];
@@ -54,6 +54,7 @@ pub enum Phase {
     Reconnecting,
     Running,
     Failed,
+    GpuFailed,
     ReloadFailed,
     Exited,
 }
@@ -66,6 +67,18 @@ struct Shared {
     phase: Phase,
     input: Option<Sender<EditorEvent>>,
     frame: Option<Arc<PreviewFrame>>,
+    redraw: Option<EventLoopProxy<()>>,
+    redraw_pending: bool,
+}
+
+impl Shared {
+    fn request_redraw(&mut self) {
+        if !self.redraw_pending
+            && let Some(redraw) = &self.redraw
+        {
+            self.redraw_pending = redraw.send_event(()).is_ok();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -91,18 +104,23 @@ impl Bridge {
             phase: Phase::Building,
             input: None,
             frame: None,
+            redraw: None,
+            redraw_pending: false,
         })))
     }
 
     pub fn set_phase(&self, phase: Phase) {
-        self.0.lock().expect("editor bridge").phase = phase;
+        let mut shared = self.0.lock().expect("editor bridge");
+        shared.phase = phase;
+        shared.request_redraw();
     }
 
-    pub fn disconnect(&self) {
+    pub fn disconnect(&self, phase: Phase) {
         let mut shared = self.0.lock().expect("editor bridge");
         shared.generation = None;
-        shared.phase = Phase::Exited;
+        shared.phase = phase;
         shared.input = None;
+        shared.request_redraw();
     }
 
     pub fn endpoint(&self, generation: u64) -> io::Result<SocketAddr> {
@@ -114,6 +132,7 @@ impl Bridge {
             shared.generation = Some(generation);
             shared.phase = Phase::Reconnecting;
             shared.input = None;
+            shared.request_redraw();
         }
         let bridge = self.clone();
         thread::spawn(move || {
@@ -126,7 +145,9 @@ impl Bridge {
                         bridge.read_game(stream, generation);
                         return;
                     }
-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => thread::sleep(TICK),
+                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(ACCEPT_POLL_INTERVAL);
+                    }
                     Err(err) => {
                         eprintln!("editor preview connection failed: {err}");
                         bridge.disconnect_generation(generation);
@@ -145,6 +166,7 @@ impl Bridge {
             if matches!(shared.phase, Phase::Running | Phase::Reconnecting) {
                 shared.phase = Phase::Reconnecting;
             }
+            shared.request_redraw();
         }
     }
 
@@ -201,6 +223,7 @@ impl Bridge {
                 }
             }
             shared.frame = Some(Arc::new(frame));
+            shared.request_redraw();
         }
         self.disconnect_generation(generation);
     }
@@ -291,6 +314,20 @@ impl Interaction {
         }
     }
 
+    fn wait_for_seek(&self) -> ControlFlow {
+        match (self.pending_seek, self.last_seek) {
+            (Some(_), Some(last)) => ControlFlow::WaitUntil(last + SEEK_INTERVAL),
+            _ => ControlFlow::Wait,
+        }
+    }
+
+    fn hovered_button(&self) -> Option<Rect> {
+        let (x, y) = self.cursor?;
+        [BACK, PLAY, NEXT, RESUME]
+            .into_iter()
+            .find(|rect| rect.contains(x, y))
+    }
+
     fn set_preview_focus(&mut self, bridge: &Bridge, focused: bool) {
         if self.preview_focus != focused {
             self.preview_focus = focused;
@@ -370,7 +407,7 @@ fn dock_command(x: u32, y: u32, timeline: TimelineStatus) -> Option<TimelineComm
 }
 
 pub fn run(bridge: Bridge, game_name: &str) -> Result<(), Box<dyn Error>> {
-    let mut events = EventLoop::new();
+    let mut events = EventLoopBuilder::<()>::with_user_event().build();
     let window = WindowBuilder::new()
         .with_title("Sycho Editor")
         .with_inner_size(LogicalSize::new(1000.0, 773.0))
@@ -391,10 +428,12 @@ pub fn run(bridge: Bridge, game_name: &str) -> Result<(), Box<dyn Error>> {
     let background = render_background(game_name);
     let mut input = Interaction::default();
     let mut window_focused = true;
-    let mut next_draw = Instant::now();
+    let mut drawn_controls = None;
     let mut failure: Option<Box<dyn Error>> = None;
+    bridge.0.lock().expect("editor bridge").redraw = Some(events.create_proxy());
+    window.request_redraw();
     events.run_return(|event, _, control| {
-        *control = ControlFlow::WaitUntil(next_draw);
+        *control = input.wait_for_seek();
         match event {
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
@@ -403,12 +442,16 @@ pub fn run(bridge: Bridge, game_name: &str) -> Result<(), Box<dyn Error>> {
             Event::WindowEvent { event, .. } => {
                 let snapshot = bridge.snapshot();
                 input.update_connection(&bridge, &snapshot, window_focused);
+                let previous_focus = input.preview_focus;
+                let previous_drag = input.drag_ms;
+                let previous_hover = input.hovered_button();
                 match event {
                     WindowEvent::Resized(size) if size.width > 0 && size.height > 0 => {
                         if let Err(err) = pixels.resize_surface(size.width, size.height) {
                             failure = Some(err.into());
                             *control = ControlFlow::Exit;
                         }
+                        window.request_redraw();
                     }
                     WindowEvent::CursorMoved { position, .. } => {
                         let point =
@@ -457,17 +500,31 @@ pub fn run(bridge: Bridge, game_name: &str) -> Result<(), Box<dyn Error>> {
                     }
                     _ => {}
                 }
+                if input.preview_focus != previous_focus
+                    || input.drag_ms != previous_drag
+                    || input.hovered_button() != previous_hover
+                {
+                    window.request_redraw();
+                }
             }
-            Event::MainEventsCleared if Instant::now() >= next_draw => {
-                next_draw = Instant::now() + TICK;
-                input.flush_seek(&bridge, false);
+            Event::UserEvent(()) => {
+                bridge.0.lock().expect("editor bridge").redraw_pending = false;
                 window.request_redraw();
-                *control = ControlFlow::WaitUntil(next_draw);
+            }
+            Event::MainEventsCleared => {
+                input.flush_seek(&bridge, false);
+                *control = input.wait_for_seek();
             }
             Event::RedrawRequested(_) => {
                 let snapshot = bridge.snapshot();
                 input.update_connection(&bridge, &snapshot, window_focused);
-                render(pixels.frame_mut(), &background, &snapshot, &input);
+                render(
+                    pixels.frame_mut(),
+                    &background,
+                    &snapshot,
+                    &input,
+                    &mut drawn_controls,
+                );
                 if let Err(err) = pixels.render() {
                     failure = Some(err.into());
                     *control = ControlFlow::Exit;
@@ -551,162 +608,43 @@ fn render_background(game_name: &str) -> Vec<u8> {
         MUTED,
         2,
     );
+    fill(&mut gfx, DOCK.x + 3, DOCK.y + 5, DOCK.w, DOCK.h, GRID);
+    gfx.fill_rect(DOCK, PAPER);
+    gfx.rect_outline(DOCK, BORDER);
     pixels
 }
 
-fn render(canvas: &mut [u8], background: &[u8], snapshot: &Snapshot, input: &Interaction) {
-    canvas.copy_from_slice(background);
-    {
-        let mut gfx = CpuRenderer::new(canvas, SurfaceSize::new(WIDTH, HEIGHT));
-        let (status, fg, bg) = match snapshot.phase {
-            Phase::Building => ("BUILDING", INK, PAPER),
-            Phase::Reconnecting => ("CONNECTING", INK, PAPER),
-            Phase::Running => ("CONNECTED", GREEN, GREEN_LIGHT),
-            Phase::Failed => ("BUILD FAILED", RED, RED_LIGHT),
-            Phase::ReloadFailed => ("RELOAD FAILED", RED, RED_LIGHT),
-            Phase::Exited => ("GAME EXITED", RED, RED_LIGHT),
-        };
-        fill(&mut gfx, 938, 23, 132, 24, bg);
-        text(&mut gfx, 947, 30, status, fg, 2);
-        let focus = if input.preview_focus {
-            "GAME INPUT ACTIVE"
-        } else {
-            "CLICK PREVIEW TO PLAY"
-        };
-        text(&mut gfx, 110, 53, focus, MUTED, 2);
-        if matches!(snapshot.phase, Phase::Failed | Phase::ReloadFailed) {
-            text(&mut gfx, 869, 53, "DETAILS IN TERMINAL", RED, 2);
-        }
-        let frame_border = if input.preview_focus { GREEN } else { INK };
-        fill(
-            &mut gfx,
-            PREVIEW.x - 5,
-            PREVIEW.y - 5,
-            PREVIEW.w + 10,
-            PREVIEW.h + 10,
-            frame_border,
-        );
-        if snapshot.frame.is_none() {
-            gfx.fill_rect(PREVIEW, BLACK);
-            let label = if snapshot.phase == Phase::Failed {
-                "WAITING FOR A SOURCE FIX"
-            } else {
-                "WAITING FOR GAME PREVIEW"
-            };
-            text(&mut gfx, PREVIEW.x + 336, PREVIEW.y + 305, label, WHITE, 3);
-        }
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Controls {
+    phase: Phase,
+    connected: bool,
+    has_preview: bool,
+    timeline: TimelineStatus,
+    preview_focus: bool,
+    hovered: Option<Rect>,
+    drag_ms: Option<u64>,
+}
 
-        fill(&mut gfx, DOCK.x + 3, DOCK.y + 5, DOCK.w, DOCK.h, GRID);
-        gfx.fill_rect(DOCK, PAPER);
-        gfx.rect_outline(DOCK, BORDER);
-        let timeline = snapshot.timeline();
-        text(&mut gfx, 138, 758, "TIMELINE", INK, 2);
-        let cursor = input
-            .drag_ms
-            .or_else(|| timeline.cursor.map(|frame| frame.at_ms))
-            .unwrap_or(0);
-        let tip = timeline.tip.map_or(0, |frame| frame.at_ms);
-        let mode = if timeline.playing {
-            "PLAYBACK"
-        } else if timeline.paused {
-            "PAUSED"
-        } else if snapshot.connected {
-            "LIVE"
-        } else {
-            "OFFLINE"
-        };
-        text(
-            &mut gfx,
-            244,
-            758,
-            mode,
-            if timeline.paused { RED } else { GREEN },
-            2,
-        );
-        text(
-            &mut gfx,
-            778,
-            758,
-            &format!("{}  /  TIP {}", timestamp(cursor), timestamp(tip)),
-            MUTED,
-            2,
-        );
-        gfx.fill_rect(TRACK, [221, 210, 187, 255]);
-        let marker = if tip == 0 {
-            TRACK.x
-        } else {
-            TRACK.x + (u128::from(TRACK.w) * u128::from(cursor.min(tip)) / u128::from(tip)) as u32
-        };
-        fill(&mut gfx, TRACK.x, TRACK.y + 4, marker - TRACK.x, 4, GREEN);
-        for i in 0..=10 {
-            let x = TRACK.x + TRACK.w * i / 10;
-            fill(&mut gfx, x, TRACK.y + 9, 1, 6, BORDER);
-        }
-        fill(
-            &mut gfx,
-            (TRACK.x + TRACK.w).saturating_sub(2),
-            TRACK.y - 2,
-            3,
-            16,
-            INK,
-        );
-        fill(
-            &mut gfx,
-            marker.saturating_sub(4),
-            TRACK.y - 4,
-            9,
-            20,
-            GREEN,
-        );
-        let hover = |rect: Rect| input.cursor.is_some_and(|(x, y)| rect.contains(x, y));
-        let in_past = timeline.cursor != timeline.tip;
-        button(
-            &mut gfx,
-            BACK,
-            "BACK",
-            snapshot.connected && timeline.cursor.is_some_and(|frame| frame.id > 0),
-            false,
-            hover(BACK),
-        );
-        let play_label = if timeline.playing || !timeline.paused {
-            "PAUSE"
-        } else {
-            "PLAY"
-        };
-        button(
-            &mut gfx,
-            PLAY,
-            play_label,
-            snapshot.connected && (!timeline.paused || in_past),
-            false,
-            hover(PLAY),
-        );
-        button(
-            &mut gfx,
-            NEXT,
-            "NEXT",
-            snapshot.connected && in_past,
-            false,
-            hover(NEXT),
-        );
-        button(
-            &mut gfx,
-            RESUME,
-            "RESUME LIVE",
-            snapshot.connected && timeline.paused,
-            true,
-            hover(RESUME),
-        );
-        if timeline.paused && in_past {
-            text(
-                &mut gfx,
-                449,
-                828,
-                "RESUMING HERE REPLACES LATER HISTORY",
-                MUTED,
-                2,
-            );
-        }
+fn render(
+    canvas: &mut [u8],
+    background: &[u8],
+    snapshot: &Snapshot,
+    input: &Interaction,
+    drawn_controls: &mut Option<Controls>,
+) {
+    let controls = Controls {
+        phase: snapshot.phase,
+        connected: snapshot.connected,
+        has_preview: snapshot.frame.is_some(),
+        timeline: snapshot.timeline(),
+        preview_focus: input.preview_focus,
+        hovered: input.hovered_button(),
+        drag_ms: input.drag_ms,
+    };
+    if *drawn_controls != Some(controls) {
+        canvas.copy_from_slice(background);
+        draw_controls(canvas, controls);
+        *drawn_controls = Some(controls);
     }
     if let Some(frame) = &snapshot.frame {
         let source_stride = PREVIEW_WIDTH as usize * 4;
@@ -714,6 +652,160 @@ fn render(canvas: &mut [u8], background: &[u8], snapshot: &Snapshot, input: &Int
             let offset = ((PREVIEW.y as usize + y) * WIDTH as usize + PREVIEW.x as usize) * 4;
             canvas[offset..offset + source_stride].copy_from_slice(row);
         }
+    }
+}
+
+fn draw_controls(canvas: &mut [u8], controls: Controls) {
+    let mut gfx = CpuRenderer::new(canvas, SurfaceSize::new(WIDTH, HEIGHT));
+    let (status, fg, bg) = match controls.phase {
+        Phase::Building => ("BUILDING", INK, PAPER),
+        Phase::Reconnecting => ("CONNECTING", INK, PAPER),
+        Phase::Running => ("CONNECTED", GREEN, GREEN_LIGHT),
+        Phase::Failed => ("BUILD FAILED", RED, RED_LIGHT),
+        Phase::GpuFailed => ("GPU UNAVAILABLE", RED, RED_LIGHT),
+        Phase::ReloadFailed => ("RELOAD FAILED", RED, RED_LIGHT),
+        Phase::Exited => ("GAME EXITED", RED, RED_LIGHT),
+    };
+    fill(&mut gfx, 938, 23, 132, 24, bg);
+    text(&mut gfx, 947, 30, status, fg, 2);
+    let focus = if controls.preview_focus {
+        "GAME INPUT ACTIVE"
+    } else {
+        "CLICK PREVIEW TO PLAY"
+    };
+    text(&mut gfx, 110, 53, focus, MUTED, 2);
+    if matches!(
+        controls.phase,
+        Phase::Failed | Phase::GpuFailed | Phase::ReloadFailed
+    ) {
+        text(&mut gfx, 869, 53, "DETAILS IN TERMINAL", RED, 2);
+    }
+    let frame_border = if controls.preview_focus { GREEN } else { INK };
+    for rect in [
+        Rect::new(PREVIEW.x - 5, PREVIEW.y - 5, PREVIEW.w + 10, 5),
+        Rect::new(PREVIEW.x - 5, PREVIEW.y + PREVIEW.h, PREVIEW.w + 10, 5),
+        Rect::new(PREVIEW.x - 5, PREVIEW.y, 5, PREVIEW.h),
+        Rect::new(PREVIEW.x + PREVIEW.w, PREVIEW.y, 5, PREVIEW.h),
+    ] {
+        gfx.fill_rect(rect, frame_border);
+    }
+    if !controls.has_preview {
+        gfx.fill_rect(PREVIEW, BLACK);
+        let label = match controls.phase {
+            Phase::Failed => "WAITING FOR A SOURCE FIX",
+            Phase::GpuFailed => "GPU PREVIEW FAILED",
+            _ => "WAITING FOR GAME PREVIEW",
+        };
+        text(&mut gfx, PREVIEW.x + 336, PREVIEW.y + 305, label, WHITE, 3);
+    }
+
+    let timeline = controls.timeline;
+    text(&mut gfx, 138, 758, "TIMELINE", INK, 2);
+    let cursor = controls
+        .drag_ms
+        .or_else(|| timeline.cursor.map(|frame| frame.at_ms))
+        .unwrap_or(0);
+    let tip = timeline.tip.map_or(0, |frame| frame.at_ms);
+    let mode = if timeline.playing {
+        "PLAYBACK"
+    } else if timeline.paused {
+        "PAUSED"
+    } else if controls.connected {
+        "LIVE"
+    } else {
+        "OFFLINE"
+    };
+    text(
+        &mut gfx,
+        244,
+        758,
+        mode,
+        if timeline.paused { RED } else { GREEN },
+        2,
+    );
+    text(
+        &mut gfx,
+        778,
+        758,
+        &format!("{}  /  TIP {}", timestamp(cursor), timestamp(tip)),
+        MUTED,
+        2,
+    );
+    gfx.fill_rect(TRACK, [221, 210, 187, 255]);
+    let marker = if tip == 0 {
+        TRACK.x
+    } else {
+        TRACK.x + (u128::from(TRACK.w) * u128::from(cursor.min(tip)) / u128::from(tip)) as u32
+    };
+    fill(&mut gfx, TRACK.x, TRACK.y + 4, marker - TRACK.x, 4, GREEN);
+    for i in 0..=10 {
+        let x = TRACK.x + TRACK.w * i / 10;
+        fill(&mut gfx, x, TRACK.y + 9, 1, 6, BORDER);
+    }
+    fill(
+        &mut gfx,
+        (TRACK.x + TRACK.w).saturating_sub(2),
+        TRACK.y - 2,
+        3,
+        16,
+        INK,
+    );
+    fill(
+        &mut gfx,
+        marker.saturating_sub(4),
+        TRACK.y - 4,
+        9,
+        20,
+        GREEN,
+    );
+    let hovered = controls.hovered;
+    let in_past = timeline.cursor != timeline.tip;
+    button(
+        &mut gfx,
+        BACK,
+        "BACK",
+        controls.connected && timeline.cursor.is_some_and(|frame| frame.id > 0),
+        false,
+        hovered == Some(BACK),
+    );
+    let play_label = if timeline.playing || !timeline.paused {
+        "PAUSE"
+    } else {
+        "PLAY"
+    };
+    button(
+        &mut gfx,
+        PLAY,
+        play_label,
+        controls.connected && (!timeline.paused || in_past),
+        false,
+        hovered == Some(PLAY),
+    );
+    button(
+        &mut gfx,
+        NEXT,
+        "NEXT",
+        controls.connected && in_past,
+        false,
+        hovered == Some(NEXT),
+    );
+    button(
+        &mut gfx,
+        RESUME,
+        "RESUME LIVE",
+        controls.connected && timeline.paused,
+        true,
+        hovered == Some(RESUME),
+    );
+    if timeline.paused && in_past {
+        text(
+            &mut gfx,
+            449,
+            828,
+            "RESUMING HERE REPLACES LATER HISTORY",
+            MUTED,
+            2,
+        );
     }
 }
 

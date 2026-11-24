@@ -28,6 +28,35 @@ pub struct RenderCache {
     pub last_settings_menu: SettingsMenuLayout,
 }
 
+pub struct RenderInputs {
+    pub mouse: (u32, u32),
+    pub world_offset_y_px: i32,
+    pub frame_dt: Duration,
+    pub settings_overlay: Option<PlayerSettings>,
+    pub show_round_timer: bool,
+}
+
+pub struct DrawTimings {
+    frame_dt: Duration,
+    board_dt: Duration,
+    draw_dt: Duration,
+    overlay_dt: Duration,
+    frame_total_dt: Duration,
+}
+
+impl DrawTimings {
+    pub fn record(self, debug_hud: &mut DebugHud) {
+        debug_hud.on_frame(
+            self.frame_dt,
+            self.board_dt,
+            self.draw_dt,
+            self.overlay_dt,
+            Duration::ZERO,
+            self.frame_total_dt,
+        );
+    }
+}
+
 pub fn export_video(directory: &Path, output: &Path) -> io::Result<()> {
     let timeline = TimelineReader::open(directory, TIMELINE_SCHEMA)?;
     let mut ui_tree = UiTree::new();
@@ -42,32 +71,29 @@ pub fn export_video(directory: &Path, output: &Path) -> io::Result<()> {
         render_frame(
             renderer,
             &mut ui_tree,
-            &mut debug_hud,
+            &debug_hud,
             state,
-            u32::MAX,
-            u32::MAX,
             &mut cache,
-            0,
-            Duration::ZERO,
-            None,
-            true,
-        );
+            RenderInputs {
+                mouse: (u32::MAX, u32::MAX),
+                world_offset_y_px: 0,
+                frame_dt: Duration::ZERO,
+                settings_overlay: None,
+                show_round_timer: true,
+            },
+        )
+        .record(&mut debug_hud);
     })
 }
 
 pub fn render_frame(
     renderer: &mut dyn Renderer2d,
     ui_tree: &mut UiTree,
-    debug_hud: &mut DebugHud,
+    debug_hud: &DebugHud,
     state: &GameState,
-    mouse_x: u32,
-    mouse_y: u32,
     cache: &mut RenderCache,
-    world_offset_y_px: i32,
-    last_frame_dt: Duration,
-    settings_overlay: Option<&PlayerSettings>,
-    show_round_timer: bool,
-) {
+    inputs: RenderInputs,
+) -> DrawTimings {
     let frame_start = Instant::now();
     let board_start = Instant::now();
     let view = state.view;
@@ -87,7 +113,7 @@ pub fn render_frame(
             size.width,
             size.height,
             state.tetris(),
-            world_offset_y_px,
+            inputs.world_offset_y_px,
         );
         if view.is_tetris() {
             draw_tetris_hud_view(
@@ -96,13 +122,13 @@ pub fn render_frame(
                 size.height,
                 state.tetris(),
                 tetris_layout,
-                Some((mouse_x, mouse_y)),
+                Some(inputs.mouse),
             );
         }
         cache.last_layout = tetris_layout;
     }
 
-    if view.is_tetris() && show_round_timer {
+    if view.is_tetris() && inputs.show_round_timer {
         let hud_x = cache.last_layout.pause_button.x.saturating_sub(180);
         let hud_y = cache
             .last_layout
@@ -146,7 +172,7 @@ pub fn render_frame(
                 size.height,
                 ui_tree,
                 &state.skilltree,
-                Some((mouse_x, mouse_y)),
+                Some(inputs.mouse),
             );
             cache.last_game_over_menu = GameOverMenuLayout::default();
             cache.last_settings_menu = SettingsMenuLayout::default();
@@ -175,7 +201,7 @@ pub fn render_frame(
             cache.last_settings_menu = SettingsMenuLayout::default();
         }
     }
-    if let Some(settings) = settings_overlay {
+    if let Some(settings) = &inputs.settings_overlay {
         cache.last_settings_menu =
             draw_settings_menu_with_ui(renderer, size.width, size.height, ui_tree, settings);
     } else {
@@ -184,14 +210,11 @@ pub fn render_frame(
     debug_hud.draw_overlay(renderer, size.width, size.height);
     let overlay_dt = overlay_start.elapsed();
 
-    let present_dt = Duration::ZERO;
-    let frame_total_dt = frame_start.elapsed();
-    debug_hud.on_frame(
-        last_frame_dt,
+    DrawTimings {
+        frame_dt: inputs.frame_dt,
         board_dt,
         draw_dt,
         overlay_dt,
-        present_dt,
-        frame_total_dt,
-    );
+        frame_total_dt: frame_start.elapsed(),
+    }
 }

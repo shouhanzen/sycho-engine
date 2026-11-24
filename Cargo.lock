@@ -551,6 +551,7 @@ dependencies = [
  "bytemuck",
  "hex",
  "pixels",
+ "pollster",
  "serde",
  "serde_json",
  "sha2",

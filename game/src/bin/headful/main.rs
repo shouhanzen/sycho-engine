@@ -27,7 +27,7 @@ use game::debug::DebugHud;
 use game::headful::dig_camera as headful_dig_camera;
 use game::headful::input_adapter as headful_input;
 use game::headful::render_pipeline::{
-    RenderCache, export_video, render_frame as render_headful_frame,
+    DrawTimings, RenderCache, RenderInputs, export_video, render_frame as render_headful_frame,
 };
 use game::headful::skilltree_camera as headful_camera;
 use game::headful::view_transitions as headful_view;
@@ -59,6 +59,7 @@ struct HeadfulApp {
     sfx: Option<Sfx>,
     debug_hud: DebugHud,
     ui_tree: UiTree,
+    preview_epoch: u64,
     last_layout: UiLayout,
     last_main_menu: MainMenuLayout,
     last_pause_menu: PauseMenuLayout,
@@ -82,6 +83,23 @@ struct HeadfulApp {
     settings_origin: SettingsOrigin,
     active_settings_slider: Option<ActiveSettingsSlider>,
     settings_dirty: bool,
+}
+
+struct PreviewSnapshot {
+    state: GameState,
+    inputs: RenderInputs,
+    ui_tree: UiTree,
+    debug_hud: DebugHud,
+    epoch: u64,
+}
+
+struct PreviewFeedback {
+    view: GameView,
+    settings_open: bool,
+    ui_tree: UiTree,
+    cache: RenderCache,
+    timings: DrawTimings,
+    epoch: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -222,6 +240,7 @@ impl HeadfulApp {
             sfx,
             debug_hud,
             ui_tree: UiTree::new(),
+            preview_epoch: 0,
             last_layout: UiLayout::default(),
             last_main_menu: MainMenuLayout::default(),
             last_pause_menu: PauseMenuLayout::default(),
@@ -248,6 +267,31 @@ impl HeadfulApp {
         };
         app.apply_audio_settings();
         app
+    }
+
+    fn render_inputs(&self) -> RenderInputs {
+        let camera_offset = if self.player_settings.accessibility.reduce_motion {
+            0.0
+        } else {
+            self.dig_camera.offset_y_px()
+                * (self.player_settings.video.clamped_screen_shake() as f32 / 100.0)
+        };
+        RenderInputs {
+            mouse: (self.mouse_x, self.mouse_y),
+            world_offset_y_px: camera_offset.round() as i32,
+            frame_dt: self.last_frame_dt,
+            settings_overlay: self.settings_open.then(|| self.player_settings.clone()),
+            show_round_timer: self.player_settings.gameplay.show_round_timer,
+        }
+    }
+
+    fn set_render_cache(&mut self, cache: RenderCache) {
+        self.last_layout = cache.last_layout;
+        self.last_main_menu = cache.last_main_menu;
+        self.last_pause_menu = cache.last_pause_menu;
+        self.last_skilltree = cache.last_skilltree;
+        self.last_game_over_menu = cache.last_game_over_menu;
+        self.last_settings_menu = cache.last_settings_menu;
     }
 
     fn play_click_sfx(&self) {
@@ -1077,40 +1121,18 @@ impl GameApp for HeadfulApp {
         _view: &engine::view_tree::ViewTree<Self::Action>,
         renderer: &mut dyn engine::graphics::Renderer2d,
     ) {
-        let state = runner.state();
-        let mut cache = RenderCache {
-            last_layout: self.last_layout,
-            last_main_menu: self.last_main_menu,
-            last_pause_menu: self.last_pause_menu,
-            last_skilltree: self.last_skilltree,
-            last_game_over_menu: self.last_game_over_menu,
-            last_settings_menu: self.last_settings_menu,
-        };
-        let mut camera_offset = self.dig_camera.offset_y_px();
-        if self.player_settings.accessibility.reduce_motion {
-            camera_offset = 0.0;
-        } else {
-            camera_offset *= self.player_settings.video.clamped_screen_shake() as f32 / 100.0;
-        }
+        let inputs = self.render_inputs();
+        let mut cache = RenderCache::default();
         render_headful_frame(
             renderer,
             &mut self.ui_tree,
-            &mut self.debug_hud,
-            state,
-            self.mouse_x,
-            self.mouse_y,
+            &self.debug_hud,
+            runner.state(),
             &mut cache,
-            camera_offset.round() as i32,
-            self.last_frame_dt,
-            self.settings_open.then_some(&self.player_settings),
-            self.player_settings.gameplay.show_round_timer,
-        );
-        self.last_layout = cache.last_layout;
-        self.last_main_menu = cache.last_main_menu;
-        self.last_pause_menu = cache.last_pause_menu;
-        self.last_skilltree = cache.last_skilltree;
-        self.last_game_over_menu = cache.last_game_over_menu;
-        self.last_settings_menu = cache.last_settings_menu;
+            inputs,
+        )
+        .record(&mut self.debug_hud);
+        self.set_render_cache(cache);
     }
 
     fn exit_requested(&self) -> bool {
@@ -1165,7 +1187,54 @@ impl GameApp for HeadfulApp {
 
 impl TimelineGame for HeadfulApp {
     type Snapshot = GameState;
+    type PreviewSnapshot = PreviewSnapshot;
+    type PreviewFeedback = PreviewFeedback;
     const SCHEMA: StateSchema = TIMELINE_SCHEMA;
+
+    fn preview_snapshot(&self, runner: &Self::State) -> PreviewSnapshot {
+        PreviewSnapshot {
+            state: runner.state().clone(),
+            inputs: self.render_inputs(),
+            ui_tree: self.ui_tree.clone(),
+            debug_hud: self.debug_hud.clone(),
+            epoch: self.preview_epoch,
+        }
+    }
+
+    fn draw_preview(
+        mut snapshot: PreviewSnapshot,
+        renderer: &mut dyn engine::graphics::Renderer2d,
+    ) -> PreviewFeedback {
+        let mut cache = RenderCache::default();
+        let settings_open = snapshot.inputs.settings_overlay.is_some();
+        let timings = render_headful_frame(
+            renderer,
+            &mut snapshot.ui_tree,
+            &snapshot.debug_hud,
+            &snapshot.state,
+            &mut cache,
+            snapshot.inputs,
+        );
+        PreviewFeedback {
+            view: snapshot.state.view,
+            settings_open,
+            ui_tree: snapshot.ui_tree,
+            cache,
+            timings,
+            epoch: snapshot.epoch,
+        }
+    }
+
+    fn apply_preview_feedback(&mut self, runner: &Self::State, feedback: PreviewFeedback) {
+        feedback.timings.record(&mut self.debug_hud);
+        if feedback.epoch == self.preview_epoch
+            && feedback.view == runner.state().view
+            && feedback.settings_open == self.settings_open
+        {
+            self.ui_tree.replace_layout(feedback.ui_tree);
+            self.set_render_cache(feedback.cache);
+        }
+    }
 
     fn snapshot(state: &Self::State) -> &Self::Snapshot {
         state.state()
@@ -1181,6 +1250,8 @@ impl TimelineGame for HeadfulApp {
             .reset(runner.state().tetris.background_depth_rows());
         self.skilltree_cam_input = SkillTreeCameraInput::default();
         self.ui_tree = UiTree::new();
+        self.preview_epoch = self.preview_epoch.wrapping_add(1);
+        self.set_render_cache(RenderCache::default());
         self.active_settings_slider = None;
         self.settings_open = false;
         self.mouse_release_was_drag = false;

@@ -81,6 +81,12 @@ impl UiTree {
         self.state
     }
 
+    /// Install a layout built by the renderer while preserving input received since it began.
+    pub fn replace_layout(&mut self, layout: UiTree) {
+        self.nodes = layout.nodes;
+        self.roots = layout.roots;
+    }
+
     pub fn is_hovered(&self, id: UiId) -> bool {
         self.state.is_hovered(id)
     }

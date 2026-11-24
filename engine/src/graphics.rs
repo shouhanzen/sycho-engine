@@ -1,5 +1,5 @@
 use crate::{surface::SurfaceSize, ui::Rect};
-use pixels::{PixelsContext, wgpu};
+use pixels::wgpu;
 use wgpu::util::DeviceExt;
 
 pub type Color = [u8; 4];
@@ -565,23 +565,22 @@ impl GpuRenderer2d {
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         render_target: &wgpu::TextureView,
-        ctx: &PixelsContext,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
     ) {
         let width = self.size.width.max(1);
         let height = self.size.height.max(1);
 
-        self.ensure_instance_capacity(&ctx.device, self.instances.len());
+        self.ensure_instance_capacity(device, self.instances.len());
 
         let globals = Globals {
             screen: [width as f32, height as f32],
             _pad: [0.0, 0.0],
         };
-        ctx.queue
-            .write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
+        queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&globals));
 
         if !self.instances.is_empty() {
-            ctx.queue
-                .write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&self.instances));
+            queue.write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&self.instances));
         }
 
         let clear = wgpu::Color {

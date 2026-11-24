@@ -14,6 +14,7 @@ use winit::event::{ElementState, MouseButton, VirtualKeyCode};
 use crate::timeline::{Frame, TimelineCommand};
 
 pub const ADDRESS_ENV: &str = "SYCHO_EMBEDDED_ADDRESS";
+pub const GPU_PREVIEW_EXIT_CODE: i32 = 76;
 pub const PREVIEW_WIDTH: u32 = 960;
 pub const PREVIEW_HEIGHT: u32 = 640;
 pub const PREVIEW_BYTES: usize = (PREVIEW_WIDTH * PREVIEW_HEIGHT * 4) as usize;
@@ -88,7 +89,12 @@ pub(crate) struct GameLink {
     stream: TcpStream,
     pub events: Receiver<EditorEvent>,
     frames: Arc<(Mutex<Outbox>, Condvar)>,
+}
+
+pub(crate) struct FramePublisher {
+    frames: Arc<(Mutex<Outbox>, Condvar)>,
     recycled: Receiver<Vec<u8>>,
+    pixels: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -98,7 +104,7 @@ struct Outbox {
 }
 
 impl GameLink {
-    pub fn connect() -> io::Result<Option<Self>> {
+    pub fn connect() -> io::Result<Option<(Self, FramePublisher)>> {
         let Some(address) = env::var_os(ADDRESS_ENV) else {
             return Ok(None);
         };
@@ -148,25 +154,34 @@ impl GameLink {
                 let _ = recycle.try_send(frame.pixels);
             }
         });
-        Ok(Some(Self {
-            stream,
-            events,
-            frames,
-            recycled,
-        }))
+        Ok(Some((
+            Self {
+                stream,
+                events,
+                frames: frames.clone(),
+            },
+            FramePublisher {
+                frames,
+                recycled,
+                pixels: vec![0; PREVIEW_BYTES],
+            },
+        )))
     }
+}
 
-    pub fn publish(&self, status: TimelineStatus, buffer: &mut Vec<u8>) {
+impl FramePublisher {
+    pub fn publish(&mut self, status: TimelineStatus, rgba: &[u8]) {
+        self.pixels.copy_from_slice(rgba);
         let (outbox, changed) = &*self.frames;
         let mut slot = outbox.lock().expect("preview outbox");
         let frame = PreviewFrame {
             status,
-            pixels: std::mem::take(buffer),
+            pixels: std::mem::take(&mut self.pixels),
         };
         let old = slot.frame.replace(frame);
         changed.notify_one();
         drop(slot);
-        *buffer = old
+        self.pixels = old
             .map(|frame| frame.pixels)
             .or_else(|| self.recycled.try_recv().ok())
             .unwrap_or_else(|| vec![0; PREVIEW_BYTES]);

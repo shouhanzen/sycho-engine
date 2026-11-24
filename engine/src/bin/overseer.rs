@@ -13,7 +13,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use engine::embedded::ADDRESS_ENV;
+use engine::embedded::{ADDRESS_ENV, GPU_PREVIEW_EXIT_CODE};
 use engine::reload::{MANAGED_ENV, RELOAD_EXIT_CODE, RELOAD_REJECTED, RELOAD_REQUEST};
 use engine::timeline::session_directory;
 use serde::Deserialize;
@@ -152,7 +152,11 @@ fn supervise(options: &Options, editor: Option<&Bridge>, stop: &AtomicBool) -> i
             && let Some(status) = running.child.try_wait()?
         {
             if let Some(editor) = editor {
-                editor.disconnect();
+                if status.code() == Some(GPU_PREVIEW_EXIT_CODE) {
+                    editor.disconnect(Phase::GpuFailed);
+                } else {
+                    editor.disconnect(Phase::Exited);
+                }
                 if let Err(err) = game_exit(status) {
                     eprintln!("{err}");
                 }
@@ -218,8 +222,7 @@ fn supervise(options: &Options, editor: Option<&Bridge>, stop: &AtomicBool) -> i
                         Ok(child) => game = Some(child),
                         Err(err) => {
                             if let Some(editor) = editor {
-                                editor.disconnect();
-                                editor.set_phase(Phase::Failed);
+                                editor.disconnect(Phase::Failed);
                                 game = None;
                                 eprintln!("could not start the game: {err}");
                             } else {

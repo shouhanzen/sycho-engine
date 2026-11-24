@@ -130,7 +130,7 @@ impl PixelsRenderer2d {
                     .take()
                     .expect("RenderBackend2d::Gpu requires gpu renderer to be initialized");
                 let res = self.pixels.render_with(|encoder, render_target, ctx| {
-                    gpu.render(encoder, render_target, ctx);
+                    gpu.render(encoder, render_target, &ctx.device, &ctx.queue);
                     Ok(())
                 });
                 self.gpu = Some(gpu);
