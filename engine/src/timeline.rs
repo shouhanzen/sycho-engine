@@ -21,15 +21,17 @@ pub struct StateSchema {
     pub version: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TimelineCommand {
     TogglePause,
+    ResumeLive,
     Rewind,
     Forward,
     TogglePlayback,
+    Seek(u64),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Frame {
     pub id: u64,
     pub at_ms: u64,
@@ -222,6 +224,7 @@ pub struct Timeline {
     head: Option<Head>,
     position: Option<Frame>,
     future: Option<Vec<Frame>>,
+    seek_index: Option<Vec<Frame>>,
     base: Option<CaptureBase>,
 }
 
@@ -313,6 +316,7 @@ impl Timeline {
             head,
             position,
             future,
+            seek_index: None,
             base: None,
         };
         Ok((timeline, snapshot.map(|snapshot| snapshot.state)))
@@ -324,6 +328,17 @@ impl Timeline {
 
     pub fn position(&self) -> Option<Frame> {
         self.position
+    }
+
+    pub fn tip_position(&self) -> io::Result<Option<Frame>> {
+        let Some(head) = &self.head else {
+            return Ok(None);
+        };
+        if head.cursor == head.tip {
+            Ok(self.position)
+        } else {
+            read_frame(&self.directory, head.tip).map(Some)
+        }
     }
 
     pub fn is_paused(&self) -> bool {
@@ -395,6 +410,31 @@ impl Timeline {
         Ok(Some(state))
     }
 
+    /// Selects the last recorded sample at or before the requested time without branching.
+    pub fn seek<S: DeserializeOwned>(&mut self, at_ms: u64) -> io::Result<Option<S>> {
+        if !self.is_paused() {
+            return Ok(None);
+        }
+        if self.seek_index.is_none() {
+            let tip = self.head.as_ref().expect("paused timeline has a head").tip;
+            let mut frames = backward_frames(&self.directory, tip, None)?;
+            frames.reverse();
+            self.seek_index = Some(frames);
+        }
+        let frames = self.seek_index.as_ref().expect("seek index loaded");
+        let index = frames
+            .partition_point(|frame| frame.at_ms <= at_ms)
+            .saturating_sub(1);
+        let frame = frames[index];
+        if self.position == Some(frame) {
+            return Ok(None);
+        }
+        let state = self.select(frame)?;
+        // Rebuild the forward cache on demand so drag events don't copy the remainder of history.
+        self.future = None;
+        Ok(Some(state))
+    }
+
     pub fn next_frame(&mut self) -> io::Result<Option<Frame>> {
         Ok(self.future()?.last().copied())
     }
@@ -436,11 +476,12 @@ impl Timeline {
     fn future(&mut self) -> io::Result<&[Frame]> {
         if self.future.is_none() {
             let head = self.head.as_ref().expect("future requires a head");
-            self.future = Some(backward_frames(
-                &self.directory,
-                head.tip,
-                Some(head.cursor),
-            )?);
+            self.future = Some(if let Some(frames) = &self.seek_index {
+                let next = frames.partition_point(|frame| frame.id <= head.cursor);
+                frames[next..].iter().rev().copied().collect()
+            } else {
+                backward_frames(&self.directory, head.tip, Some(head.cursor))?
+            });
         }
         Ok(self.future.as_deref().expect("future loaded"))
     }
@@ -469,6 +510,7 @@ impl Timeline {
         let selected = head.cursor;
         self.commit_head(head)?;
         self.future = Some(Vec::new());
+        self.seek_index = None;
         self.base = None;
         sync_directory(&self.directory)?;
         // The committed head already excludes these checkpoints. Cleanup is best effort.
@@ -545,6 +587,7 @@ impl Timeline {
         head.paused = paused;
         self.commit_head(head)?;
         self.position = Some(Frame { id, at_ms });
+        self.seek_index = None;
         self.base = Some(CaptureBase {
             state,
             keyframe_at,

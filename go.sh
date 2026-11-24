@@ -11,9 +11,10 @@ usage() {
 go.sh - rollout_engine control surface
 
 Usage:
+  ./go.sh --editor [--timeline DIR] [--fresh] [--detach] [--release]
   ./go.sh --start [--headful|--headless] [--watch] [--timeline DIR] [--fresh|--playback] [--detach] [--release]
   ./go.sh --stop
-  ./go.sh --restart [--headful|--headless] [--watch] [--timeline DIR] [--fresh|--playback] [--detach] [--release]
+  ./go.sh --restart [--headful|--headless] [--watch|--editor] [--timeline DIR] [--fresh|--playback] [--detach] [--release]
   ./go.sh --status
   ./go.sh --test [--release]
   ./go.sh --test-fast [--release]
@@ -29,6 +30,7 @@ Modes:
 
 Live timeline (windowed game):
   --watch         Rebuild on source edits and relaunch at the last live checkpoint.
+  --editor        Launch the game's timeline editor with live reload.
   --timeline DIR  Open or create a timeline (default: target/timelines/headful).
   --fresh         Start a separate timeline. If DIR is given, it must be new.
   --playback      Open a saved timeline paused at its first snapshot.
@@ -347,6 +349,7 @@ VIDEO="false"
 PLAYBACK="false"
 EXPORT_PATH=""
 WATCH="false"
+EDITOR="false"
 TIMELINE_PATH=""
 FRESH="false"
 FFMPEG_BIN=""
@@ -394,6 +397,10 @@ while [[ $# -gt 0 ]]; do
       WATCH="true"
       shift
       ;;
+    --editor)
+      EDITOR="true"
+      shift
+      ;;
     --timeline)
       if [[ $# -lt 2 || "$2" == --* ]]; then
         echo "--timeline requires a directory" >&2
@@ -430,6 +437,17 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "$EDITOR" == "true" ]]; then
+  if [[ -z "$ACTION" ]]; then
+    ACTION="--start"
+  fi
+  if [[ "$MODE" != "headful" || ( "$ACTION" != "--start" && "$ACTION" != "--restart" ) ]]; then
+    echo "--editor requires a windowed launch" >&2
+    exit 2
+  fi
+  WATCH="true"
+fi
 
 if [[ -z "$ACTION" ]]; then
   usage
@@ -538,6 +556,9 @@ case "$ACTION" in
         --watch Cargo.toml --watch Cargo.lock
         --watch engine/Cargo.toml --watch engine/src
         --watch game/Cargo.toml --watch game/src)
+      if [[ "$EDITOR" == "true" ]]; then
+        HEADFUL_ARGS+=(--editor)
+      fi
       if [[ "$RELEASE" == "true" ]]; then
         HEADFUL_ARGS+=(--release)
       fi

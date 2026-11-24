@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod app;
 pub mod audio;
+pub mod embedded;
 pub mod graphics;
 pub mod pixels_renderer;
 pub mod profiling;

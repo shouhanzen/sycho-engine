@@ -787,7 +787,7 @@ impl GameApp for HeadfulApp {
         state: &Self::State,
         ctx: &AppContext,
     ) -> engine::view_tree::ViewTree<Self::Action> {
-        let size = ctx.renderer.size();
+        let size = ctx.surface_size;
         let mut tree = build_menu_view_tree(state.state().view, size.width, size.height);
         tree.nodes
             .extend(build_hud_view_tree(state.state(), size.width, size.height).nodes);
@@ -855,7 +855,7 @@ impl GameApp for HeadfulApp {
         }
 
         if left_mouse_pressed {
-            let size = ctx.renderer.size();
+            let size = ctx.surface_size;
             let debug_clicked =
                 self.debug_hud
                     .handle_click(self.mouse_x, self.mouse_y, size.width, size.height);
@@ -1113,6 +1113,14 @@ impl GameApp for HeadfulApp {
         self.last_settings_menu = cache.last_settings_menu;
     }
 
+    fn exit_requested(&self) -> bool {
+        self.exit_requested
+    }
+
+    fn shutdown(&mut self) {
+        self.save_settings_if_dirty();
+    }
+
     fn handle_event(
         &mut self,
         event: &Event<()>,
@@ -1145,7 +1153,7 @@ impl GameApp for HeadfulApp {
                 self.next_redraw = now + self.frame_interval;
             }
             Event::LoopDestroyed => {
-                self.save_settings_if_dirty();
+                self.shutdown();
                 return true;
             }
             _ => {}

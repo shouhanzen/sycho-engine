@@ -2,24 +2,36 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use engine::embedded::ADDRESS_ENV;
 use engine::reload::{MANAGED_ENV, RELOAD_EXIT_CODE, RELOAD_REJECTED, RELOAD_REQUEST};
 use engine::timeline::session_directory;
 use serde::Deserialize;
+
+#[path = "overseer/editor.rs"]
+mod editor;
+
+use editor::{Bridge, Phase};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
 const USAGE: &str = "Usage: overseer --package NAME --bin NAME --watch PATH [--watch PATH ...]
-                [--timeline DIR] [--fresh] [--release]
+                [--timeline DIR] [--fresh] [--editor] [--release]
 
 Watches the given files or source directories and runs a Sycho game.
-The timeline defaults to target/timelines/<bin>. --fresh creates a separate timeline.";
+The timeline defaults to target/timelines/<bin>. --fresh creates a separate timeline.
+--editor embeds the game in an editor with timeline controls.";
 
 struct Options {
     package: String,
@@ -27,6 +39,7 @@ struct Options {
     timeline: PathBuf,
     watch: Vec<PathBuf>,
     release: bool,
+    editor: bool,
 }
 
 impl Options {
@@ -38,6 +51,7 @@ impl Options {
         let mut watch = Vec::new();
         let mut fresh = false;
         let mut release = false;
+        let mut editor = false;
         while let Some(flag) = args.next() {
             let flag = flag.to_str().ok_or_else(|| invalid("invalid option"))?;
             let mut value = || {
@@ -64,6 +78,7 @@ impl Options {
                 "--watch" => watch.push(PathBuf::from(value()?)),
                 "--fresh" => fresh = true,
                 "--release" => release = true,
+                "--editor" => editor = true,
                 "--help" | "-h" => {
                     println!("{USAGE}");
                     return Ok(None);
@@ -84,6 +99,7 @@ impl Options {
             timeline,
             watch,
             release,
+            editor,
         }))
     }
 }
@@ -93,13 +109,33 @@ fn invalid(message: impl Into<String>) -> io::Error {
 }
 
 fn main() -> io::Result<()> {
-    if let Some(options) = Options::from_args()? {
-        supervise(&options)?;
+    let Some(options) = Options::from_args()? else {
+        return Ok(());
+    };
+    if !options.editor {
+        return supervise(&options, None, &AtomicBool::new(false));
     }
-    Ok(())
+
+    let bridge = Bridge::new();
+    let stop = Arc::new(AtomicBool::new(false));
+    let game_name = options.package.clone();
+    let worker_bridge = bridge.clone();
+    let worker_stop = stop.clone();
+    let worker = thread::spawn(move || {
+        if let Err(err) = supervise(&options, Some(&worker_bridge), &worker_stop) {
+            worker_bridge.set_phase(Phase::Failed);
+            eprintln!("editor supervision failed: {err}");
+        }
+    });
+    let result = editor::run(bridge, &game_name);
+    stop.store(true, Ordering::Relaxed);
+    worker
+        .join()
+        .map_err(|_| io::Error::other("editor supervisor stopped unexpectedly"))?;
+    result.map_err(|err| io::Error::other(err.to_string()))
 }
 
-fn supervise(options: &Options) -> io::Result<()> {
+fn supervise(options: &Options, editor: Option<&Bridge>, stop: &AtomicBool) -> io::Result<()> {
     let staging = Staging::new()?;
     let mut game: Option<RunningGame> = None;
     let mut observed = scan_sources(&options.watch)?;
@@ -111,11 +147,19 @@ fn supervise(options: &Options) -> io::Result<()> {
         options.watch.len(),
         options.binary
     );
-    loop {
+    while !stop.load(Ordering::Relaxed) {
         if let Some(running) = &mut game
             && let Some(status) = running.child.try_wait()?
         {
-            return game_exit(status);
+            if let Some(editor) = editor {
+                editor.disconnect();
+                if let Err(err) = game_exit(status) {
+                    eprintln!("{err}");
+                }
+                game = None;
+            } else {
+                return game_exit(status);
+            }
         }
         let current = scan_sources(&options.watch)?;
         if current != observed {
@@ -125,34 +169,80 @@ fn supervise(options: &Options) -> io::Result<()> {
         if rebuild.is_some_and(|since| since.elapsed() >= DEBOUNCE) {
             rebuild = None;
             generation += 1;
-            match build(options).and_then(|binary| staging.copy(&binary, generation)) {
+            if let Some(editor) = editor {
+                editor.set_phase(Phase::Building);
+            }
+            match build(options, stop).and_then(|binary| staging.copy(&binary, generation)) {
                 Ok(candidate) => {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
                     // Let edits made during a build settle before replacing the live process.
                     if scan_sources(&options.watch)? != observed {
                         continue;
                     }
                     if let Some(running) = &mut game {
-                        match running.handoff() {
+                        match running.handoff(stop) {
                             Ok(Handoff::Ready) => {
                                 println!("checkpoint committed, starting the new build")
                             }
-                            Ok(Handoff::Rejected) => continue,
-                            Ok(Handoff::Exited(status)) => return game_exit(status),
+                            Ok(Handoff::Rejected) => {
+                                if let Some(editor) = editor {
+                                    editor.set_phase(Phase::ReloadFailed);
+                                }
+                                continue;
+                            }
+                            Ok(Handoff::Exited(status)) if editor.is_none() => {
+                                return game_exit(status);
+                            }
+                            Ok(Handoff::Exited(status)) => {
+                                if let Err(err) = game_exit(status) {
+                                    eprintln!("{err}");
+                                }
+                            }
                             Err(err) => {
-                                eprintln!("could not request a reload: {err}");
+                                if !stop.load(Ordering::Relaxed) {
+                                    eprintln!("could not request a reload: {err}");
+                                    if let Some(editor) = editor {
+                                        editor.set_phase(Phase::ReloadFailed);
+                                    }
+                                }
                                 continue;
                             }
                         }
                     }
-                    game = Some(RunningGame::launch(candidate, &options.timeline)?);
+                    let address = editor
+                        .map(|bridge| bridge.endpoint(generation))
+                        .transpose()?;
+                    match RunningGame::launch(candidate, &options.timeline, address) {
+                        Ok(child) => game = Some(child),
+                        Err(err) => {
+                            if let Some(editor) = editor {
+                                editor.disconnect();
+                                editor.set_phase(Phase::Failed);
+                                game = None;
+                                eprintln!("could not start the game: {err}");
+                            } else {
+                                return Err(err);
+                            }
+                        }
+                    }
                 }
-                Err(err) => {
+                Err(err) if !stop.load(Ordering::Relaxed) => {
                     eprintln!("build failed: {err}. Waiting for another source change");
+                    if let Some(editor) = editor {
+                        editor.set_phase(Phase::Failed);
+                    }
                 }
+                Err(_) => break,
             }
         }
         thread::sleep(POLL_INTERVAL);
     }
+    if let Some(game) = &mut game {
+        game.stop();
+    }
+    Ok(())
 }
 
 fn game_exit(status: ExitStatus) -> io::Result<()> {
@@ -212,7 +302,7 @@ struct CargoDiagnostic {
     rendered: Option<String>,
 }
 
-fn build(options: &Options) -> io::Result<PathBuf> {
+fn build(options: &Options, stop: &AtomicBool) -> io::Result<PathBuf> {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut command = Command::new(cargo);
     command.args([
@@ -231,6 +321,28 @@ fn build(options: &Options) -> io::Result<PathBuf> {
         .stdout(Stdio::piped())
         .spawn()?;
     let stdout = build.stdout.take().expect("Cargo stdout is piped");
+    let messages = thread::spawn(move || read_build_messages(stdout));
+    let status = loop {
+        if let Some(status) = build.try_wait()? {
+            break status;
+        }
+        if stop.load(Ordering::Relaxed) {
+            let _ = build.kill();
+            let _ = build.wait();
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "build canceled"));
+        }
+        thread::sleep(POLL_INTERVAL);
+    };
+    let executable = messages
+        .join()
+        .map_err(|_| io::Error::other("Cargo output reader stopped"))??;
+    if !status.success() {
+        return Err(io::Error::other(format!("Cargo exited with {status}")));
+    }
+    executable.ok_or_else(|| io::Error::other("Cargo did not report a game executable"))
+}
+
+fn read_build_messages(stdout: impl io::Read) -> io::Result<Option<PathBuf>> {
     let mut executable = None;
     for line in BufReader::new(stdout).lines() {
         let line = line?;
@@ -255,11 +367,7 @@ fn build(options: &Options) -> io::Result<PathBuf> {
             Err(_) => println!("{line}"),
         }
     }
-    let status = build.wait()?;
-    if !status.success() {
-        return Err(io::Error::other(format!("Cargo exited with {status}")));
-    }
-    executable.ok_or_else(|| io::Error::other("Cargo did not report a game executable"))
+    Ok(executable)
 }
 
 struct Staging(PathBuf);
@@ -314,11 +422,22 @@ enum Handoff {
 }
 
 impl RunningGame {
-    fn launch(executable: StagedGame, timeline: &Path) -> io::Result<Self> {
-        let mut child = Command::new(&executable.0)
+    fn launch(
+        executable: StagedGame,
+        timeline: &Path,
+        address: Option<SocketAddr>,
+    ) -> io::Result<Self> {
+        let mut command = Command::new(&executable.0);
+        command
             .arg("--timeline")
             .arg(timeline)
-            .env(MANAGED_ENV, "1")
+            .env(MANAGED_ENV, "1");
+        if let Some(address) = address {
+            command.env(ADDRESS_ENV, address.to_string());
+        } else {
+            command.env_remove(ADDRESS_ENV);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()?;
@@ -344,7 +463,7 @@ impl RunningGame {
         })
     }
 
-    fn handoff(&mut self) -> io::Result<Handoff> {
+    fn handoff(&mut self, stop: &AtomicBool) -> io::Result<Handoff> {
         if let Some(status) = self.child.try_wait()? {
             return Ok(Handoff::Exited(status));
         }
@@ -354,6 +473,12 @@ impl RunningGame {
         let mut slow = false;
         let start = Instant::now();
         loop {
+            if stop.load(Ordering::Relaxed) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "reload canceled",
+                ));
+            }
             if let Some(status) = self.child.try_wait()? {
                 return Ok(if status.code() == Some(RELOAD_EXIT_CODE) {
                     Handoff::Ready
@@ -371,5 +496,19 @@ impl RunningGame {
             }
             thread::sleep(POLL_INTERVAL);
         }
+    }
+
+    fn stop(&mut self) {
+        // Closing the supervisor pipe asks the game to commit its final state and exit.
+        self.child.stdin.take();
+        let until = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < until {
+            if !matches!(self.child.try_wait(), Ok(None)) {
+                return;
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }

@@ -249,3 +249,23 @@ fn format_one_timelines_open_with_nominal_timing_and_can_continue() {
         [0, 250, 450]
     );
 }
+
+#[test]
+fn scrubbing_can_cross_the_live_cursor_and_preserves_history_until_resume() {
+    let directory = TestDirectory::new();
+    let (mut timeline, _) = Timeline::open::<u32>(&directory.0, SCHEMA).unwrap();
+    for frame in 0_u32..=5 {
+        timeline.capture_at(&frame, u64::from(frame) * 200).unwrap();
+    }
+    assert_eq!(timeline.seek::<u32>(0).unwrap(), None);
+    timeline.pause_at(&6_u32, 1_200).unwrap();
+    assert_eq!(timeline.seek::<u32>(790).unwrap(), Some(3));
+    assert_eq!(timeline.tip_position().unwrap().unwrap().id, 6);
+    assert_eq!(timeline.seek::<u32>(200).unwrap(), Some(1));
+    assert_eq!(timeline.forward::<u32>().unwrap(), Some(2));
+    assert_eq!(timeline.seek::<u32>(2_000).unwrap(), Some(6));
+    assert_eq!(timeline.seek::<u32>(450).unwrap(), Some(2));
+    timeline.resume().unwrap();
+    assert_eq!(timeline.tip_position().unwrap().unwrap().id, 2);
+    assert!(!timeline.is_paused());
+}

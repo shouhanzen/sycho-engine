@@ -6,6 +6,9 @@ These presets are optimized for local iteration speed and reduced machine lag.
 
 Run `./go.sh --start --watch` to open Tetree and rebuild it when Rust sources or Cargo manifests change. The running game keeps playing during a build. After a successful build it commits a checkpoint and the replacement process resumes from it.
 
+- Run `./go.sh --editor` for the embedded workspace with live reload. Click the preview to give the game keyboard and mouse input. Press **Tab** to switch focus between the preview and the editor.
+- The editor's timeline dock shows the current position and the live tip. Drag the playhead to inspect saved checkpoints. **Back**, **Play/Pause**, and **Next** browse the recording. **Resume Live** continues the game from the selected checkpoint.
+- The editor stays open through successful rebuilds. Build errors appear in the terminal, and the previous preview stays playable.
 - `./go.sh --start` opens the same timeline without watching files.
 - The default timeline is `target/timelines/headful`. Use `--timeline DIR` to select another one. Use `--fresh` for a separate timeline, optionally with a new directory of your choice.
 - **Option+P** (F5) pauses live play or resumes live from the cursor. **Option+Left** (F6) and **Option+Right** (F7) step backward and forward. **Option+Space** (F8) plays or pauses the recorded sequence, stopping at the end. Use Alt in place of Option on other keyboards. Resuming live from an older checkpoint replaces the history after it.
