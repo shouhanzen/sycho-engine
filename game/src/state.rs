@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use engine::timeline::StateSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::round_timer::RoundTimer;
@@ -9,6 +10,10 @@ use crate::view::GameView;
 
 pub const DEFAULT_ROUND_LIMIT: Duration = Duration::from_secs(20);
 pub const DEFAULT_GRAVITY_INTERVAL: Duration = Duration::from_millis(500);
+pub const TIMELINE_SCHEMA: StateSchema = StateSchema {
+    game: "tetree",
+    version: 1,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameState {
@@ -62,5 +67,10 @@ impl GameState {
 
     pub fn core_mut(&mut self) -> &mut TetrisCore {
         &mut self.tetris
+    }
+
+    pub fn use_timeline_progress(&mut self) {
+        self.skilltree.use_timeline_progress();
+        self.tetris.use_timeline_progress();
     }
 }

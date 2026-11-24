@@ -1,12 +1,13 @@
 use engine::HeadlessRunner;
 use engine::graphics::CpuRenderer;
-use engine::recording::{Mp4Config, Mp4Recorder};
+use engine::recording::{Mp4Config, Mp4Recorder, export_timeline};
 use engine::regression::{VideoCaptureConfig, record_state_and_video_then_replay_and_compare};
 use engine::render::{CELL_SIZE, draw_board};
 use engine::surface::SurfaceSize;
+use engine::timeline::{Timeline, TimelineReader, session_directory};
 
 use game::playtest::{InputAction, TetrisLogic};
-use game::state::GameState;
+use game::state::{GameState, TIMELINE_SCHEMA};
 use game::tetris_core::{BOARD_HEIGHT, BOARD_WIDTH, Piece, Vec2i};
 
 use std::fs;
@@ -18,11 +19,12 @@ static WARNED_FFMPEG_MISSING: Once = Once::new();
 static WARNED_E2E_IMAGE_CAPTURE_FAILED: Once = Once::new();
 
 struct E2eMp4 {
-    rec: Mp4Recorder,
-    width: u32,
-    height: u32,
-    hold_frames: usize,
-    buf: Vec<u8>,
+    timeline: Timeline,
+    directory: PathBuf,
+    output: PathBuf,
+    config: Mp4Config,
+    next_ms: u64,
+    spacing_ms: u64,
 }
 
 impl E2eMp4 {
@@ -50,41 +52,46 @@ impl E2eMp4 {
 
         let out = default_record_dir().join(format!("{}.mp4", sanitize_filename(test_name)));
         let config = Mp4Config { width, height, fps };
-        let rec = Mp4Recorder::start(&out, config).unwrap_or_else(|e| {
-            panic!(
-                "failed to start mp4 recorder via ffmpeg at {}: {e}",
-                out.display()
-            )
-        });
-
-        eprintln!("mp4 recording: {}", rec.output().display());
-
+        let directory = session_directory(out.with_extension("timeline"), None, true)
+            .expect("reserve a test timeline");
+        let (timeline, _) =
+            Timeline::open::<GameState>(&directory, TIMELINE_SCHEMA).expect("open a test timeline");
+        let spacing_ms = (hold_frames as u64).saturating_mul(1_000) / u64::from(fps.max(1));
         Some(Self {
-            rec,
-            width,
-            height,
-            hold_frames,
-            buf: vec![0u8; config.rgba_frame_len()],
+            timeline,
+            directory,
+            output: out,
+            config,
+            next_ms: 0,
+            spacing_ms: spacing_ms.max(1),
         })
     }
 
     fn capture(&mut self, runner: &HeadlessRunner<TetrisLogic>) {
-        render_board_frame(runner, self.width, self.height, self.buf.as_mut_slice());
-        for _ in 0..self.hold_frames {
-            self.rec
-                .push_rgba_frame(&self.buf)
-                .expect("failed writing frame to ffmpeg");
-        }
+        self.timeline
+            .capture_at(runner.state(), self.next_ms)
+            .expect("capture playtest state");
+        self.next_ms = self.next_ms.saturating_add(self.spacing_ms);
     }
 
-    fn finish(mut self) -> PathBuf {
-        let out = self.rec.output().to_path_buf();
-        self.rec
-            .finish()
-            .expect("ffmpeg failed while finalizing the mp4");
-        let meta = fs::metadata(&out).expect("mp4 output missing after ffmpeg finished");
-        assert!(meta.len() > 0, "mp4 output was empty");
-        out
+    fn finish(self) -> PathBuf {
+        let Self {
+            timeline,
+            directory,
+            output,
+            config,
+            ..
+        } = self;
+        drop(timeline);
+        let reader =
+            TimelineReader::open(&directory, TIMELINE_SCHEMA).expect("read playtest timeline");
+        export_timeline(&reader, &output, config, |state: &GameState, gfx| {
+            draw_board(gfx, &state.tetris.board_with_active_piece());
+        })
+        .expect("export playtest video");
+        eprintln!("timeline: {}", directory.display());
+        eprintln!("mp4 recording: {}", output.display());
+        output
     }
 }
 
@@ -343,7 +350,7 @@ fn e2e_state_recording_replay_video_matches_live_video() {
     )
     .expect("record/replay regression should succeed");
 
-    eprintln!("state recording: {}", artifacts.state_json.display());
+    eprintln!("timeline: {}", artifacts.timeline.display());
     eprintln!("live mp4:       {}", artifacts.live_mp4.display());
     eprintln!("replay mp4:     {}", artifacts.replay_mp4.display());
 }

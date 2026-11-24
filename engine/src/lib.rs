@@ -1,32 +1,24 @@
 pub mod agent;
-pub mod audio;
 pub mod app;
-pub mod editor;
+pub mod audio;
 pub mod graphics;
 pub mod pixels_renderer;
 pub mod profiling;
 pub mod recording;
 pub mod regression;
+pub mod reload;
 pub mod render;
 pub mod slider;
 pub mod surface;
+pub mod timeline;
 pub mod ui;
 pub mod ui_tree;
 pub mod view_tree;
 
-use std::{
-    fs,
-    io::{self, BufReader, BufWriter, Write},
-    path::Path,
-};
-
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct TimeMachine<State> {
     states: Vec<State>,
     frame: usize,
-    #[serde(default = "default_record_every_n_frames")]
     record_every_n_frames: usize,
 }
 
@@ -108,59 +100,6 @@ impl<State> TimeMachine<State> {
         self.frame += 1;
         self.frame
     }
-
-    pub fn save_json_file(&self, path: impl AsRef<Path>) -> io::Result<()>
-    where
-        State: Serialize,
-    {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
-        }
-
-        let file = fs::File::create(path)?;
-        let mut writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(&mut writer, self)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        writer.flush()?;
-        Ok(())
-    }
-
-    pub fn load_json_file(path: impl AsRef<Path>) -> io::Result<Self>
-    where
-        State: DeserializeOwned,
-    {
-        let path = path.as_ref();
-        let file = fs::File::open(path)?;
-        let reader = BufReader::new(file);
-        let mut tm: Self =
-            serde_json::from_reader(reader).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-        if tm.states.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "timemachine recording has no states",
-            ));
-        }
-        if tm.frame >= tm.states.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "timemachine recording frame {} out of bounds (len {})",
-                    tm.frame,
-                    tm.states.len()
-                ),
-            ));
-        }
-
-        if tm.record_every_n_frames == 0 {
-            tm.record_every_n_frames = default_record_every_n_frames();
-        }
-
-        Ok(tm)
-    }
 }
 
 fn default_record_every_n_frames() -> usize {
@@ -175,36 +114,28 @@ pub trait GameLogic {
     fn step(&self, state: &Self::State, input: Self::Input) -> Self::State;
 }
 
-pub trait RecordableState {
-    fn recording_frame(&self) -> usize;
-    fn save_recording(&self, path: &Path) -> io::Result<()>;
-}
-
-pub trait ReplayableState: Sized {
-    fn replay_frame(&self) -> usize;
-    fn replay_len(&self) -> usize;
-    fn replay_seek(&mut self, frame: usize);
-    fn replay_forward(&mut self, frames: usize);
-    fn replay_rewind(&mut self, frames: usize);
-    fn replay_load(&self, path: &Path) -> io::Result<Self>;
-}
-
 #[derive(Debug)]
 pub struct HeadlessRunner<G: GameLogic> {
     game: G,
     timemachine: TimeMachine<G::State>,
     state: G::State,
     absolute_frame: usize,
+    records_history: bool,
 }
 
 impl<G: GameLogic> HeadlessRunner<G> {
     pub fn new(game: G) -> Self {
         let initial_state = game.initial_state();
+        Self::from_state(game, initial_state)
+    }
+
+    pub fn from_state(game: G, state: G::State) -> Self {
         Self {
             game,
-            timemachine: TimeMachine::new(initial_state.clone()),
-            state: initial_state,
+            timemachine: TimeMachine::new(state.clone()),
+            state,
             absolute_frame: 0,
+            records_history: true,
         }
     }
 
@@ -218,7 +149,13 @@ impl<G: GameLogic> HeadlessRunner<G> {
             timemachine,
             state,
             absolute_frame,
+            records_history: true,
         }
+    }
+
+    /// Use when the app lifecycle owns recording and the runner only drives simulation.
+    pub fn disable_history(&mut self) {
+        self.records_history = false;
     }
 
     pub fn frame(&self) -> usize {
@@ -255,14 +192,8 @@ impl<G: GameLogic> HeadlessRunner<G> {
 
     pub fn step(&mut self, input: G::Input) -> usize {
         let next_state = self.game.step(&self.state, input);
-        self.state = next_state.clone();
-        self.absolute_frame = self.absolute_frame.saturating_add(1);
-
-        if self.absolute_frame % self.timemachine.record_every_n_frames() == 0 {
-            self.timemachine.record(next_state)
-        } else {
-            self.timemachine.frame()
-        }
+        self.advance(next_state);
+        self.timemachine.frame()
     }
 
     pub fn step_profiled<P: profiling::Profiler>(
@@ -279,18 +210,12 @@ impl<G: GameLogic> HeadlessRunner<G> {
         let step_dt = step_start.elapsed();
 
         let record_start = Instant::now();
-        self.state = next_state.clone();
-        self.absolute_frame = self.absolute_frame.saturating_add(1);
-        let frame = if self.absolute_frame % self.timemachine.record_every_n_frames() == 0 {
-            self.timemachine.record(next_state)
-        } else {
-            self.timemachine.frame()
-        };
-        let record_dt = if self.absolute_frame % self.timemachine.record_every_n_frames() == 0 {
+        let record_dt = if self.advance(next_state) {
             record_start.elapsed()
         } else {
             std::time::Duration::ZERO
         };
+        let frame = self.timemachine.frame();
 
         let total_dt = total_start.elapsed();
         profiler.on_step(
@@ -303,6 +228,17 @@ impl<G: GameLogic> HeadlessRunner<G> {
         );
 
         frame
+    }
+
+    fn advance(&mut self, next_state: G::State) -> bool {
+        self.state = next_state;
+        self.absolute_frame = self.absolute_frame.saturating_add(1);
+        let should_record = self.records_history
+            && self.absolute_frame % self.timemachine.record_every_n_frames() == 0;
+        if should_record {
+            self.timemachine.record(self.state.clone());
+        }
+        should_record
     }
 
     pub fn run<I>(&mut self, inputs: I) -> usize
@@ -335,51 +271,6 @@ impl<G: GameLogic> HeadlessRunner<G> {
         self.state = self.timemachine.state().clone();
         self.absolute_frame = frame.saturating_mul(self.timemachine.record_every_n_frames());
         frame
-    }
-}
-
-impl<G> RecordableState for HeadlessRunner<G>
-where
-    G: GameLogic,
-    G::State: Serialize,
-{
-    fn recording_frame(&self) -> usize {
-        self.frame()
-    }
-
-    fn save_recording(&self, path: &Path) -> io::Result<()> {
-        self.timemachine.save_json_file(path)
-    }
-}
-
-impl<G> ReplayableState for HeadlessRunner<G>
-where
-    G: GameLogic + Clone,
-    G::State: Serialize + DeserializeOwned,
-{
-    fn replay_frame(&self) -> usize {
-        self.frame()
-    }
-
-    fn replay_len(&self) -> usize {
-        self.history().len()
-    }
-
-    fn replay_seek(&mut self, frame: usize) {
-        let _ = self.seek(frame);
-    }
-
-    fn replay_forward(&mut self, frames: usize) {
-        let _ = self.forward(frames);
-    }
-
-    fn replay_rewind(&mut self, frames: usize) {
-        let _ = self.rewind(frames);
-    }
-
-    fn replay_load(&self, path: &Path) -> io::Result<Self> {
-        let tm = TimeMachine::<G::State>::load_json_file(path)?;
-        Ok(HeadlessRunner::from_timemachine(self.game.clone(), tm))
     }
 }
 

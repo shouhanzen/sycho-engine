@@ -4,6 +4,15 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use serde::de::DeserializeOwned;
+
+use crate::{
+    graphics::{CpuRenderer, Renderer2d},
+    surface::SurfaceSize,
+    timeline::TimelineReader,
 };
 
 fn ffmpeg_bin() -> OsString {
@@ -138,4 +147,66 @@ impl Drop for Mp4Recorder {
     fn drop(&mut self) {
         let _ = self.finish();
     }
+}
+
+/// Renders committed snapshots at their recorded times on a fixed-rate video grid.
+pub fn export_timeline<S: DeserializeOwned>(
+    timeline: &TimelineReader,
+    output: &Path,
+    config: Mp4Config,
+    mut render: impl FnMut(&S, &mut dyn Renderer2d),
+) -> io::Result<()> {
+    if config.fps == 0
+        || config.width == 0
+        || config.height == 0
+        || config.width % 2 != 0
+        || config.height % 2 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "video requires positive FPS and positive, even dimensions",
+        ));
+    }
+    let mut snapshots = timeline.snapshots::<S>();
+    let mut current = snapshots
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "timeline has no frames"))??;
+    let start_ms = current.frame.at_ms;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?;
+    let temporary = output.with_file_name(format!(
+        ".sycho-export-{}-{}.mp4",
+        std::process::id(),
+        suffix.as_nanos()
+    ));
+    let result = (|| {
+        let mut recorder = Mp4Recorder::start(&temporary, config)?;
+        let mut buffer = vec![0; config.rgba_frame_len()];
+        let size = SurfaceSize::new(config.width, config.height);
+        let mut written = 0;
+        for next in snapshots {
+            let next = next?;
+            let elapsed_ms = u128::from(next.frame.at_ms.saturating_sub(start_ms));
+            let boundary = (elapsed_ms * u128::from(config.fps)).div_ceil(1_000);
+            if written < boundary {
+                buffer.fill(0);
+                render(&current.state, &mut CpuRenderer::new(&mut buffer, size));
+                while written < boundary {
+                    recorder.push_rgba_frame(&buffer)?;
+                    written += 1;
+                }
+            }
+            current = next;
+        }
+        buffer.fill(0);
+        render(&current.state, &mut CpuRenderer::new(&mut buffer, size));
+        recorder.push_rgba_frame(&buffer)?;
+        recorder.finish()?;
+        fs::rename(&temporary, output)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }

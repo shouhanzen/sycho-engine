@@ -312,6 +312,8 @@ pub struct TetrisCore {
     glass_shatter_count: u32,
     #[serde(skip, default = "default_depth_wall_progress_path")]
     depth_wall_progress_path: PathBuf,
+    #[serde(skip)]
+    timeline_managed_progress: bool,
 }
 
 fn default_bottomwell_rows() -> usize {
@@ -408,6 +410,7 @@ impl TetrisCore {
             broken_walls: HashSet::new(),
             glass_shatter_count: 0,
             depth_wall_progress_path: default_depth_wall_progress_path(),
+            timeline_managed_progress: false,
         }
     }
 
@@ -521,6 +524,15 @@ impl TetrisCore {
 
     pub fn set_depth_wall_progress_path(&mut self, path: PathBuf) {
         self.depth_wall_progress_path = path;
+    }
+
+    pub(crate) fn use_timeline_progress(&mut self) {
+        self.timeline_managed_progress = true;
+    }
+
+    pub fn inherit_timeline_progress(&mut self, previous: &Self) {
+        self.use_timeline_progress();
+        self.broken_walls.clone_from(&previous.broken_walls);
     }
 
     pub fn set_available_pieces(&mut self, pieces: Vec<Piece>) {
@@ -1620,7 +1632,9 @@ impl TetrisCore {
         self.active_wall_hp_remaining = 0;
         self.depth_progress_paused = false;
         self.broken_walls.insert(wall_id);
-        let _ = self.save_depth_wall_progress();
+        if !self.timeline_managed_progress {
+            let _ = self.save_depth_wall_progress();
+        }
     }
 
     /// Ensure the bottomwell floor is maintained — bottom `bottomwell_rows`
@@ -1668,6 +1682,9 @@ impl TetrisCore {
     }
 
     fn reload_depth_wall_progress(&mut self) {
+        if self.timeline_managed_progress {
+            return;
+        }
         let progress = load_depth_wall_progress(&self.depth_wall_progress_path).unwrap_or_default();
         self.broken_walls = progress.broken_walls;
     }

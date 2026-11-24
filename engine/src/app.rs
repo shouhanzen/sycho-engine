@@ -5,7 +5,10 @@ use std::fs;
 use std::hash::Hash;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::time::{Duration, Instant};
+
+use serde::{Serialize, de::DeserializeOwned};
 
 use pixels::{Pixels, PixelsBuilder, SurfaceTexture};
 use winit::dpi::PhysicalSize;
@@ -17,10 +20,11 @@ use winit::window::{Window, WindowBuilder};
 
 use crate::graphics::Renderer2d;
 use crate::pixels_renderer::PixelsRenderer2d;
+use crate::reload::{self, ProcessCommand, RELOAD_EXIT_CODE};
 use crate::surface::SurfaceSize;
+use crate::timeline::{Frame, StateSchema, Timeline, TimelineCommand, TimelineWorker};
 use crate::ui_tree::UiInput;
 use crate::view_tree::{ViewTree, hit_test_actions};
-use crate::{RecordableState, ReplayableState};
 
 pub struct AppConfig {
     pub title: String,
@@ -31,14 +35,10 @@ pub struct AppConfig {
 }
 
 #[derive(Debug, Clone)]
-pub struct RecordingConfig {
-    pub path: PathBuf,
-}
-
-#[derive(Debug, Clone)]
-pub struct ReplayConfig {
-    pub path: PathBuf,
-    pub fps: u32,
+pub struct TimelineConfig {
+    pub directory: PathBuf,
+    pub checkpoint_interval: Duration,
+    pub playback: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -47,77 +47,61 @@ pub struct ProfileConfig {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct CaptureCli {
+pub struct TimelineCli {
     pub help: bool,
-    pub record_path: Option<PathBuf>,
-    pub replay_path: Option<PathBuf>,
+    pub timeline_path: Option<PathBuf>,
+    pub fresh: bool,
+    pub playback: bool,
+    pub export_video: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunMode {
     Normal,
-    Recording,
-    Replay,
+    Timeline,
     Profile,
 }
 
-pub fn default_recording_path(app_tag: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("target")
-        .join("recordings")
-        .join(format!("{app_tag}_{nanos}.json"))
-}
-
-pub fn parse_capture_cli_with_default_path(
-    default_recording_path: impl Fn() -> PathBuf,
-) -> io::Result<CaptureCli> {
-    let mut cli = CaptureCli::default();
-    let mut args = env::args().skip(1).peekable();
+pub fn parse_timeline_cli() -> io::Result<TimelineCli> {
+    let mut cli = TimelineCli::default();
+    let mut args = env::args_os().skip(1);
     while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-h" | "--help" => {
-                cli.help = true;
-            }
-            "--record" => {
-                cli.record_path = Some(
-                    args.peek()
-                        .filter(|next| !next.starts_with('-'))
-                        .map_or_else(&default_recording_path, |p| PathBuf::from(p.clone())),
-                );
-                if args.peek().is_some_and(|next| !next.starts_with('-')) {
-                    let _ = args.next();
+        let arg = arg.to_string_lossy();
+        match arg.as_ref() {
+            "-h" | "--help" => cli.help = true,
+            "--fresh" => cli.fresh = true,
+            "--playback" => cli.playback = true,
+            "--timeline" | "--export-video" => {
+                let path = args
+                    .next()
+                    .filter(|path| !path.to_string_lossy().starts_with('-'))
+                    .map(PathBuf::from)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("{arg} requires a path"),
+                        )
+                    })?;
+                if arg == "--timeline" {
+                    cli.timeline_path = Some(path);
+                } else {
+                    cli.export_video = Some(path);
                 }
             }
-            "--replay" => {
-                let Some(path) = args.next() else {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "--replay requires a path",
-                    ));
-                };
-                cli.replay_path = Some(PathBuf::from(path));
-            }
-            other => {
+            _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("unknown argument: {other} (try --help)"),
+                    format!("unknown argument: {arg} (try --help)"),
                 ));
             }
         }
     }
-
-    if cli.record_path.is_some() && cli.replay_path.is_some() {
+    if (cli.fresh && cli.playback) || (cli.export_video.is_some() && (cli.fresh || cli.playback)) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "cannot combine --record and --replay",
+            "--fresh, --playback, and --export-video are mutually exclusive",
         ));
     }
-
     Ok(cli)
 }
 
@@ -308,7 +292,12 @@ pub trait GameApp {
         _ctx: &mut AppContext,
     ) -> Vec<Self::Effect>;
 
-    fn render(&mut self, view: &ViewTree<Self::Action>, renderer: &mut dyn Renderer2d);
+    fn render(
+        &mut self,
+        state: &Self::State,
+        view: &ViewTree<Self::Action>,
+        renderer: &mut dyn Renderer2d,
+    );
 
     fn handle_effects(&mut self, _effects: Vec<Self::Effect>, _ctx: &mut AppContext) {}
 
@@ -420,335 +409,431 @@ pub fn run_app<H: AppHandler + 'static>(
     Ok(())
 }
 
-pub fn run_game<G: GameApp + 'static>(
-    config: AppConfig,
-    mut game: G,
-) -> Result<(), Box<dyn Error>> {
-    let event_loop = EventLoop::new();
-    let mut ctx = create_app_context(&config, &event_loop)?;
-    let mut state = game.init_state(&mut ctx);
-    game.on_run_mode(RunMode::Normal, &mut state, &mut ctx);
-    let mut input = InputFrame::default();
-    let mut last_frame = Instant::now();
+/// Hooks for a game whose simulation can continue from a recorded snapshot.
+pub trait TimelineGame: GameApp {
+    type Snapshot: Clone + Send + Serialize + DeserializeOwned + 'static;
+    const SCHEMA: StateSchema;
 
-    event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Poll;
+    fn snapshot(state: &Self::State) -> &Self::Snapshot;
+    fn restore_state(&mut self, snapshot: Self::Snapshot) -> Self::State;
 
-        if let Event::WindowEvent { event, .. } = &event {
-            apply_window_event_to_input(&mut input, event);
-        }
-
-        if game.handle_event(&event, &mut state, &mut input, &mut ctx, control_flow) {
-            return;
-        }
-
-        match &event {
-            Event::WindowEvent { event, .. } => match event {
-                WindowEvent::CloseRequested => {
-                    *control_flow = ControlFlow::Exit;
-                    return;
-                }
-                WindowEvent::Resized(size) => {
-                    ctx.surface_size = SurfaceSize::new(size.width, size.height);
-                    if let Err(err) = ctx.renderer.resize(ctx.surface_size) {
-                        eprintln!("resize failed: {err}");
-                    }
-                    ctx.window.request_redraw();
-                }
-                _ => {}
-            },
-            Event::RedrawRequested(_) => {
-                let now = Instant::now();
-                let dt = now.saturating_duration_since(last_frame);
-                last_frame = now;
-
-                let frame_input = input.clone();
-                let view_for_input = game.build_view(&state, &ctx);
-                let actions = hit_test_actions(
-                    &view_for_input,
-                    UiInput {
-                        mouse_pos: frame_input.mouse_pos,
-                        mouse_down: frame_input.mouse_down,
-                        mouse_up: frame_input.mouse_up,
-                    },
-                );
-                let effects = game.update_state(&mut state, frame_input, dt, &actions, &mut ctx);
-
-                let view_for_render = game.build_view(&state, &ctx);
-                let draw_res = ctx.renderer.draw_frame(|gfx| {
-                    game.render(&view_for_render, gfx);
-                });
-                if let Err(err) = draw_res {
-                    eprintln!("draw failed: {err}");
-                }
-                if let Err(err) = ctx.renderer.present() {
-                    eprintln!("present failed: {err}");
-                }
-
-                game.handle_effects(effects, &mut ctx);
-                input.clear_frame_transients();
-            }
-            Event::MainEventsCleared => {
-                ctx.window.request_redraw();
-            }
-            _ => {}
-        }
-    });
-
-    #[allow(unreachable_code)]
-    Ok(())
+    fn timeline_command(&self, _input: &InputFrame) -> Option<TimelineCommand> {
+        None
+    }
 }
 
-pub fn run_game_with_recording<G>(
+pub fn run_game<G: GameApp + 'static>(config: AppConfig, game: G) -> Result<(), Box<dyn Error>> {
+    run_live(config, game, NormalSession)
+}
+
+pub fn run_game_with_timeline<G>(
     config: AppConfig,
-    mut game: G,
-    recording: RecordingConfig,
+    game: G,
+    options: TimelineConfig,
 ) -> Result<(), Box<dyn Error>>
 where
-    G: GameApp + 'static,
-    G::State: RecordableState,
+    G: TimelineGame + 'static,
 {
-    let event_loop = EventLoop::new();
-    let mut ctx = create_app_context(&config, &event_loop)?;
-    let mut state = game.init_state(&mut ctx);
-    game.on_run_mode(RunMode::Recording, &mut state, &mut ctx);
-    let mut input = InputFrame::default();
-    let mut last_frame = Instant::now();
-    let mut recording_saved = false;
+    let (mut timeline, mut snapshot) = Timeline::open(&options.directory, G::SCHEMA)?;
+    if options.playback {
+        snapshot = Some(timeline.pause_at_start()?);
+    }
+    println!("timeline: {}", options.directory.display());
+    if let Some(cursor) = timeline.cursor() {
+        println!("restored checkpoint {cursor}");
+    }
+    let session = TimelineSession {
+        paused: timeline.is_paused(),
+        cursor: timeline.position(),
+        clock_position: timeline.position().map_or(0, |frame| frame.at_ms),
+        clock_start: Instant::now(),
+        playback: None,
+        writer: TimelineWorker::start(timeline)?,
+        snapshot,
+        pending: None,
+        interval: options.checkpoint_interval,
+        last_checkpoint: Instant::now(),
+        overseer: reload::listen_for_overseer(),
+    };
+    run_live(config, game, session)
+}
 
-    event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Poll;
+trait LiveSession<G: GameApp> {
+    const MODE: RunMode;
 
-        if let Event::WindowEvent { event, .. } = &event {
-            apply_window_event_to_input(&mut input, event);
+    fn start(&mut self, game: &mut G, ctx: &mut AppContext, _title: &str) -> io::Result<G::State> {
+        Ok(game.init_state(ctx))
+    }
+
+    fn should_update(
+        &mut self,
+        _game: &mut G,
+        _state: &mut G::State,
+        _input: &InputFrame,
+        _ctx: &mut AppContext,
+        _title: &str,
+    ) -> bool {
+        true
+    }
+
+    fn after_update(&mut self, _state: &G::State, _now: Instant) {}
+
+    fn process_command(&mut self) -> Option<ProcessCommand> {
+        None
+    }
+
+    fn save(&mut self, _state: &G::State) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct NormalSession;
+
+impl<G: GameApp> LiveSession<G> for NormalSession {
+    const MODE: RunMode = RunMode::Normal;
+}
+
+struct Playback {
+    from_ms: u64,
+    started: Instant,
+    next_ms: u64,
+}
+
+enum TimelineAction {
+    Control(TimelineCommand),
+    PlayUntil(u64),
+}
+
+struct TimelineSession<S> {
+    writer: TimelineWorker,
+    pending: Option<Receiver<io::Result<()>>>,
+    paused: bool,
+    cursor: Option<Frame>,
+    clock_position: u64,
+    clock_start: Instant,
+    playback: Option<Playback>,
+    snapshot: Option<S>,
+    interval: Duration,
+    last_checkpoint: Instant,
+    overseer: Option<Receiver<ProcessCommand>>,
+}
+
+impl<S> TimelineSession<S> {
+    fn live_time_ms(&self) -> u64 {
+        self.clock_position
+            .saturating_add(elapsed_ms(self.clock_start))
+    }
+
+    fn update_title(&self, ctx: &AppContext, title: &str) {
+        if self.paused {
+            let cursor = self.cursor.expect("paused timeline has a checkpoint");
+            let status = if self.playback.is_some() {
+                "playing"
+            } else {
+                "paused"
+            };
+            ctx.window.set_title(&format!(
+                "{title} — timeline {status} at {:.1}s (checkpoint {})",
+                cursor.at_ms as f64 / 1000.0,
+                cursor.id,
+            ));
+        } else {
+            ctx.window.set_title(title);
         }
+    }
+}
 
-        if game.handle_event(&event, &mut state, &mut input, &mut ctx, control_flow) {
-            return;
-        }
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
 
-        match &event {
-            Event::WindowEvent { event, .. } => match event {
-                WindowEvent::CloseRequested => {
-                    if !recording_saved {
-                        if let Err(err) = state.save_recording(&recording.path) {
-                            eprintln!(
-                                "failed saving state recording to {}: {err}",
-                                recording.path.display()
-                            );
+impl<G: TimelineGame> LiveSession<G> for TimelineSession<G::Snapshot> {
+    const MODE: RunMode = RunMode::Timeline;
+
+    fn start(&mut self, game: &mut G, ctx: &mut AppContext, title: &str) -> io::Result<G::State> {
+        let state = if let Some(snapshot) = self.snapshot.take() {
+            game.restore_state(snapshot)
+        } else {
+            let state = game.init_state(ctx);
+            let initial = G::snapshot(&state).clone();
+            self.writer
+                .request(move |timeline| timeline.checkpoint_at(&initial, 0))?;
+            state
+        };
+        self.last_checkpoint = Instant::now();
+        self.clock_start = self.last_checkpoint;
+        self.update_title(ctx, title);
+        Ok(state)
+    }
+
+    fn should_update(
+        &mut self,
+        game: &mut G,
+        state: &mut G::State,
+        input: &InputFrame,
+        ctx: &mut AppContext,
+        title: &str,
+    ) -> bool {
+        let action = if let Some(command) = game.timeline_command(input) {
+            let was_playing = self.playback.take().is_some();
+            if command == TimelineCommand::TogglePlayback && was_playing {
+                self.update_title(ctx, title);
+                return false;
+            }
+            TimelineAction::Control(command)
+        } else if let Some(playback) = &self.playback {
+            let target = playback
+                .from_ms
+                .saturating_add(elapsed_ms(playback.started));
+            if target < playback.next_ms {
+                return false;
+            }
+            TimelineAction::PlayUntil(target)
+        } else {
+            return !self.paused;
+        };
+
+        let was_paused = self.paused;
+        let live_state = (!was_paused).then(|| G::snapshot(state).clone());
+        let at_ms = self.live_time_ms();
+        let result = self.writer.request(move |timeline| {
+            let changed = match action {
+                TimelineAction::Control(command) => {
+                    let prepared = if let Some(snapshot) = live_state {
+                        timeline.pause_at(&snapshot, at_ms)
+                    } else if command == TimelineCommand::TogglePause {
+                        timeline.resume()
+                    } else {
+                        Ok(())
+                    };
+                    prepared.and_then(|()| match command {
+                        TimelineCommand::Rewind => timeline.rewind(),
+                        TimelineCommand::Forward => timeline.forward(),
+                        _ => Ok(None),
+                    })
+                }
+                TimelineAction::PlayUntil(target) => timeline.play_until(target),
+            };
+            let next = if matches!(
+                action,
+                TimelineAction::PlayUntil(_)
+                    | TimelineAction::Control(TimelineCommand::TogglePlayback)
+            ) && changed.is_ok()
+            {
+                timeline.next_frame()
+            } else {
+                Ok(None)
+            };
+            Ok((timeline.is_paused(), timeline.position(), changed, next))
+        });
+        match result {
+            Ok((paused, cursor, changed, next)) => {
+                self.paused = paused;
+                self.cursor = cursor;
+                if was_paused && !paused {
+                    self.clock_position = cursor.map_or(0, |frame| frame.at_ms);
+                    self.clock_start = Instant::now();
+                }
+                match changed {
+                    Ok(Some(snapshot)) => *state = game.restore_state(snapshot),
+                    Ok(None) => {}
+                    Err(err) => eprintln!("timeline control failed: {err}"),
+                }
+                match next {
+                    Ok(Some(next)) => match &mut self.playback {
+                        Some(playback) => playback.next_ms = next.at_ms,
+                        None => {
+                            let from_ms = cursor.expect("playing requires a checkpoint").at_ms;
+                            self.playback = Some(Playback {
+                                from_ms,
+                                started: Instant::now(),
+                                next_ms: next.at_ms,
+                            });
                         }
-                        recording_saved = true;
+                    },
+                    Ok(None) => self.playback = None,
+                    Err(err) => {
+                        self.playback = None;
+                        eprintln!("timeline playback failed: {err}");
+                    }
+                }
+            }
+            Err(err) => {
+                self.playback = None;
+                eprintln!("timeline control failed: {err}");
+            }
+        }
+        self.last_checkpoint = Instant::now();
+        self.update_title(ctx, title);
+        false
+    }
+
+    fn after_update(&mut self, state: &G::State, now: Instant) {
+        if let Some(pending) = &self.pending {
+            match pending.try_recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => eprintln!("could not record timeline checkpoint: {err}"),
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => eprintln!("timeline writer stopped"),
+            }
+            self.pending = None;
+        }
+        if now.saturating_duration_since(self.last_checkpoint) >= self.interval {
+            self.last_checkpoint = now;
+            let snapshot = G::snapshot(state).clone();
+            let at_ms = self.live_time_ms();
+            match self
+                .writer
+                .submit(move |timeline| timeline.capture_at(&snapshot, at_ms))
+            {
+                Ok(pending) => self.pending = Some(pending),
+                Err(err) => eprintln!("could not queue timeline checkpoint: {err}"),
+            }
+        }
+    }
+
+    fn process_command(&mut self) -> Option<ProcessCommand> {
+        self.overseer.as_ref()?.try_recv().ok()
+    }
+
+    fn save(&mut self, state: &G::State) -> io::Result<()> {
+        let snapshot = G::snapshot(state).clone();
+        let at_ms = self.live_time_ms();
+        self.writer
+            .request(move |timeline| timeline.checkpoint_at(&snapshot, at_ms))
+    }
+}
+
+fn run_live<G, S>(config: AppConfig, mut game: G, mut session: S) -> Result<(), Box<dyn Error>>
+where
+    G: GameApp + 'static,
+    S: LiveSession<G> + 'static,
+{
+    let event_loop = EventLoop::new();
+    let mut ctx = create_app_context(&config, &event_loop)?;
+    let mut state = session.start(&mut game, &mut ctx, &config.title)?;
+    game.on_run_mode(S::MODE, &mut state, &mut ctx);
+    let mut input = InputFrame::default();
+    let mut last_frame = Instant::now();
+    let mut exiting = false;
+
+    event_loop.run(move |event, _, control_flow| {
+        if exiting {
+            if matches!(event, Event::LoopDestroyed) {
+                game.handle_event(&event, &mut state, &mut input, &mut ctx, control_flow);
+            }
+            return;
+        }
+        *control_flow = ControlFlow::Poll;
+        if let Event::WindowEvent { event, .. } = &event {
+            apply_window_event_to_input(&mut input, event);
+        }
+
+        if let Some(command) = session.process_command() {
+            match (command, session.save(&state)) {
+                (ProcessCommand::Reload, Ok(())) => {
+                    *control_flow = ControlFlow::ExitWithCode(RELOAD_EXIT_CODE);
+                    exiting = true;
+                }
+                (ProcessCommand::Reload, Err(err)) => reload::reject_reload(&err),
+                (ProcessCommand::Stop, result) => {
+                    if let Err(err) = result {
+                        eprintln!("could not save final state: {err}");
                     }
                     *control_flow = ControlFlow::Exit;
-                    return;
+                    exiting = true;
                 }
-                WindowEvent::Resized(size) => {
-                    ctx.surface_size = SurfaceSize::new(size.width, size.height);
-                    if let Err(err) = ctx.renderer.resize(ctx.surface_size) {
-                        eprintln!("resize failed: {err}");
+            }
+            return;
+        }
+
+        let handled = game.handle_event(&event, &mut state, &mut input, &mut ctx, control_flow);
+        if matches!(control_flow, ControlFlow::ExitWithCode(_))
+            || matches!(event, Event::LoopDestroyed)
+            || (!handled
+                && matches!(
+                    event,
+                    Event::WindowEvent {
+                        event: WindowEvent::CloseRequested,
+                        ..
                     }
-                    ctx.window.request_redraw();
+                ))
+        {
+            if let Err(err) = session.save(&state) {
+                eprintln!("could not save final state: {err}");
+            }
+            exiting = true;
+            if !matches!(control_flow, ControlFlow::ExitWithCode(_)) {
+                *control_flow = ControlFlow::Exit;
+            }
+            return;
+        }
+        if handled {
+            return;
+        }
+
+        match &event {
+            Event::WindowEvent {
+                event: WindowEvent::Resized(size),
+                ..
+            } => {
+                ctx.surface_size = SurfaceSize::new(size.width, size.height);
+                if let Err(err) = ctx.renderer.resize(ctx.surface_size) {
+                    eprintln!("resize failed: {err}");
                 }
-                _ => {}
-            },
+                ctx.window.request_redraw();
+            }
             Event::RedrawRequested(_) => {
                 let now = Instant::now();
                 let dt = now.saturating_duration_since(last_frame);
                 last_frame = now;
-
-                let frame_input = input.clone();
-                let view_for_input = game.build_view(&state, &ctx);
-                let actions = hit_test_actions(
-                    &view_for_input,
-                    UiInput {
-                        mouse_pos: frame_input.mouse_pos,
-                        mouse_down: frame_input.mouse_down,
-                        mouse_up: frame_input.mouse_up,
-                    },
-                );
-                let effects = game.update_state(&mut state, frame_input, dt, &actions, &mut ctx);
-
-                if !recording_saved && state.recording_frame() > 0 {
-                    if let Err(err) = state.save_recording(&recording.path) {
-                        eprintln!(
-                            "failed saving state recording to {}: {err}",
-                            recording.path.display()
-                        );
-                    } else {
-                        println!("state recording saved: {}", recording.path.display());
-                    }
-                    recording_saved = true;
+                let effects = if session.should_update(
+                    &mut game,
+                    &mut state,
+                    &input,
+                    &mut ctx,
+                    &config.title,
+                ) {
+                    let view = game.build_view(&state, &ctx);
+                    let actions = hit_test_actions(
+                        &view,
+                        UiInput {
+                            mouse_pos: input.mouse_pos,
+                            mouse_down: input.mouse_down,
+                            mouse_up: input.mouse_up,
+                        },
+                    );
+                    let effects =
+                        game.update_state(&mut state, input.clone(), dt, &actions, &mut ctx);
+                    session.after_update(&state, now);
+                    Some(effects)
+                } else {
+                    last_frame = Instant::now();
+                    None
+                };
+                draw_game(&mut game, &state, &mut ctx);
+                if let Some(effects) = effects {
+                    game.handle_effects(effects, &mut ctx);
                 }
-
-                let view_for_render = game.build_view(&state, &ctx);
-                let draw_res = ctx.renderer.draw_frame(|gfx| {
-                    game.render(&view_for_render, gfx);
-                });
-                if let Err(err) = draw_res {
-                    eprintln!("draw failed: {err}");
-                }
-                if let Err(err) = ctx.renderer.present() {
-                    eprintln!("present failed: {err}");
-                }
-
-                game.handle_effects(effects, &mut ctx);
                 input.clear_frame_transients();
             }
-            Event::MainEventsCleared => {
-                ctx.window.request_redraw();
-            }
-            Event::LoopDestroyed => {
-                if !recording_saved {
-                    if let Err(err) = state.save_recording(&recording.path) {
-                        eprintln!(
-                            "failed saving state recording to {}: {err}",
-                            recording.path.display()
-                        );
-                    } else {
-                        println!("state recording saved: {}", recording.path.display());
-                    }
-                    recording_saved = true;
-                }
-            }
+            Event::MainEventsCleared => ctx.window.request_redraw(),
             _ => {}
         }
     });
-
-    #[allow(unreachable_code)]
-    Ok(())
 }
 
-pub fn run_game_with_replay<G>(
-    config: AppConfig,
-    mut game: G,
-    replay: ReplayConfig,
-) -> Result<(), Box<dyn Error>>
-where
-    G: GameApp + 'static,
-    G::State: ReplayableState,
-{
-    let event_loop = EventLoop::new();
-    let mut ctx = create_app_context(&config, &event_loop)?;
-    let initial_state = game.init_state(&mut ctx);
-    let mut state = initial_state
-        .replay_load(&replay.path)
-        .map_err(|err| -> Box<dyn Error> { err.into() })?;
-    game.on_run_mode(RunMode::Replay, &mut state, &mut ctx);
-    let mut replay_playing = true;
-    let mut replay_fps = replay.fps.max(1);
-    let mut replay_next_step = Instant::now();
-
-    event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Poll;
-
-        if let Event::WindowEvent {
-            event:
-                WindowEvent::KeyboardInput {
-                    input:
-                        KeyboardInput {
-                            state: ElementState::Pressed,
-                            virtual_keycode: Some(key),
-                            ..
-                        },
-                    ..
-                },
-            ..
-        } = &event
-        {
-            let now = Instant::now();
-            match *key {
-                VirtualKeyCode::Escape => {
-                    *control_flow = ControlFlow::Exit;
-                    return;
-                }
-                VirtualKeyCode::Space => {
-                    replay_playing = !replay_playing;
-                    replay_next_step = now;
-                    return;
-                }
-                VirtualKeyCode::Left => {
-                    state.replay_rewind(1);
-                    replay_playing = false;
-                    return;
-                }
-                VirtualKeyCode::Right => {
-                    state.replay_forward(1);
-                    replay_playing = false;
-                    return;
-                }
-                VirtualKeyCode::Home => {
-                    state.replay_seek(0);
-                    replay_playing = false;
-                    return;
-                }
-                VirtualKeyCode::End => {
-                    let last = state.replay_len().saturating_sub(1);
-                    state.replay_seek(last);
-                    replay_playing = false;
-                    return;
-                }
-                VirtualKeyCode::Up => {
-                    replay_fps = replay_fps.saturating_mul(2).min(240).max(1);
-                    replay_next_step = now;
-                    return;
-                }
-                VirtualKeyCode::Down => {
-                    replay_fps = (replay_fps / 2).max(1);
-                    replay_next_step = now;
-                    return;
-                }
-                _ => {}
-            }
-        }
-
-        match &event {
-            Event::WindowEvent { event, .. } => match event {
-                WindowEvent::CloseRequested => {
-                    *control_flow = ControlFlow::Exit;
-                    return;
-                }
-                WindowEvent::Resized(size) => {
-                    ctx.surface_size = SurfaceSize::new(size.width, size.height);
-                    if let Err(err) = ctx.renderer.resize(ctx.surface_size) {
-                        eprintln!("resize failed: {err}");
-                    }
-                    ctx.window.request_redraw();
-                }
-                _ => {}
-            },
-            Event::RedrawRequested(_) => {
-                let now = Instant::now();
-                if replay_playing && now >= replay_next_step {
-                    let max_frame = state.replay_len().saturating_sub(1);
-                    if state.replay_frame() < max_frame {
-                        state.replay_forward(1);
-                    } else {
-                        replay_playing = false;
-                    }
-                    let interval = Duration::from_secs_f64(1.0 / (replay_fps.max(1) as f64));
-                    replay_next_step = now + interval;
-                }
-
-                let view_for_render = game.build_view(&state, &ctx);
-                let draw_res = ctx.renderer.draw_frame(|gfx| {
-                    game.render(&view_for_render, gfx);
-                });
-                if let Err(err) = draw_res {
-                    eprintln!("draw failed: {err}");
-                }
-                if let Err(err) = ctx.renderer.present() {
-                    eprintln!("present failed: {err}");
-                }
-            }
-            Event::MainEventsCleared => {
-                ctx.window.request_redraw();
-            }
-            _ => {}
-        }
-    });
-
-    #[allow(unreachable_code)]
-    Ok(())
+fn draw_game<G: GameApp>(game: &mut G, state: &G::State, ctx: &mut AppContext) {
+    let view = game.build_view(state, ctx);
+    if let Err(err) = ctx
+        .renderer
+        .draw_frame(|gfx| game.render(state, &view, gfx))
+    {
+        eprintln!("draw failed: {err}");
+    }
+    if let Err(err) = ctx.renderer.present() {
+        eprintln!("present failed: {err}");
+    }
 }
 
 pub fn run_game_with_profile<G>(
@@ -817,7 +902,7 @@ where
                 let draw_start = Instant::now();
                 let view_for_render = game.build_view(&state, &ctx);
                 let draw_res = ctx.renderer.draw_frame(|gfx| {
-                    game.render(&view_for_render, gfx);
+                    game.render(&state, &view_for_render, gfx);
                 });
                 let draw_dt = draw_start.elapsed();
                 trace.record("render.draw", draw_start, draw_dt);

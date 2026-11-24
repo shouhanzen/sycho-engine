@@ -107,6 +107,6 @@ fn golden_gridgame_render_hashes_are_stable() {
     });
 
     // Clean up on success; keep the temp dir if the test fails.
-    let _ = fs::remove_file(artifacts.state_json);
+    let _ = fs::remove_dir_all(artifacts.timeline);
     let _ = fs::remove_dir_all(out_dir);
 }

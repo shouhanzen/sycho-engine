@@ -3,21 +3,6 @@
 **/target/
 **/*.rs.bk
 
-# === Node / frontend tooling ===
-**/node_modules/
-**/dist/*
-!**/dist/.gitkeep
-**/.vite/
-**/.turbo/
-**/.cache/
-**/coverage/
-**/*.tsbuildinfo
-
-# Tauri
-**/src-tauri/target/
-**/src-tauri/gen/
-**/src-tauri/icons/icon.ico
-
 # === Logs / runtime artifacts (go.sh control surface) ===
 .go*.log
 .go*.pid

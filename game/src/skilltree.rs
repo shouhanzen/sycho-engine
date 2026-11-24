@@ -320,6 +320,7 @@ pub struct SkillTreeRuntime {
     pub editor: SkillTreeEditorState,
 
     editor_history: SkillTreeEditorHistory,
+    timeline_managed_progress: bool,
 
     // Cached indices (rebuilt on load/edit).
     id_to_index: HashMap<String, usize>,
@@ -353,6 +354,7 @@ impl SkillTreeRuntime {
             camera: SkillTreeCamera::default(),
             editor: SkillTreeEditorState::default(),
             editor_history: SkillTreeEditorHistory::default(),
+            timeline_managed_progress: false,
             id_to_index: HashMap::new(),
             unlocked_set: HashSet::new(),
         };
@@ -378,6 +380,7 @@ impl SkillTreeRuntime {
             camera: snapshot.camera,
             editor: snapshot.editor,
             editor_history: SkillTreeEditorHistory::default(),
+            timeline_managed_progress: false,
             id_to_index: HashMap::new(),
             unlocked_set: HashSet::new(),
         };
@@ -398,6 +401,7 @@ impl SkillTreeRuntime {
             camera: SkillTreeCamera::default(),
             editor: SkillTreeEditorState::default(),
             editor_history: SkillTreeEditorHistory::default(),
+            timeline_managed_progress: false,
             id_to_index: HashMap::new(),
             unlocked_set: HashSet::new(),
         };
@@ -552,13 +556,30 @@ impl SkillTreeRuntime {
             self.unlocked_set.insert(id.to_string());
             self.progress.unlocked.push(id.to_string());
         }
-        let _ = save_progress(&self.progress_path, &self.progress);
+        self.persist_progress();
         true
     }
 
     pub fn add_money(&mut self, amount: u32) {
         self.progress.money = self.progress.money.saturating_add(amount);
-        let _ = save_progress(&self.progress_path, &self.progress);
+        self.persist_progress();
+    }
+
+    pub(crate) fn use_timeline_progress(&mut self) {
+        self.timeline_managed_progress = true;
+        if self.def_path.is_none() {
+            self.def_path = std::env::var_os("ROLLOUT_SKILLTREE_PATH")
+                .map(PathBuf::from)
+                .into_iter()
+                .chain([default_def_path()])
+                .find(|path| path.is_file());
+        }
+    }
+
+    fn persist_progress(&self) {
+        if !self.timeline_managed_progress {
+            let _ = save_progress(&self.progress_path, &self.progress);
+        }
     }
 
     pub fn save_def(&self) -> std::io::Result<()> {
@@ -1059,9 +1080,7 @@ fn load_def_from_default_path() -> (SkillTreeDef, Option<PathBuf>, Option<String
         }
     }
 
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("assets")
-        .join("skilltree.json");
+    let path = default_def_path();
     match load_def(&path) {
         Ok(def) => {
             let warning = if warnings.is_empty() {
@@ -1083,6 +1102,10 @@ fn load_def_from_default_path() -> (SkillTreeDef, Option<PathBuf>, Option<String
         warnings.join(" | ")
     ));
     (SkillTreeDef::default(), None, warning)
+}
+
+fn default_def_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets/skilltree.json")
 }
 
 fn load_def(path: &Path) -> Result<SkillTreeDef, std::io::Error> {
@@ -1312,6 +1335,7 @@ mod tests {
             camera: SkillTreeCamera::default(),
             editor: SkillTreeEditorState::default(),
             editor_history: SkillTreeEditorHistory::default(),
+            timeline_managed_progress: false,
             id_to_index: HashMap::new(),
             unlocked_set: HashSet::new(),
         };

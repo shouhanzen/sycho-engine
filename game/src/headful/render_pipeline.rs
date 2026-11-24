@@ -1,11 +1,14 @@
 use std::time::{Duration, Instant};
+use std::{io, path::Path};
 
 use engine::graphics::Renderer2d;
+use engine::recording::{Mp4Config, export_timeline};
+use engine::timeline::TimelineReader;
 use engine::ui_tree::UiTree;
 
 use crate::debug::DebugHud;
 use crate::settings::PlayerSettings;
-use crate::state::GameState;
+use crate::state::{GameState, TIMELINE_SCHEMA};
 use crate::tetris_ui::{
     GameOverMenuLayout, MainMenuLayout, PauseMenuLayout, Rect, SettingsMenuLayout, SkillTreeLayout,
     UiLayout, draw_game_over_menu_with_ui, draw_main_menu_with_ui, draw_pause_menu_with_ui,
@@ -23,6 +26,33 @@ pub struct RenderCache {
     pub last_skilltree: SkillTreeLayout,
     pub last_game_over_menu: GameOverMenuLayout,
     pub last_settings_menu: SettingsMenuLayout,
+}
+
+pub fn export_video(directory: &Path, output: &Path) -> io::Result<()> {
+    let timeline = TimelineReader::open(directory, TIMELINE_SCHEMA)?;
+    let mut ui_tree = UiTree::new();
+    let mut debug_hud = DebugHud::new();
+    let mut cache = RenderCache::default();
+    let config = Mp4Config {
+        width: 1280,
+        height: 720,
+        fps: 30,
+    };
+    export_timeline(&timeline, output, config, |state, renderer| {
+        render_frame(
+            renderer,
+            &mut ui_tree,
+            &mut debug_hud,
+            state,
+            u32::MAX,
+            u32::MAX,
+            &mut cache,
+            0,
+            Duration::ZERO,
+            None,
+            true,
+        );
+    })
 }
 
 pub fn render_frame(

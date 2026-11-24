@@ -3,44 +3,43 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Game (default)
 GAME_PID_FILE="${ROLLOUT_GO_GAME_PID_FILE:-$ROOT_DIR/.go.pid}"
 GAME_LOG_FILE="${ROLLOUT_GO_GAME_LOG_FILE:-$ROOT_DIR/.go.log}"
-
-# Editor (engine editor API + Tauri app)
-EDITOR_API_PID_FILE="${ROLLOUT_GO_EDITOR_API_PID_FILE:-$ROOT_DIR/.go.editor-api.pid}"
-EDITOR_API_LOG_FILE="${ROLLOUT_GO_EDITOR_API_LOG_FILE:-$ROOT_DIR/.go.editor-api.log}"
-EDITOR_APP_PID_FILE="${ROLLOUT_GO_EDITOR_APP_PID_FILE:-$ROOT_DIR/.go.editor-app.pid}"
-EDITOR_APP_LOG_FILE="${ROLLOUT_GO_EDITOR_APP_LOG_FILE:-$ROOT_DIR/.go.editor-app.log}"
 
 usage() {
   cat <<'EOF'
 go.sh - rollout_engine control surface
 
 Usage:
-  ./go.sh --start [--game|--editor] [--headful|--headless] [--record [PATH]] [--replay PATH] [--detach] [--release]
-  ./go.sh --stop [--game|--editor]
-  ./go.sh --restart [--game|--editor] [--headful|--headless] [--record [PATH]] [--replay PATH] [--detach] [--release]
-  ./go.sh --status [--game|--editor]
+  ./go.sh --start [--headful|--headless] [--watch] [--timeline DIR] [--fresh|--playback] [--detach] [--release]
+  ./go.sh --stop
+  ./go.sh --restart [--headful|--headless] [--watch] [--timeline DIR] [--fresh|--playback] [--detach] [--release]
+  ./go.sh --status
   ./go.sh --test [--release]
   ./go.sh --test-fast [--release]
   ./go.sh --test-light [--release]
   ./go.sh --e2e [--video] [--ffmpeg /path/to/ffmpeg] [--release]
+  ./go.sh --export-video PATH [--timeline DIR] [--ffmpeg PATH] [--release]
   ./go.sh --profile [--release]
   ./go.sh --help
-
-Targets:
-  --game        Control the game process (default).
-  --editor      Control the engine editor API + Tauri editor app pair.
 
 Modes:
   --headful      Run the windowed game (default). Uses: cargo run -p game --bin headful
   --headless     Run headless playtests (non-interactive). Uses: cargo test -p game --test e2e_playtest_tests
 
-Recording / Replay (headful game only):
-  --record [PATH]   Save a frame-by-frame state recording (JSON) on exit.
-                   If PATH is omitted, the game chooses a default under `target/recordings/`.
-  --replay PATH      Replay a previously saved state recording (JSON).
+Live timeline (windowed game):
+  --watch         Rebuild on source edits and relaunch at the last live checkpoint.
+  --timeline DIR  Open or create a timeline (default: target/timelines/headful).
+  --fresh         Start a separate timeline. If DIR is given, it must be new.
+  --playback      Open a saved timeline paused at its first snapshot.
+  Option+P (F5)     Pause live play or explicitly resume it from the cursor.
+  Option+Left (F6)  Step backward one snapshot.
+  Option+Right (F7) Step forward one snapshot.
+  Option+Space (F8) Play / pause the recorded timeline. Playback stops at the end.
+  Use Alt in place of Option on other keyboards.
+  SYCHO_CHECKPOINT_MS sets the checkpoint interval (default: 200 ms).
+
+  --export-video PATH  Render a closed timeline to MP4 without a game window.
 
 Build:
   --release      Use release profile for cargo commands (faster runtime, slower compile).
@@ -52,20 +51,8 @@ Build cache (multi-worktree):
                   (reuses build artifacts across worktrees; concurrent cargo invocations will block on a file lock).
                   Override with: CARGO_TARGET_DIR=/path/to/target
 
-Editor:
-  API:  cargo run -p game --bin editor_api   (default http://127.0.0.1:4000; override via ROLLOUT_EDITOR_API_ADDR / ROLLOUT_EDITOR_API_PORT)
-  App:  cd editor/frontend && npm run tauri dev
-  Note: the app may require a one-time: cd editor/frontend && npm install
-
-Ports (multi-worktree safe defaults):
-  go.sh derives a stable per-worktree port offset from the worktree path.
-  Override any of these to force a specific port assignment:
-    ROLLOUT_EDITOR_PORT_OFFSET  (integer; used to derive both ports)
-    ROLLOUT_EDITOR_API_PORT     (default: 4000 + offset)
-    ROLLOUT_EDITOR_DEV_PORT     (default: 5173 + offset)
-
 Lifecycle:
-  --start        Starts the selected target/mode. Default is foreground (attached to the terminal).
+  --start        Starts the game in the selected mode. Default is foreground (attached to the terminal).
   --detach       Run in background (writes pid/log files).
                 If a background process exits immediately, go.sh will print recent logs to the terminal.
   --foreground   (default) Runs attached to the current terminal (no pid/log management).
@@ -74,7 +61,7 @@ Lifecycle:
   --status       Prints whether a background process is running (--start --detach).
 
 Testing:
-  --test         cargo test (workspace; includes editor crate)
+  --test         cargo test (engine and game workspace)
   --test-fast    cargo test -p engine -p game (fast default local loop)
   --test-light   same as --test-fast but reduced local CPU pressure
                 Env knobs:
@@ -82,7 +69,7 @@ Testing:
                   ROLLOUT_TEST_LIGHT_THREADS=1
   --e2e          cargo test -p game --test e2e_playtest_tests
   --video        (e2e) record an mp4 per test via ffmpeg (requires `ffmpeg` on PATH)
-  --ffmpeg PATH  (e2e) path to ffmpeg binary (sets ROLLOUT_FFMPEG_BIN)
+  --ffmpeg PATH  (e2e or export) path to ffmpeg binary (sets ROLLOUT_FFMPEG_BIN)
   --profile      run the headless profiler (cargo run -p game --bin profile)
                 Env knobs:
                   ROLLOUT_PROFILE_FRAMES=10000
@@ -353,119 +340,21 @@ setup_build_cache() {
   fi
 }
 
-kill_listeners_on_port() {
-  local port="$1"
-
-  if ! is_uint "$port" || ((port < 1 || port > 65535)); then
-    return 0
-  fi
-
-  # macOS / Linux
-  if command -v lsof >/dev/null 2>&1; then
-    local pids
-    pids="$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)"
-    if [[ -n "$pids" ]]; then
-      for pid in $pids; do
-        kill "$pid" 2>/dev/null || true
-      done
-    fi
-    return 0
-  fi
-
-  # Windows Git Bash fallback
-  if command -v netstat >/dev/null 2>&1 && command -v taskkill >/dev/null 2>&1; then
-    local pids
-    # netstat -ano columns: proto local foreign state pid
-    pids="$(netstat -ano 2>/dev/null | awk -v p=":${port}$" '$2 ~ p && $4 == "LISTENING" { print $5 }' | sort -u)"
-    if [[ -n "$pids" ]]; then
-      for pid in $pids; do
-        taskkill //PID "$pid" //F >/dev/null 2>&1 || true
-      done
-    fi
-    return 0
-  fi
-}
-
-worktree_port_offset() {
-  # Stable per-worktree offset derived from the worktree root directory path.
-  # Use a wide enough range to make collisions very unlikely across a handful of worktrees.
-  local crc
-  crc="$(printf "%s" "$ROOT_DIR" | cksum | awk '{print $1}')"
-  echo $((crc % 10000))
-}
-
-compute_editor_ports() {
-  local offset
-  offset="${ROLLOUT_EDITOR_PORT_OFFSET:-$(worktree_port_offset)}"
-  if ! is_uint "$offset"; then
-    echo "invalid ROLLOUT_EDITOR_PORT_OFFSET: $offset" >&2
-    exit 2
-  fi
-
-  EDITOR_API_PORT="${ROLLOUT_EDITOR_API_PORT:-$((4000 + offset))}"
-  EDITOR_DEV_PORT="${ROLLOUT_EDITOR_DEV_PORT:-$((5173 + offset))}"
-
-  if ! is_uint "$EDITOR_API_PORT" || ((EDITOR_API_PORT < 1 || EDITOR_API_PORT > 65535)); then
-    echo "invalid editor api port: $EDITOR_API_PORT" >&2
-    exit 2
-  fi
-  if ! is_uint "$EDITOR_DEV_PORT" || ((EDITOR_DEV_PORT < 1 || EDITOR_DEV_PORT > 65535)); then
-    echo "invalid editor dev port: $EDITOR_DEV_PORT" >&2
-    exit 2
-  fi
-
-  EDITOR_API_URL="http://127.0.0.1:${EDITOR_API_PORT}"
-  # Use 127.0.0.1 rather than localhost to avoid Windows IPv4/IPv6 resolution mismatches
-  # that can prevent the Tauri dev server proxy from reaching Vite.
-  EDITOR_DEV_URL="http://127.0.0.1:${EDITOR_DEV_PORT}"
-}
-
-generate_tauri_worktree_config() {
-  local api_port="$1"
-  local dev_port="$2"
-
-  local base_conf="$ROOT_DIR/editor/frontend/src-tauri/tauri.conf.json"
-  local gen_conf="$ROOT_DIR/editor/frontend/src-tauri/gen/tauri.conf.worktree.json"
-
-  mkdir -p "$(dirname "$gen_conf")"
-
-  # Replace the dev server URL + CSP API endpoints so multiple worktrees can run side-by-side.
-  sed \
-    -e "s|http://127.0.0.1:5173|http://127.0.0.1:${dev_port}|g" \
-    -e "s|http://127.0.0.1:4000|http://127.0.0.1:${api_port}|g" \
-    -e "s|http://localhost:4000|http://localhost:${api_port}|g" \
-    "$base_conf" >"$gen_conf"
-
-  echo "$gen_conf"
-}
-
-TARGET="game"
 MODE="headful"
 FOREGROUND="true"
 ACTION=""
 VIDEO="false"
-RECORD_FLAG="false"
-RECORD_PATH=""
-REPLAY_PATH=""
+PLAYBACK="false"
+EXPORT_PATH=""
+WATCH="false"
+TIMELINE_PATH=""
+FRESH="false"
 FFMPEG_BIN=""
 RELEASE="false"
-EDITOR_API_PORT=""
-EDITOR_DEV_PORT=""
-EDITOR_API_URL=""
-EDITOR_DEV_URL=""
-
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --start|--stop|--restart|--status|--test|--test-fast|--test-light|--e2e|--profile)
       ACTION="$1"
-      shift
-      ;;
-    --game)
-      TARGET="game"
-      shift
-      ;;
-    --editor)
-      TARGET="editor"
       shift
       ;;
     --headful)
@@ -488,23 +377,34 @@ while [[ $# -gt 0 ]]; do
       VIDEO="true"
       shift
       ;;
-    --record)
-      RECORD_FLAG="true"
-      # Optional path argument (only meaningful for headful state recordings).
-      if [[ $# -ge 2 ]] && ! [[ "$2" == --* ]]; then
-        RECORD_PATH="$2"
-        shift 2
-      else
-        shift
-      fi
+    --playback)
+      PLAYBACK="true"
+      shift
       ;;
-    --replay)
-      if [[ $# -lt 2 ]]; then
-        echo "--replay requires a path" >&2
+    --export-video)
+      if [[ $# -lt 2 || "$2" == --* ]]; then
+        echo "--export-video requires an output path" >&2
         exit 2
       fi
-      REPLAY_PATH="$2"
+      ACTION="$1"
+      EXPORT_PATH="$2"
       shift 2
+      ;;
+    --watch)
+      WATCH="true"
+      shift
+      ;;
+    --timeline)
+      if [[ $# -lt 2 || "$2" == --* ]]; then
+        echo "--timeline requires a directory" >&2
+        exit 2
+      fi
+      TIMELINE_PATH="$2"
+      shift 2
+      ;;
+    --fresh)
+      FRESH="true"
+      shift
       ;;
     --ffmpeg)
       if [[ $# -lt 2 ]]; then
@@ -539,59 +439,20 @@ fi
 cd "$ROOT_DIR"
 setup_build_cache
 
-# Interpret `--record`:
-# - headful mode: state recording (passed through to the headful binary)
-# - headless / e2e mode: legacy alias for `--video` (mp4 capture)
-STATE_RECORD="false"
-STATE_RECORD_PATH=""
-if [[ "$RECORD_FLAG" == "true" ]]; then
-  if [[ "$ACTION" == "--e2e" || "$MODE" == "headless" ]]; then
-    if [[ -n "$RECORD_PATH" ]]; then
-      echo "--record PATH is only supported for headful state recordings; use --video for e2e mp4 capture" >&2
-      exit 2
-    fi
-    if [[ "$VIDEO" == "true" ]]; then
-      echo "cannot combine --record and --video" >&2
-      exit 2
-    fi
-    VIDEO="true"
-    echo "warning: --record in headless/e2e mode is deprecated; use --video" >&2
-  else
-    STATE_RECORD="true"
-    STATE_RECORD_PATH="$RECORD_PATH"
-  fi
-fi
-
-if [[ -n "$REPLAY_PATH" ]]; then
-  if [[ "$TARGET" != "game" ]]; then
-    echo "--replay is a game-only flag; remove --editor" >&2
+if [[ "$WATCH" == "true" || "$FRESH" == "true" || "$PLAYBACK" == "true" ]]; then
+  if [[ "$MODE" != "headful" || ( "$ACTION" != "--start" && "$ACTION" != "--restart" ) ]]; then
+    echo "--watch, --fresh, and --playback require a windowed --start or --restart" >&2
     exit 2
   fi
-  if [[ "$MODE" != "headful" ]]; then
-    echo "--replay is headful-only; remove --headless" >&2
-    exit 2
-  fi
-  if [[ "$STATE_RECORD" == "true" ]]; then
-    echo "cannot combine --record and --replay" >&2
-    exit 2
-  fi
-  if [[ "$ACTION" != "--start" && "$ACTION" != "--restart" ]]; then
-    echo "--replay requires --start (or --restart)" >&2
+  if [[ "$PLAYBACK" == "true" && ( "$WATCH" == "true" || "$FRESH" == "true" ) ]]; then
+    echo "--playback cannot be combined with --watch or --fresh" >&2
     exit 2
   fi
 fi
 
-if [[ "$STATE_RECORD" == "true" ]]; then
-  if [[ "$TARGET" != "game" ]]; then
-    echo "--record is a game-only flag; remove --editor" >&2
-    exit 2
-  fi
-  if [[ "$MODE" != "headful" ]]; then
-    echo "--record (state recording) is headful-only; remove --headless" >&2
-    exit 2
-  fi
-  if [[ "$ACTION" != "--start" && "$ACTION" != "--restart" ]]; then
-    echo "--record requires --start (or --restart)" >&2
+if [[ -n "$TIMELINE_PATH" && "$ACTION" != "--export-video" ]]; then
+  if [[ "$MODE" != "headful" || ( "$ACTION" != "--start" && "$ACTION" != "--restart" ) ]]; then
+    echo "--timeline requires a windowed launch or --export-video" >&2
     exit 2
   fi
 fi
@@ -611,33 +472,19 @@ if [[ "$VIDEO" == "true" ]] && [[ -z "$FFMPEG_BIN" ]]; then
   fi
 fi
 
+# Guard expansions of this array because Bash 3.2 treats an empty array as unset.
 CARGO_PROFILE_ARGS=()
 if [[ "$RELEASE" == "true" ]]; then
   CARGO_PROFILE_ARGS+=(--release)
 fi
 
+if [[ "$ACTION" == "--restart" ]]; then
+  stop_pidfile "$GAME_PID_FILE"
+  ACTION="--start"
+fi
+
 case "$ACTION" in
   --status)
-    if [[ "$TARGET" == "editor" ]]; then
-      local_api="stopped"
-      local_app="stopped"
-
-      if is_running_pidfile "$EDITOR_API_PID_FILE"; then
-        local_api="running (pid $(cat "$EDITOR_API_PID_FILE"))"
-      fi
-      if is_running_pidfile "$EDITOR_APP_PID_FILE"; then
-        local_app="running (pid $(cat "$EDITOR_APP_PID_FILE"))"
-      fi
-
-      echo "editor api: $local_api"
-      echo "editor app: $local_app"
-
-      if [[ "$local_api" == running* ]] && [[ "$local_app" == running* ]]; then
-        exit 0
-      fi
-      exit 1
-    fi
-
     if is_running_pidfile "$GAME_PID_FILE"; then
       echo "running (pid $(cat "$GAME_PID_FILE"))"
       exit 0
@@ -647,134 +494,10 @@ case "$ACTION" in
     ;;
 
   --stop)
-    if [[ "$TARGET" == "editor" ]]; then
-      stop_pidfile "$EDITOR_APP_PID_FILE"
-      stop_pidfile "$EDITOR_API_PID_FILE"
-
-      # Best-effort cleanup for stray processes (e.g. Vite dev server) if the editor crashed
-      # or the PID file went stale.
-      compute_editor_ports
-      kill_listeners_on_port "$EDITOR_DEV_PORT"
-      kill_listeners_on_port "$EDITOR_API_PORT"
-
-      # Backward compatibility: stop old pidfiles if they exist.
-      stop_pidfile "$ROOT_DIR/.go.editor-frontend.pid" || true
-      stop_pidfile "$ROOT_DIR/.go.editor-backend.pid" || true
-      exit 0
-    fi
     stop_pidfile "$GAME_PID_FILE"
     ;;
 
-  --restart)
-    if [[ "$TARGET" == "editor" ]]; then
-      stop_pidfile "$EDITOR_APP_PID_FILE"
-      stop_pidfile "$EDITOR_API_PID_FILE"
-
-      compute_editor_ports
-      kill_listeners_on_port "$EDITOR_DEV_PORT"
-      kill_listeners_on_port "$EDITOR_API_PORT"
-
-      # Backward compatibility: stop old pidfiles if they exist.
-      stop_pidfile "$ROOT_DIR/.go.editor-frontend.pid" || true
-      stop_pidfile "$ROOT_DIR/.go.editor-backend.pid" || true
-    else
-      stop_pidfile "$GAME_PID_FILE"
-    fi
-    ACTION="--start"
-    ;&
-
   --start)
-    if [[ "$TARGET" == "editor" ]]; then
-      if [[ "$MODE" == "headless" ]]; then
-        echo "--headless is a game-only mode; remove it when using --editor" >&2
-        exit 2
-      fi
-
-      compute_editor_ports
-      tauri_conf="$(generate_tauri_worktree_config "$EDITOR_API_PORT" "$EDITOR_DEV_PORT")"
-
-      api_running="false"
-      app_running="false"
-      if is_running_pidfile "$EDITOR_API_PID_FILE"; then
-        api_running="true"
-      fi
-      if is_running_pidfile "$EDITOR_APP_PID_FILE"; then
-        app_running="true"
-      fi
-
-      if [[ "$FOREGROUND" == "true" ]]; then
-        if [[ "$api_running" == "true" ]] || [[ "$app_running" == "true" ]]; then
-          if [[ "$api_running" == "true" ]]; then
-            echo "already running editor api (pid $(cat "$EDITOR_API_PID_FILE"))"
-            echo "api logs: $EDITOR_API_LOG_FILE"
-          fi
-          if [[ "$app_running" == "true" ]]; then
-            echo "already running editor app (pid $(cat "$EDITOR_APP_PID_FILE"))"
-            echo "app logs: $EDITOR_APP_LOG_FILE"
-          fi
-          echo "stop with: ./go.sh --stop --editor"
-          exit 0
-        fi
-
-        echo "starting editor api ($EDITOR_API_URL) + tauri app ($EDITOR_DEV_URL) in foreground"
-        env ROLLOUT_EDITOR_API_ADDR="127.0.0.1:$EDITOR_API_PORT" cargo run -p game --bin editor_api "${CARGO_PROFILE_ARGS[@]}" &
-        api_pid=$!
-
-        (
-          cd "$ROOT_DIR/editor/frontend"
-          export ROLLOUT_EDITOR_DEV_PORT="$EDITOR_DEV_PORT"
-          export ROLLOUT_EDITOR_API_URL="$EDITOR_API_URL"
-          export VITE_EDITOR_API="$EDITOR_API_URL"
-          npm run tauri -- dev --config "$tauri_conf"
-        ) &
-        app_pid=$!
-
-        trap 'kill "$api_pid" "$app_pid" 2>/dev/null || true' INT TERM EXIT
-        wait
-        exit 0
-      fi
-
-      if [[ "$api_running" == "true" ]] && [[ "$app_running" == "true" ]]; then
-        echo "already running editor api (pid $(cat "$EDITOR_API_PID_FILE"))"
-        echo "already running editor app (pid $(cat "$EDITOR_APP_PID_FILE"))"
-        echo "api logs: $EDITOR_API_LOG_FILE"
-        echo "app logs: $EDITOR_APP_LOG_FILE"
-        exit 0
-      fi
-
-      if [[ "$app_running" == "false" ]] && ! [[ -d "$ROOT_DIR/editor/frontend/node_modules/@tauri-apps/cli" ]]; then
-        echo "editor app dependencies not installed (missing @tauri-apps/cli)." >&2
-        echo "run: cd editor/frontend && npm install" >&2
-        exit 2
-      fi
-
-      if [[ "$api_running" == "false" ]]; then
-        nohup env ROLLOUT_EDITOR_API_ADDR="127.0.0.1:$EDITOR_API_PORT" cargo run -p game --bin editor_api "${CARGO_PROFILE_ARGS[@]}" >"$EDITOR_API_LOG_FILE" 2>&1 &
-        echo $! >"$EDITOR_API_PID_FILE"
-        ensure_pid_alive_or_dump_logs "$EDITOR_API_PID_FILE" "$EDITOR_API_LOG_FILE" "editor api"
-      fi
-
-      if [[ "$app_running" == "false" ]]; then
-        (
-          cd "$ROOT_DIR/editor/frontend"
-          export ROLLOUT_EDITOR_DEV_PORT="$EDITOR_DEV_PORT"
-          export ROLLOUT_EDITOR_API_URL="$EDITOR_API_URL"
-          export VITE_EDITOR_API="$EDITOR_API_URL"
-          nohup npm run tauri -- dev --config "$tauri_conf" >"$EDITOR_APP_LOG_FILE" 2>&1 &
-          echo $! >"$EDITOR_APP_PID_FILE"
-          ensure_pid_alive_or_dump_logs "$EDITOR_APP_PID_FILE" "$EDITOR_APP_LOG_FILE" "editor app"
-        )
-      fi
-
-      echo "started editor api (pid $(cat "$EDITOR_API_PID_FILE" 2>/dev/null || echo "?"))"
-      echo "started editor app (pid $(cat "$EDITOR_APP_PID_FILE" 2>/dev/null || echo "?"))"
-      echo "api: $EDITOR_API_URL"
-      echo "ui:  $EDITOR_DEV_URL"
-      echo "api logs: $EDITOR_API_LOG_FILE"
-      echo "app logs: $EDITOR_APP_LOG_FILE"
-      exit 0
-    fi
-
     if is_running_pidfile "$GAME_PID_FILE"; then
       echo "already running (pid $(cat "$GAME_PID_FILE"))"
       exit 0
@@ -784,22 +507,22 @@ case "$ACTION" in
       if [[ "$FOREGROUND" == "true" ]]; then
         if [[ "$VIDEO" == "true" ]]; then
           if [[ -n "$FFMPEG_BIN" ]]; then
-            exec env ROLLOUT_E2E_RECORD_MP4=1 ROLLOUT_FFMPEG_BIN="$FFMPEG_BIN" cargo test -p game --test e2e_playtest_tests "${CARGO_PROFILE_ARGS[@]}" -- --nocapture
+            exec env ROLLOUT_E2E_RECORD_MP4=1 ROLLOUT_FFMPEG_BIN="$FFMPEG_BIN" cargo test -p game --test e2e_playtest_tests ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- --nocapture
           fi
-          exec env ROLLOUT_E2E_RECORD_MP4=1 cargo test -p game --test e2e_playtest_tests "${CARGO_PROFILE_ARGS[@]}" -- --nocapture
+          exec env ROLLOUT_E2E_RECORD_MP4=1 cargo test -p game --test e2e_playtest_tests ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- --nocapture
         fi
-        exec cargo test -p game --test e2e_playtest_tests "${CARGO_PROFILE_ARGS[@]}" -- --nocapture
+        exec cargo test -p game --test e2e_playtest_tests ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- --nocapture
       fi
 
       # Background headless run (still useful for CI-ish usage).
       if [[ "$VIDEO" == "true" ]]; then
         if [[ -n "$FFMPEG_BIN" ]]; then
-          nohup env ROLLOUT_E2E_RECORD_MP4=1 ROLLOUT_FFMPEG_BIN="$FFMPEG_BIN" cargo test -p game --test e2e_playtest_tests "${CARGO_PROFILE_ARGS[@]}" -- --nocapture >"$GAME_LOG_FILE" 2>&1 &
+          nohup env ROLLOUT_E2E_RECORD_MP4=1 ROLLOUT_FFMPEG_BIN="$FFMPEG_BIN" cargo test -p game --test e2e_playtest_tests ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- --nocapture >"$GAME_LOG_FILE" 2>&1 &
         else
-          nohup env ROLLOUT_E2E_RECORD_MP4=1 cargo test -p game --test e2e_playtest_tests "${CARGO_PROFILE_ARGS[@]}" -- --nocapture >"$GAME_LOG_FILE" 2>&1 &
+          nohup env ROLLOUT_E2E_RECORD_MP4=1 cargo test -p game --test e2e_playtest_tests ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- --nocapture >"$GAME_LOG_FILE" 2>&1 &
         fi
       else
-        nohup cargo test -p game --test e2e_playtest_tests "${CARGO_PROFILE_ARGS[@]}" -- --nocapture >"$GAME_LOG_FILE" 2>&1 &
+        nohup cargo test -p game --test e2e_playtest_tests ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- --nocapture >"$GAME_LOG_FILE" 2>&1 &
       fi
       echo $! >"$GAME_PID_FILE"
       ensure_pid_alive_or_dump_logs "$GAME_PID_FILE" "$GAME_LOG_FILE" "headless tests"
@@ -808,29 +531,42 @@ case "$ACTION" in
       exit 0
     fi
 
-    # Headful (default)
     HEADFUL_ARGS=()
-    if [[ -n "$REPLAY_PATH" ]]; then
-      HEADFUL_ARGS+=(--replay "$REPLAY_PATH")
-    elif [[ "$STATE_RECORD" == "true" ]]; then
-      HEADFUL_ARGS+=(--record)
-      if [[ -n "$STATE_RECORD_PATH" ]]; then
-        HEADFUL_ARGS+=("$STATE_RECORD_PATH")
+    if [[ "$WATCH" == "true" ]]; then
+      LAUNCH=(cargo run -p engine --bin overseer ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} --)
+      HEADFUL_ARGS+=(--package game --bin headful
+        --watch Cargo.toml --watch Cargo.lock
+        --watch engine/Cargo.toml --watch engine/src
+        --watch game/Cargo.toml --watch game/src)
+      if [[ "$RELEASE" == "true" ]]; then
+        HEADFUL_ARGS+=(--release)
       fi
+    else
+      LAUNCH=(cargo run -p game --bin headful ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"})
     fi
 
-    if [[ "$FOREGROUND" == "true" ]]; then
-      if [[ ${#HEADFUL_ARGS[@]} -gt 0 ]]; then
-        exec cargo run -p game --bin headful "${CARGO_PROFILE_ARGS[@]}" -- "${HEADFUL_ARGS[@]}"
-      fi
-      exec cargo run -p game --bin headful "${CARGO_PROFILE_ARGS[@]}"
+    if [[ -n "$TIMELINE_PATH" ]]; then
+      HEADFUL_ARGS+=(--timeline "$TIMELINE_PATH")
+    fi
+    if [[ "$FRESH" == "true" ]]; then
+      HEADFUL_ARGS+=(--fresh)
+    fi
+    if [[ "$PLAYBACK" == "true" ]]; then
+      HEADFUL_ARGS+=(--playback)
     fi
 
     if [[ ${#HEADFUL_ARGS[@]} -gt 0 ]]; then
-      pid="$(start_detached "$GAME_LOG_FILE" cargo run -p game --bin headful "${CARGO_PROFILE_ARGS[@]}" -- "${HEADFUL_ARGS[@]}")"
-    else
-      pid="$(start_detached "$GAME_LOG_FILE" cargo run -p game --bin headful "${CARGO_PROFILE_ARGS[@]}")"
+      if [[ "$WATCH" != "true" ]]; then
+        LAUNCH+=(--)
+      fi
+      LAUNCH+=("${HEADFUL_ARGS[@]}")
     fi
+
+    if [[ "$FOREGROUND" == "true" ]]; then
+      exec "${LAUNCH[@]}"
+    fi
+
+    pid="$(start_detached "$GAME_LOG_FILE" "${LAUNCH[@]}")"
     echo "$pid" >"$GAME_PID_FILE"
     ensure_pid_alive_or_dump_logs "$GAME_PID_FILE" "$GAME_LOG_FILE" "headful game"
     echo "started headful game (pid $(cat "$GAME_PID_FILE"))"
@@ -838,11 +574,11 @@ case "$ACTION" in
     ;;
 
   --test)
-    exec cargo test --workspace "${CARGO_PROFILE_ARGS[@]}"
+    exec cargo test --workspace ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"}
     ;;
 
   --test-fast)
-    exec cargo test -p engine -p game "${CARGO_PROFILE_ARGS[@]}"
+    exec cargo test -p engine -p game ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"}
     ;;
 
   --test-light)
@@ -859,24 +595,31 @@ case "$ACTION" in
     exec env \
       CARGO_BUILD_JOBS="$TEST_LIGHT_BUILD_JOBS" \
       RUST_TEST_THREADS="$TEST_LIGHT_THREADS" \
-      cargo test -p engine -p game "${CARGO_PROFILE_ARGS[@]}"
+      cargo test -p engine -p game ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"}
     ;;
 
   --e2e)
     if [[ "$VIDEO" == "true" ]]; then
       if [[ -n "$FFMPEG_BIN" ]]; then
-        exec env ROLLOUT_E2E_RECORD_MP4=1 ROLLOUT_FFMPEG_BIN="$FFMPEG_BIN" cargo test -p game --test e2e_playtest_tests "${CARGO_PROFILE_ARGS[@]}" -- --nocapture
+        exec env ROLLOUT_E2E_RECORD_MP4=1 ROLLOUT_FFMPEG_BIN="$FFMPEG_BIN" cargo test -p game --test e2e_playtest_tests ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- --nocapture
       fi
-      exec env ROLLOUT_E2E_RECORD_MP4=1 cargo test -p game --test e2e_playtest_tests "${CARGO_PROFILE_ARGS[@]}" -- --nocapture
+      exec env ROLLOUT_E2E_RECORD_MP4=1 cargo test -p game --test e2e_playtest_tests ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- --nocapture
     fi
-    exec cargo test -p game --test e2e_playtest_tests "${CARGO_PROFILE_ARGS[@]}" -- --nocapture
+    exec cargo test -p game --test e2e_playtest_tests ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- --nocapture
+    ;;
+
+  --export-video)
+    EXPORT_ARGS=(--export-video "$EXPORT_PATH")
+    if [[ -n "$TIMELINE_PATH" ]]; then
+      EXPORT_ARGS+=(--timeline "$TIMELINE_PATH")
+    fi
+    if [[ -n "$FFMPEG_BIN" ]]; then
+      export ROLLOUT_FFMPEG_BIN="$FFMPEG_BIN"
+    fi
+    exec cargo run -p game --bin headful ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- "${EXPORT_ARGS[@]}"
     ;;
 
   --profile)
-    if [[ "$TARGET" != "game" ]]; then
-      echo "--profile is a game-only action; remove --editor" >&2
-      exit 2
-    fi
-    exec cargo run -p game --bin profile "${CARGO_PROFILE_ARGS[@]}"
+    exec cargo run -p game --bin profile ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"}
     ;;
 esac

@@ -2,6 +2,23 @@
 
 These presets are optimized for local iteration speed and reduced machine lag.
 
+## Develop with live reload
+
+Run `./go.sh --start --watch` to open Tetree and rebuild it when Rust sources or Cargo manifests change. The running game keeps playing during a build. After a successful build it commits a checkpoint and the replacement process resumes from it.
+
+- `./go.sh --start` opens the same timeline without watching files.
+- The default timeline is `target/timelines/headful`. Use `--timeline DIR` to select another one. Use `--fresh` for a separate timeline, optionally with a new directory of your choice.
+- **Option+P** (F5) pauses live play or resumes live from the cursor. **Option+Left** (F6) and **Option+Right** (F7) step backward and forward. **Option+Space** (F8) plays or pauses the recorded sequence, stopping at the end. Use Alt in place of Option on other keyboards. Resuming live from an older checkpoint replaces the history after it.
+- Use `./go.sh --start --playback --timeline DIR` to open a saved timeline paused at the beginning.
+- The game queues a sample every 200 ms by default, with a full snapshot about once per second and up to four deltas in between. Set `SYCHO_CHECKPOINT_MS` to change the sample interval. A successful reload commits an exact full snapshot at handoff.
+- The timeline stores timestamped, versioned JSON. Earlier live timelines stay readable and use nominal 250 ms timing for entries without timestamps. Change Tetree's timeline schema version in `game/src/state.rs` when older snapshots can no longer be read.
+
+## Export video and use timeline fixtures
+
+Close the game, then run `./go.sh --export-video video.mp4 --timeline DIR`. Export uses Tetree's renderer, preserves recorded pacing, and requires FFmpeg. You can specify its location with `--ffmpeg PATH`.
+
+Tests can write a timeline with `Timeline::capture_at` and reopen it with `TimelineReader`. Use `load` to reconstruct a single checkpoint and `snapshots` to walk the committed sequence. `./go.sh --e2e --video` saves playtest timelines and exports MP4s from them.
+
 ## Recommended Local Loop
 
 - Fast default loop (engine + game):
@@ -18,7 +35,7 @@ These presets are optimized for local iteration speed and reduced machine lag.
 
 ## When To Use `--test`
 
-`./go.sh --test` runs `cargo test --workspace` and includes all workspace crates (including editor tooling). Use it for full validation, not the default inner loop.
+`./go.sh --test` runs `cargo test --workspace` for both the engine and game.
 
 ## Lower-CPU Knobs
 

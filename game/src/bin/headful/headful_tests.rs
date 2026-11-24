@@ -81,6 +81,34 @@ fn input_frame_for_keys(
 }
 
 #[test]
+fn timeline_chords_use_either_option_key_and_keep_function_key_bindings() {
+    use VirtualKeyCode::{F5, F6, F7, F8, LAlt, Left, P, RAlt, Right, Space};
+
+    let (app, _) = make_test_headful(GameView::MainMenu);
+    for (function_key, alternate, command) in [
+        (F5, P, TimelineCommand::TogglePause),
+        (F6, Left, TimelineCommand::Rewind),
+        (F7, Right, TimelineCommand::Forward),
+        (F8, Space, TimelineCommand::TogglePlayback),
+    ] {
+        assert_eq!(
+            app.timeline_command(&input_frame_for_keys(&[function_key], &[function_key], &[])),
+            Some(command)
+        );
+        for option in [LAlt, RAlt] {
+            assert_eq!(
+                app.timeline_command(&input_frame_for_keys(&[alternate], &[option, alternate], &[])),
+                Some(command)
+            );
+        }
+        assert_eq!(
+            app.timeline_command(&input_frame_for_keys(&[alternate], &[alternate], &[])),
+            None
+        );
+    }
+}
+
+#[test]
 fn key_a_maps_to_rotate_180() {
     assert_eq!(
         map_key_to_action(VirtualKeyCode::A),
@@ -436,6 +464,29 @@ fn gravity_timeline_is_deterministic_for_same_inputs() {
     let first = run_timeline();
     let second = run_timeline();
     assert_eq!(first, second);
+}
+
+#[test]
+fn timeline_restore_keeps_the_board_score_and_timers_then_advances_live() {
+    let (mut app, mut runner) = make_test_headful(GameView::Tetris { paused: false });
+    runner.step(InputAction::HardDrop);
+    let fraction = Duration::from_nanos(200_123_456);
+    app.update_round_timer_and_game_over(&mut runner, fraction);
+    app.apply_gravity_steps(&mut runner, fraction);
+    let saved = serde_json::to_vec(runner.state()).unwrap();
+
+    let mut restored = app.restore_state(serde_json::from_slice(&saved).unwrap());
+    let expected: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+    assert_eq!(serde_json::to_value(restored.state()).unwrap(), expected);
+    assert_eq!(restored.state().round_timer.elapsed(), fraction);
+    assert_eq!(restored.state().gravity_elapsed, fraction);
+
+    let board_before = restored.state().tetris.snapshot();
+    restored.step(InputAction::HardDrop);
+    app.update_round_timer_and_game_over(&mut restored, Duration::from_millis(100));
+    assert!(restored.state().tetris.score() > board_before.score);
+    assert_ne!(serde_json::to_value(restored.state()).unwrap(), expected);
+    assert_eq!(restored.history().len(), 1);
 }
 
 #[test]

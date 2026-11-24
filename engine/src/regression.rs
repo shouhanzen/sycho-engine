@@ -1,7 +1,7 @@
 //! Engine-level regression testing helpers.
 //!
 //! These utilities help you:
-//! - record a frame-by-frame `TimeMachine` (JSON) and a matching MP4 (via ffmpeg),
+//! - record a filesystem timeline and a matching MP4 (via ffmpeg),
 //! - replay the recording from disk, produce a second MP4, and
 //! - assert the decoded video frames match.
 //!
@@ -20,8 +20,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    GameLogic, HeadlessRunner, TimeMachine,
+    GameLogic, HeadlessRunner,
     recording::{Mp4Config, Mp4Recorder},
+    timeline::{StateSchema, Timeline, TimelineReader, session_directory},
 };
 
 /// Environment flag helper: accepts `1/true/yes/on` (case-insensitive).
@@ -52,14 +53,14 @@ impl VideoCaptureConfig {
 
 #[derive(Debug, Clone)]
 pub struct RecordReplayArtifacts {
-    pub state_json: PathBuf,
+    pub timeline: PathBuf,
     pub live_mp4: PathBuf,
     pub replay_mp4: PathBuf,
 }
 
 #[derive(Debug, Clone)]
 pub struct RecordReplayHashArtifacts {
-    pub state_json: PathBuf,
+    pub timeline: PathBuf,
     pub live_hashes: Vec<String>,
     pub replay_hashes: Vec<String>,
 }
@@ -314,8 +315,8 @@ fn write_ppm_rgb_diff(
     Ok(())
 }
 
-pub fn render_frame_hashes_for_timemachine<State, Render>(
-    tm: &TimeMachine<State>,
+fn render_frame_hashes<State, Render>(
+    states: &[State],
     width: u32,
     height: u32,
     render: &mut Render,
@@ -327,17 +328,13 @@ where
         .saturating_mul(height as usize)
         .saturating_mul(4);
     let mut buf = vec![0u8; expected];
-    let mut hashes = Vec::with_capacity(tm.len());
-
-    for frame in 0..tm.len() {
-        let state = tm
-            .state_at(frame)
-            .unwrap_or_else(|| panic!("timemachine missing state at frame {frame}"));
-        render(state, &mut buf, width, height);
-        hashes.push(rgba_sha256_hex(&buf));
-    }
-
-    hashes
+    states
+        .iter()
+        .map(|state| {
+            render(state, &mut buf, width, height);
+            rgba_sha256_hex(&buf)
+        })
+        .collect()
 }
 
 fn first_hash_mismatch(a: &[String], b: &[String]) -> Option<usize> {
@@ -358,8 +355,8 @@ fn compare_render_hashes_and_maybe_dump<State, Render>(
     out_dir: &Path,
     width: u32,
     height: u32,
-    live_tm: &TimeMachine<State>,
-    replay_tm: &TimeMachine<State>,
+    live: &[State],
+    replay: &[State],
     live_hashes: &[String],
     replay_hashes: &[String],
     render: &mut Render,
@@ -388,8 +385,8 @@ where
     ));
 
     if dump_ppm_on_mismatch_enabled()
-        && i < live_tm.len()
-        && i < replay_tm.len()
+        && i < live.len()
+        && i < replay.len()
         && width > 0
         && height > 0
     {
@@ -404,8 +401,8 @@ where
         let mut a = vec![0u8; expected_len];
         let mut b = vec![0u8; expected_len];
 
-        let a_state = live_tm.state_at(i).expect("checked bounds");
-        let b_state = replay_tm.state_at(i).expect("checked bounds");
+        let a_state = &live[i];
+        let b_state = &replay[i];
         render(a_state, &mut a, width, height);
         render(b_state, &mut b, width, height);
 
@@ -514,8 +511,8 @@ pub fn assert_mp4_videos_match_ffmpeg(
 }
 
 /// Engine-level regression helper:
-/// - run a scenario live, capturing MP4 frames and saving a `TimeMachine` JSON recording
-/// - load the JSON recording, replay frame-by-frame, capture a second MP4
+/// - run a scenario live, capturing MP4 frames and saving a timeline
+/// - load the timeline, replay frame-by-frame, capture a second MP4
 /// - decode both MP4s and assert every frame matches (via ffmpeg `framemd5`)
 ///
 /// The caller provides a `render` function that fills an RGBA frame for a given state.
@@ -528,7 +525,7 @@ pub fn record_state_and_video_then_replay_and_compare<G, Render>(
     mut render: Render,
 ) -> io::Result<RecordReplayArtifacts>
 where
-    G: GameLogic + Clone,
+    G: GameLogic,
     G::State: Serialize + DeserializeOwned,
     Render: FnMut(&G::State, &mut [u8], u32, u32),
 {
@@ -536,7 +533,7 @@ where
     fs::create_dir_all(out_dir)?;
 
     let base = sanitize_filename(name);
-    let state_json = out_dir.join(format!("{base}.json"));
+    let timeline = out_dir.join(format!("{base}.timeline"));
     let live_mp4 = out_dir.join(format!("{base}__live.mp4"));
     let replay_mp4 = out_dir.join(format!("{base}__replay.mp4"));
 
@@ -545,7 +542,7 @@ where
     let mut replay_hashes: Vec<String> = Vec::new();
 
     // Live record.
-    let mut live_runner = HeadlessRunner::new(game.clone());
+    let mut live_runner = HeadlessRunner::new(game);
     let mut live_rec = Mp4Recorder::start(&live_mp4, video.mp4)?;
     {
         let mut buf = vec![0u8; video.rgba_frame_len()];
@@ -567,11 +564,12 @@ where
     }
     live_rec.finish()?;
 
-    live_runner.timemachine().save_json_file(&state_json)?;
+    let spacing_ms = u64::try_from(hold_frames)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(1_000)
+        / u64::from(video.mp4.fps.max(1));
+    let (timeline, replay) = roundtrip_history(timeline, live_runner.history(), spacing_ms.max(1))?;
 
-    // Replay record.
-    let tm = TimeMachine::<G::State>::load_json_file(&state_json)?;
-    let mut replay_runner = HeadlessRunner::from_timemachine(game, tm);
     let mut replay_rec = Mp4Recorder::start(&replay_mp4, video.mp4)?;
     {
         let mut buf = vec![0u8; video.rgba_frame_len()];
@@ -585,10 +583,8 @@ where
                 Ok(())
             };
 
-        let frames = replay_runner.history().len();
-        for frame in 0..frames {
-            replay_runner.seek(frame);
-            capture(&mut replay_rec, replay_runner.state(), &mut replay_hashes)?;
+        for state in &replay {
+            capture(&mut replay_rec, state, &mut replay_hashes)?;
         }
     }
     replay_rec.finish()?;
@@ -598,8 +594,8 @@ where
         out_dir,
         video.mp4.width,
         video.mp4.height,
-        live_runner.timemachine(),
-        replay_runner.timemachine(),
+        live_runner.history(),
+        &replay,
         &live_hashes,
         &replay_hashes,
         &mut render,
@@ -608,15 +604,15 @@ where
     assert_mp4_videos_match_ffmpeg(&live_mp4, &replay_mp4)?;
 
     Ok(RecordReplayArtifacts {
-        state_json,
+        timeline,
         live_mp4,
         replay_mp4,
     })
 }
 
 /// Engine-level regression helper (hash-only, no ffmpeg dependency):
-/// - run a scenario live, saving a `TimeMachine` JSON recording
-/// - load the JSON recording, replay it, and compute render hashes for every state
+/// - run a scenario live, saving a timeline
+/// - load the timeline, replay it, and compute render hashes for every state
 /// - assert the live and replay render hashes match
 ///
 /// The caller provides a `scenario` closure that mutates the runner (e.g. steps inputs)
@@ -631,7 +627,7 @@ pub fn record_state_then_replay_and_compare_render_hashes_with<G, Scenario, Rend
     mut render: Render,
 ) -> io::Result<RecordReplayHashArtifacts>
 where
-    G: GameLogic + Clone,
+    G: GameLogic,
     G::State: Serialize + DeserializeOwned,
     Scenario: FnOnce(&mut HeadlessRunner<G>),
     Render: FnMut(&G::State, &mut [u8], u32, u32),
@@ -640,41 +636,53 @@ where
     fs::create_dir_all(out_dir)?;
 
     let base = sanitize_filename(name);
-    let state_json = out_dir.join(format!("{base}.json"));
+    let timeline = out_dir.join(format!("{base}.timeline"));
 
     // Live record.
-    let mut live_runner = HeadlessRunner::new(game.clone());
+    let mut live_runner = HeadlessRunner::new(game);
     scenario(&mut live_runner);
-    live_runner.timemachine().save_json_file(&state_json)?;
-
-    // Replay from disk.
-    let tm = TimeMachine::<G::State>::load_json_file(&state_json)?;
-    let replay_runner = HeadlessRunner::from_timemachine(game, tm);
-
-    let live_hashes =
-        render_frame_hashes_for_timemachine(live_runner.timemachine(), width, height, &mut render);
-    let replay_hashes = render_frame_hashes_for_timemachine(
-        replay_runner.timemachine(),
-        width,
-        height,
-        &mut render,
-    );
+    let (timeline, replay) = roundtrip_history(timeline, live_runner.history(), 200)?;
+    let live_hashes = render_frame_hashes(live_runner.history(), width, height, &mut render);
+    let replay_hashes = render_frame_hashes(&replay, width, height, &mut render);
 
     compare_render_hashes_and_maybe_dump(
         name,
         out_dir,
         width,
         height,
-        live_runner.timemachine(),
-        replay_runner.timemachine(),
+        live_runner.history(),
+        &replay,
         &live_hashes,
         &replay_hashes,
         &mut render,
     )?;
 
     Ok(RecordReplayHashArtifacts {
-        state_json,
+        timeline,
         live_hashes,
         replay_hashes,
     })
+}
+
+fn roundtrip_history<S: Serialize + DeserializeOwned>(
+    path: PathBuf,
+    states: &[S],
+    spacing_ms: u64,
+) -> io::Result<(PathBuf, Vec<S>)> {
+    const SCHEMA: StateSchema = StateSchema {
+        game: "test-fixture",
+        version: 1,
+    };
+    let path = session_directory(path, None, true)?;
+    let (mut timeline, _) = Timeline::open::<S>(&path, SCHEMA)?;
+    for (i, state) in states.iter().enumerate() {
+        timeline.capture_at(state, (i as u64).saturating_mul(spacing_ms))?;
+    }
+    drop(timeline);
+    let reader = TimelineReader::open(&path, SCHEMA)?;
+    let history = reader
+        .snapshots::<S>()
+        .map(|snapshot| snapshot.map(|snapshot| snapshot.state))
+        .collect::<io::Result<_>>()?;
+    Ok((path, history))
 }

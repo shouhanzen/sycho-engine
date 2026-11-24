@@ -88,4 +88,11 @@ mod tests {
         assert_eq!(t.elapsed(), Duration::ZERO);
         assert!(!t.is_up());
     }
+
+    #[test]
+    fn recordings_with_millisecond_timers_still_load() {
+        let timer: RoundTimer = serde_json::from_str(r#"{"limit":20000,"elapsed":1234}"#).unwrap();
+        assert_eq!(timer.limit(), Duration::from_secs(20));
+        assert_eq!(timer.elapsed(), Duration::from_millis(1234));
+    }
 }

@@ -1,10 +1,7 @@
 pub mod agent;
 pub mod background;
 pub mod debug;
-pub mod editor_actions;
-pub mod editor_api;
 pub mod headful;
-pub mod headful_editor_api;
 pub mod perf_budget;
 pub mod playtest;
 pub mod round_timer;

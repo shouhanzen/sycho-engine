@@ -102,7 +102,7 @@ fn engine_regression_harness_record_replay_video_roundtrips() {
     .expect("regression harness should complete");
 
     // Clean up on success (keep artifacts if the test fails, for debugging).
-    let _ = fs::remove_file(artifacts.state_json);
+    let _ = fs::remove_dir_all(artifacts.timeline);
     let _ = fs::remove_file(artifacts.live_mp4);
     let _ = fs::remove_file(artifacts.replay_mp4);
     let _ = fs::remove_dir_all(out_dir);

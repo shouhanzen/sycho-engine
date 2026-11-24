@@ -2,19 +2,20 @@ use std::{
     cell::Cell,
     io,
     io::Cursor,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
 use engine::HeadlessRunner;
 use engine::app::{
-    AppConfig, AppContext, CaptureCli, GameApp, InputFrame, ProfileConfig, RecordingConfig,
-    ReplayConfig, RunMode, default_recording_path, parse_capture_cli_with_default_path, run_game,
-    run_game_with_profile, run_game_with_recording, run_game_with_replay,
+    AppConfig, AppContext, GameApp, InputFrame, ProfileConfig, RunMode, TimelineCli,
+    TimelineConfig, TimelineGame, parse_timeline_cli, run_game_with_profile,
+    run_game_with_timeline,
 };
-use engine::ui_tree::{UiEvent, UiInput, UiTree};
 use engine::audio::{MusicRuntime, Quantize, Scene, StepPattern, Track, Waveform};
+use engine::timeline::{StateSchema, TimelineCommand, session_directory};
+use engine::ui_tree::{UiEvent, UiInput, UiTree};
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
-#[cfg(test)]
 use winit::event::VirtualKeyCode;
 use winit::{
     dpi::PhysicalSize,
@@ -25,20 +26,20 @@ use winit::{
 use game::debug::DebugHud;
 use game::headful::dig_camera as headful_dig_camera;
 use game::headful::input_adapter as headful_input;
-use game::headful::remote_control as headful_remote;
-use game::headful::render_pipeline::{RenderCache, render_frame as render_headful_frame};
+use game::headful::render_pipeline::{
+    RenderCache, export_video, render_frame as render_headful_frame,
+};
 use game::headful::skilltree_camera as headful_camera;
 use game::headful::view_transitions as headful_view;
-use game::headful_editor_api::RemoteServer;
 use game::playtest::{InputAction, TetrisLogic};
 use game::round_timer::RoundTimer;
 use game::settings::{AudioSettings, PlayerSettings, SettingsStore};
 use game::sfx::{ACTION_SFX_VOLUME, GLASS_BREAK_SFX_VOLUME, MUSIC_VOLUME};
 use game::skilltree::{SkillTreeEditorTool, SkillTreeRunMods, SkillTreeRuntime};
-use game::state::{DEFAULT_GRAVITY_INTERVAL, DEFAULT_ROUND_LIMIT, GameState};
+use game::state::{DEFAULT_GRAVITY_INTERVAL, DEFAULT_ROUND_LIMIT, GameState, TIMELINE_SCHEMA};
 use game::tetris_core::{
-    BottomwellRunMods, DEFAULT_DEPTH_WALL_DAMAGE_PER_LINE, DEFAULT_DEPTH_WALL_MULTI_CLEAR_BONUS_PERCENT,
-    Piece, default_depth_wall_defs,
+    BottomwellRunMods, DEFAULT_DEPTH_WALL_DAMAGE_PER_LINE,
+    DEFAULT_DEPTH_WALL_MULTI_CLEAR_BONUS_PERCENT, Piece, default_depth_wall_defs,
 };
 use game::tetris_ui::{
     GameOverMenuLayout, MainMenuLayout, PauseMenuLayout, Rect, SettingsMenuLayout, SkillTreeLayout,
@@ -51,6 +52,7 @@ use game::view_tree::{
 
 struct HeadfulApp {
     profile_mode: bool,
+    timeline_mode: bool,
     base_logic: TetrisLogic,
     base_round_limit: Duration,
     base_gravity_interval: Duration,
@@ -70,12 +72,10 @@ struct HeadfulApp {
     dig_camera: DigCameraController,
     frame_interval: Duration,
     next_redraw: Instant,
-    remote_editor_api: Option<RemoteServer>,
     last_frame_dt: Duration,
     exit_requested: bool,
     mouse_release_was_drag: bool,
     consume_next_mouse_up: bool,
-    render_state: Option<GameState>,
     settings_store: SettingsStore,
     player_settings: PlayerSettings,
     settings_open: bool,
@@ -100,28 +100,32 @@ enum ActiveSettingsSlider {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let CaptureCli {
+    let TimelineCli {
         help,
-        record_path,
-        replay_path,
-    } = parse_capture_cli_with_default_path(|| default_recording_path("headful"))?;
+        timeline_path,
+        fresh,
+        playback,
+        export_video: output,
+    } = parse_timeline_cli()?;
     if help {
         print_headful_help();
         return Ok(());
     }
 
-    if let Some(path) = record_path.as_ref() {
-        println!("state recording enabled: will save to {}", path.display());
-    }
-    if let Some(path) = replay_path.as_ref() {
-        println!("replay: {}", path.display());
+    let default_directory =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/timelines/headful");
+    if let Some(output) = output {
+        let directory = timeline_path.unwrap_or(default_directory);
+        export_video(&directory, &output)?;
+        println!("exported {}", output.display());
+        return Ok(());
     }
 
     let profile_frames = env_usize("ROLLOUT_HEADFUL_PROFILE_FRAMES").unwrap_or(0);
-    if replay_path.is_some() && profile_frames > 0 {
+    if (timeline_path.is_some() || fresh || playback) && profile_frames > 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "cannot combine --replay with ROLLOUT_HEADFUL_PROFILE_FRAMES (profiling mode)",
+            "cannot combine --timeline, --fresh, or --playback with profiling mode",
         )
         .into());
     }
@@ -160,11 +164,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     base_logic = base_logic.with_depth_wall_damage_tuning(per_line_damage, multi_bonus_percent);
     let app = HeadfulApp::new(base_logic, DEFAULT_ROUND_LIMIT, DEFAULT_GRAVITY_INTERVAL);
 
-    if let Some(path) = replay_path {
-        run_game_with_replay(config, app, ReplayConfig { path, fps: 15 })
-    } else if let Some(path) = record_path {
-        run_game_with_recording(config, app, RecordingConfig { path })
-    } else if profile_frames > 0 {
+    if profile_frames > 0 {
         run_game_with_profile(
             config,
             app,
@@ -173,7 +173,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         )
     } else {
-        run_game(config, app)
+        let directory = session_directory(default_directory, timeline_path, fresh)?;
+        run_game_with_timeline(
+            config,
+            app,
+            TimelineConfig {
+                directory,
+                checkpoint_interval: Duration::from_millis(
+                    u64::from(env_u32("SYCHO_CHECKPOINT_MS").unwrap_or(200)).max(1),
+                ),
+                playback,
+            },
+        )
     }
 }
 
@@ -198,27 +209,13 @@ impl HeadfulApp {
             }
         };
         let frame_interval = Duration::from_secs_f64(1.0 / 60.0);
-        let remote_editor_api = match env_u16("ROLLOUT_HEADFUL_EDITOR_PORT").unwrap_or(0) {
-            0 => None,
-            port => match RemoteServer::start(port) {
-                Ok(server) => {
-                    println!("headful editor api: http://{}", server.info.addr);
-                    Some(server)
-                }
-                Err(err) => {
-                    eprintln!(
-                        "warning: failed to start headful editor api on 127.0.0.1:{port}: {err}"
-                    );
-                    None
-                }
-            },
-        };
         let mut debug_hud = DebugHud::new();
         if env_bool("ROLLOUT_DEBUG_DISABLE_ROUND_TIMER").unwrap_or(false) {
             debug_hud.set_round_timer_disabled(true);
         }
         let app = Self {
             profile_mode: false,
+            timeline_mode: false,
             base_logic,
             base_round_limit,
             base_gravity_interval,
@@ -238,12 +235,10 @@ impl HeadfulApp {
             dig_camera: DigCameraController::from_env(),
             frame_interval,
             next_redraw: Instant::now(),
-            remote_editor_api,
             last_frame_dt: Duration::ZERO,
             exit_requested: false,
             mouse_release_was_drag: false,
             consume_next_mouse_up: false,
-            render_state: None,
             settings_store,
             player_settings,
             settings_open: false,
@@ -395,6 +390,7 @@ impl HeadfulApp {
             self.base_round_limit,
             self.base_gravity_interval,
             &mut self.horizontal_repeat,
+            self.timeline_mode,
         );
         self.dig_camera
             .reset(state.state().tetris.background_depth_rows());
@@ -433,14 +429,6 @@ impl HeadfulApp {
                 }
             }
         }
-    }
-
-    fn drain_remote_commands(&mut self, state: &mut HeadlessRunner<TetrisLogic>) {
-        let mut remote_editor_api = self.remote_editor_api.take();
-        headful_remote::drain_remote_commands(remote_editor_api.as_mut(), state, |runner| {
-            self.reset_active_run(runner);
-        });
-        self.remote_editor_api = remote_editor_api;
     }
 
     fn handle_viewtree_action(
@@ -779,12 +767,16 @@ impl GameApp for HeadfulApp {
         state.gravity_interval = self.base_gravity_interval;
         state.gravity_elapsed = Duration::ZERO;
         self.dig_camera.reset(state.tetris.background_depth_rows());
-        self.render_state = Some(runner.state().clone());
         runner
     }
 
     fn on_run_mode(&mut self, mode: RunMode, state: &mut Self::State, _ctx: &mut AppContext) {
         self.profile_mode = matches!(mode, RunMode::Profile);
+        self.timeline_mode = matches!(mode, RunMode::Timeline);
+        if self.timeline_mode {
+            state.disable_history();
+            state.state_mut().use_timeline_progress();
+        }
         if self.profile_mode {
             state.state_mut().view = GameView::Tetris { paused: false };
         }
@@ -815,8 +807,6 @@ impl GameApp for HeadfulApp {
     ) -> Vec<Self::Effect> {
         self.last_frame_dt = dt;
         let now = Instant::now();
-
-        self.drain_remote_commands(state);
 
         if let Some((mx, my)) = input.mouse_pos {
             self.mouse_x = mx;
@@ -1078,19 +1068,16 @@ impl GameApp for HeadfulApp {
         }
 
         self.update_dig_camera_state(state, dt);
-        self.render_state = Some(state.state().clone());
         Vec::new()
     }
 
     fn render(
         &mut self,
+        runner: &Self::State,
         _view: &engine::view_tree::ViewTree<Self::Action>,
         renderer: &mut dyn engine::graphics::Renderer2d,
     ) {
-        let Some(state) = self.render_state.as_ref() else {
-            return;
-        };
-
+        let state = runner.state();
         let mut cache = RenderCache {
             last_layout: self.last_layout,
             last_main_menu: self.last_main_menu,
@@ -1159,16 +1146,57 @@ impl GameApp for HeadfulApp {
             }
             Event::LoopDestroyed => {
                 self.save_settings_if_dirty();
-                if let Some(remote) = self.remote_editor_api.as_mut() {
-                    remote.shutdown();
-                }
-
                 return true;
             }
             _ => {}
         }
 
         false
+    }
+}
+
+impl TimelineGame for HeadfulApp {
+    type Snapshot = GameState;
+    const SCHEMA: StateSchema = TIMELINE_SCHEMA;
+
+    fn snapshot(state: &Self::State) -> &Self::Snapshot {
+        state.state()
+    }
+
+    fn restore_state(&mut self, mut snapshot: Self::Snapshot) -> Self::State {
+        snapshot.use_timeline_progress();
+        let logic = logic_for_run(&self.base_logic, snapshot.skilltree.run_mods());
+        let mut runner = HeadlessRunner::from_state(logic, snapshot);
+        runner.disable_history();
+        self.horizontal_repeat.clear();
+        self.dig_camera
+            .reset(runner.state().tetris.background_depth_rows());
+        self.skilltree_cam_input = SkillTreeCameraInput::default();
+        self.ui_tree = UiTree::new();
+        self.active_settings_slider = None;
+        self.settings_open = false;
+        self.mouse_release_was_drag = false;
+        self.consume_next_mouse_up = false;
+        self.last_frame_dt = Duration::ZERO;
+        runner
+    }
+
+    fn timeline_command(&self, input: &InputFrame) -> Option<TimelineCommand> {
+        use VirtualKeyCode::{F5, F6, F7, F8, LAlt, Left, P, RAlt, Right, Space};
+
+        let option_held = input.keys_down.contains(&LAlt) || input.keys_down.contains(&RAlt);
+        [
+            (F5, P, TimelineCommand::TogglePause),
+            (F6, Left, TimelineCommand::Rewind),
+            (F7, Right, TimelineCommand::Forward),
+            (F8, Space, TimelineCommand::TogglePlayback),
+        ]
+        .into_iter()
+        .find_map(|(function_key, alternate, command)| {
+            (input.keys_pressed.contains(&function_key)
+                || (option_held && input.keys_pressed.contains(&alternate)))
+            .then_some(command)
+        })
     }
 }
 
@@ -1186,7 +1214,6 @@ fn skilltree_grid_viewport(layout: SkillTreeLayout) -> Option<Rect> {
 struct RunTuning {
     round_limit: Duration,
     gravity_interval: Duration,
-    score_bonus_per_line: u32,
 }
 
 fn gravity_interval_from_percent(base: Duration, faster_percent: u32) -> Duration {
@@ -1227,8 +1254,14 @@ fn run_tuning_from_mods(
             base_gravity_interval,
             mods.gravity_faster_percent,
         ),
-        score_bonus_per_line: mods.score_bonus_per_line,
     }
+}
+
+fn logic_for_run(base_logic: &TetrisLogic, mods: SkillTreeRunMods) -> TetrisLogic {
+    base_logic
+        .clone()
+        .with_score_bonus_per_line(mods.score_bonus_per_line)
+        .with_bottomwell_run_mods(bottomwell_run_mods_from_skill_mods(mods))
 }
 
 fn reset_run(
@@ -1237,17 +1270,22 @@ fn reset_run(
     base_round_limit: Duration,
     base_gravity_interval: Duration,
     horizontal_repeat: &mut HorizontalRepeat,
+    timeline_mode: bool,
 ) {
     let skilltree = runner.state().skilltree.clone();
     let view = runner.state().view;
     let mods = skilltree.run_mods();
     let tuning = run_tuning_from_mods(base_round_limit, base_gravity_interval, mods);
 
-    let logic = base_logic
-        .clone()
-        .with_score_bonus_per_line(tuning.score_bonus_per_line)
-        .with_bottomwell_run_mods(bottomwell_run_mods_from_skill_mods(mods));
+    let logic = logic_for_run(base_logic, mods);
     let mut next_runner = HeadlessRunner::new(logic);
+    if timeline_mode {
+        next_runner.disable_history();
+        next_runner
+            .state_mut()
+            .tetris
+            .inherit_timeline_progress(&runner.state().tetris);
+    }
     {
         let state = next_runner.state_mut();
         state.skilltree = skilltree;
@@ -1268,10 +1306,6 @@ fn env_usize(name: &str) -> Option<usize> {
 
 fn env_u32(name: &str) -> Option<u32> {
     std::env::var(name).ok().and_then(|v| v.parse::<u32>().ok())
-}
-
-fn env_u16(name: &str) -> Option<u16> {
-    std::env::var(name).ok().and_then(|v| v.parse::<u16>().ok())
 }
 
 fn env_bool(name: &str) -> Option<bool> {
@@ -1309,19 +1343,21 @@ fn print_headful_help() {
         r#"Tetree Headful
 
 Usage:
-  headful [--record [PATH]]
-  headful --replay PATH
+  headful [--timeline DIR] [--fresh | --playback]
+  headful --export-video PATH [--timeline DIR]
 
 Flags:
-  --record [PATH]   Save the in-memory TimeMachine (frame-by-frame state history) to a JSON file on exit.
-                   If PATH is omitted, writes to: target/recordings/headful_<nanos>.json
-  --replay PATH     Load a previously saved JSON recording and replay it.
-                   Replay controls:
-                     Space: play/pause
-                     Left/Right: step -/+1 frame (pauses)
-                     Home/End: jump to start/end (pauses)
-                     Up/Down: speed x2 / ÷2
-                     Esc: quit
+  --timeline DIR    Select a timeline (default: target/timelines/headful).
+  --fresh           Start a separate timeline. With --timeline, DIR must be new.
+  --playback        Open a saved timeline paused at its first snapshot.
+  --export-video PATH
+                    Render a saved timeline to MP4 without opening a window.
+  Option+P (F5)     Pause live play or explicitly resume it from the cursor.
+  Option+Left (F6)  Step backward one snapshot.
+  Option+Right (F7) Step forward one snapshot.
+  Option+Space (F8) Play / pause the recorded timeline. Playback stops at the end.
+  Use Alt in place of Option on other keyboards.
+  SYCHO_CHECKPOINT_MS sets the live capture interval (default: 200 ms).
   --help, -h        Show this help.
 "#
     );
@@ -1358,7 +1394,16 @@ impl BgMusic {
         let bass = Track::new(
             "bass",
             StepPattern::from_notes(
-                vec![Some(110.0), None, Some(98.0), None, Some(123.47), None, Some(98.0), None],
+                vec![
+                    Some(110.0),
+                    None,
+                    Some(98.0),
+                    None,
+                    Some(123.47),
+                    None,
+                    Some(98.0),
+                    None,
+                ],
                 0.5,
             )
             .with_envelope(0.02, 0.10),
@@ -1399,7 +1444,7 @@ impl BgMusic {
             Scene::new("main")
                 .with_track(arp)
                 .with_track(bass)
-                .with_track(kick)
+                .with_track(kick),
         );
         let _ = runtime.schedule_scene_switch("main", Quantize::Immediate);
 
