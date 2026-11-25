@@ -58,7 +58,7 @@ fn draw_frame(renderer: &mut dyn Renderer2d, state: &GameState, overlays: FrameO
 
     let size = renderer.size();
     let pointer = state.pointer();
-    let settings = state.settings_overlay.as_ref();
+    let settings = state.settings.open.then_some(&state.settings.values);
     let layout = GameUiLayout::compute(state, size);
     let game_pointer = if settings.is_some() { None } else { pointer };
 

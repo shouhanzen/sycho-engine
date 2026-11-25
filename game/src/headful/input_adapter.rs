@@ -377,7 +377,7 @@ pub fn process_keyboard_frame(
     let pressed = |key| input.keys_pressed.contains(&key);
     let mut commands = Vec::new();
 
-    if runner.state().settings_overlay.is_some() {
+    if runner.state().settings.open {
         if pressed(VirtualKeyCode::Escape) {
             commands.push(HeadfulInputCommand::Ui(GameUiAction::CloseSettings));
         }

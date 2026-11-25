@@ -360,18 +360,18 @@ pub trait GameApp {
     fn on_frame_timings(&mut self, _timings: FrameTimings) {}
 
     /// Live master volume advertised to the editor in percent.
-    fn master_volume(&self) -> Option<u8> {
+    fn master_volume(&self, _state: &Self::State) -> Option<u8> {
         None
     }
 
     /// Apply a master volume adjustment, saving it when the user releases the slider.
-    fn set_master_volume(&mut self, _percent: u8, _commit: bool) {}
+    fn set_master_volume(&mut self, _state: &mut Self::State, _percent: u8, _commit: bool) {}
 
     fn exit_requested(&self) -> bool {
         false
     }
 
-    fn shutdown(&mut self) {}
+    fn shutdown(&mut self, _state: &Self::State) {}
 
     fn handle_event(
         &mut self,
@@ -465,22 +465,19 @@ pub trait TimelineGame: GameApp {
     fn draw_preview(snapshot: Self::PreviewSnapshot, renderer: &mut dyn Renderer2d);
 
     fn set_timeline_paused(&mut self, _paused: bool) {}
-
-    fn timeline_command(&self, _input: &InputFrame) -> Option<TimelineCommand> {
-        None
-    }
 }
 
 pub fn run_game<G>(config: AppConfig, game: G, run: RunConfig) -> Result<(), Box<dyn Error>>
 where
     G: TimelineGame + 'static,
 {
+    let embedded = env::var_os(ADDRESS_ENV).is_some();
     let (timeline, trace) = match run {
         RunConfig::Live { timeline } => (timeline, None),
         RunConfig::Profile(profile) => (None, Some(TraceCapture::new(profile))),
     };
     let Some(options) = timeline else {
-        if env::var_os(ADDRESS_ENV).is_some() {
+        if embedded {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "the editor requires timeline recording",
@@ -490,9 +487,21 @@ where
         return run_windowed(config, game, None, trace);
     };
     let (mut timeline, mut snapshot) = Timeline::open(&options.directory, G::SCHEMA)?;
-    if options.playback {
+    let playback = if options.playback {
         snapshot = Some(timeline.pause_at_start()?);
-    }
+        let from_ms = timeline
+            .position()
+            .expect("playback starts at a checkpoint")
+            .at_ms;
+        timeline
+            .next_frame()?
+            .map(|next| Playback::new(from_ms, next))
+    } else {
+        if !embedded && let Some(latest) = timeline.resume_tip()? {
+            snapshot = Some(latest);
+        }
+        None
+    };
     println!("timeline: {}", options.directory.display());
     if let Some(cursor) = timeline.cursor() {
         println!("restored checkpoint {cursor}");
@@ -517,7 +526,7 @@ where
         tip: timeline.tip_position()?,
         clock_position: timeline.position().map_or(0, |frame| frame.at_ms),
         clock_start: Instant::now(),
-        playback: None,
+        playback,
         writer: TimelineWorker::start(timeline)?,
         snapshot,
         capture_failed: false,
@@ -533,6 +542,16 @@ struct Playback {
     from_ms: u64,
     started: Instant,
     next_ms: u64,
+}
+
+impl Playback {
+    fn new(from_ms: u64, next: Frame) -> Self {
+        Self {
+            from_ms,
+            started: Instant::now(),
+            next_ms: next.at_ms,
+        }
+    }
 }
 
 enum TimelineAction {
@@ -607,6 +626,9 @@ impl<G: TimelineGame> TimelineSession<G> {
         };
         game.set_timeline_paused(self.paused);
         self.clock_start = Instant::now();
+        if let Some(playback) = &mut self.playback {
+            playback.started = self.clock_start;
+        }
         Ok(state)
     }
 
@@ -614,11 +636,10 @@ impl<G: TimelineGame> TimelineSession<G> {
         &mut self,
         game: &mut G,
         state: &mut G::State,
-        input: &InputFrame,
         command: Option<TimelineCommand>,
     ) -> bool {
         self.poll_capture();
-        let action = if let Some(command) = command.or_else(|| game.timeline_command(input)) {
+        let action = if let Some(command) = command {
             let command = match command {
                 TimelineCommand::TogglePlayPause
                     if self.paused
@@ -714,11 +735,7 @@ impl<G: TimelineGame> TimelineSession<G> {
                         Some(playback) => playback.next_ms = next.at_ms,
                         None => {
                             let from_ms = cursor.expect("playing requires a checkpoint").at_ms;
-                            self.playback = Some(Playback {
-                                from_ms,
-                                started: Instant::now(),
-                                next_ms: next.at_ms,
-                            });
+                            self.playback = Some(Playback::new(from_ms, next));
                         }
                     },
                     Ok(None) => self.playback = None,
@@ -864,10 +881,6 @@ fn run_embedded<G: TimelineGame>(
                 _ => input.apply_editor_event(event),
             }
         }
-        if let Some((percent, request)) = volume_change {
-            game.set_master_volume(percent, commit_volume);
-            last_volume_request = Some(request);
-        }
         match preview.take_feedback() {
             Ok(Some((size, timings))) if size == ctx.surface_size => {
                 game.on_frame_timings(timings);
@@ -881,29 +894,33 @@ fn run_embedded<G: TimelineGame>(
         }
         let mut profile = profile_enabled.then(PreviewProfile::default);
         let mut update = Duration::ZERO;
-        if commands.is_empty() {
-            if session.should_update(&mut game, &mut state, &input, None) {
-                let (_, span) =
-                    Span::measure(|| game.update_state(&mut state, &input, dt, &mut ctx));
-                update = span.elapsed;
-                tick += 1;
-                let start = profile_enabled.then(Instant::now);
-                session.after_update(&state);
-                if let (Some(profile), Some(start)) = (&mut profile, start) {
-                    profile.timeline_us = micros(start.elapsed());
-                }
-            } else {
-                last_frame = Instant::now();
-            }
+        let should_update = if commands.is_empty() {
+            session.should_update(&mut game, &mut state, None)
         } else {
             for command in commands {
-                session.should_update(&mut game, &mut state, &input, Some(command));
+                session.should_update(&mut game, &mut state, Some(command));
             }
+            false
+        };
+        if let Some((percent, request)) = volume_change {
+            game.set_master_volume(&mut state, percent, commit_volume);
+            last_volume_request = Some(request);
+        }
+        if should_update {
+            let (_, span) = Span::measure(|| game.update_state(&mut state, &input, dt, &mut ctx));
+            update = span.elapsed;
+            tick += 1;
+            let start = profile_enabled.then(Instant::now);
+            session.after_update(&state);
+            if let (Some(profile), Some(start)) = (&mut profile, start) {
+                profile.timeline_us = micros(start.elapsed());
+            }
+        } else {
             last_frame = Instant::now();
         }
         let metadata = PreviewMetadata {
             status: session.status(),
-            master_volume: game.master_volume().map(|percent| MasterVolume {
+            master_volume: game.master_volume(&state).map(|percent| MasterVolume {
                 percent: percent.min(100),
                 request: last_volume_request,
             }),
@@ -923,7 +940,7 @@ fn run_embedded<G: TimelineGame>(
         deadline = (deadline + interval).max(finished);
         std::thread::sleep(deadline.saturating_duration_since(finished));
     };
-    game.shutdown();
+    game.shutdown(&state);
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
@@ -949,6 +966,9 @@ fn run_windowed<G: TimelineGame + 'static>(
     let mut previous_status = None;
 
     event_loop.run(move |event, _, control_flow| {
+        if matches!(event, Event::LoopDestroyed) {
+            game.shutdown(&state);
+        }
         if exiting {
             if matches!(event, Event::LoopDestroyed) {
                 game.handle_event(&event, &mut state, &mut input, &mut ctx.app, control_flow);
@@ -1012,9 +1032,10 @@ fn run_windowed<G: TimelineGame + 'static>(
                 let now = Instant::now();
                 let dt = now.saturating_duration_since(last_frame);
                 last_frame = now;
-                let update = if session.as_mut().is_none_or(|session| {
-                    session.should_update(&mut game, &mut state, &input, None)
-                }) {
+                let update = if session
+                    .as_mut()
+                    .is_none_or(|session| session.should_update(&mut game, &mut state, None))
+                {
                     let (_, update) =
                         Span::measure(|| game.update_state(&mut state, &input, dt, &mut ctx.app));
                     if let Some(session) = &mut session {

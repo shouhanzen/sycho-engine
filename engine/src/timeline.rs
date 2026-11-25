@@ -598,6 +598,21 @@ impl Timeline {
         Ok(state)
     }
 
+    /// Resume at the latest checkpoint, preserving all recorded history.
+    pub(crate) fn resume_tip<S: DeserializeOwned>(&mut self) -> io::Result<Option<S>> {
+        if !self.is_paused() {
+            return Ok(None);
+        }
+        let tip = self.tip_position()?.expect("paused timeline has a tip");
+        let state = if self.position != Some(tip) {
+            Some(self.select(tip)?)
+        } else {
+            None
+        };
+        self.resume()?;
+        Ok(state)
+    }
+
     /// Makes the selected checkpoint the live tip before the game advances from it.
     pub fn resume(&mut self) -> io::Result<()> {
         let Some(mut head) = self.head.clone().filter(|head| head.paused) else {
@@ -1122,6 +1137,33 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn resuming_at_the_tip_preserves_history_after_rewinding() {
+        let directory = TestDirectory::new();
+        let (mut timeline, _) = Timeline::open::<u32>(&directory.0, SCHEMA).unwrap();
+        timeline.checkpoint_at(&0u32, 0).unwrap();
+        timeline.capture_at(&1u32, 16).unwrap();
+        timeline.pause_at(&2u32, 33).unwrap();
+        assert_eq!(timeline.rewind::<u32>().unwrap(), Some(1));
+        drop(timeline);
+
+        let (mut timeline, selected) = Timeline::open::<u32>(&directory.0, SCHEMA).unwrap();
+        assert_eq!(selected, Some(1));
+        assert_eq!(timeline.resume_tip::<u32>().unwrap(), Some(2));
+        assert!(!timeline.is_paused());
+        timeline.checkpoint_at(&3u32, 50).unwrap();
+        drop(timeline);
+
+        let reader = TimelineReader::open(&directory.0, SCHEMA).unwrap();
+        assert_eq!(
+            reader
+                .snapshots::<u32>()
+                .map(|s| s.unwrap().state)
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
     }
 
     #[test]

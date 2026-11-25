@@ -93,6 +93,38 @@ impl GameDisplay {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(from = "SavedSettings")]
+pub struct SettingsState {
+    #[serde(rename = "settings")]
+    pub values: PlayerSettings,
+    #[serde(rename = "settings_open")]
+    pub open: bool,
+    #[serde(skip)]
+    legacy_display_only: bool,
+}
+
+#[derive(Deserialize)]
+struct SavedSettings {
+    settings: Option<PlayerSettings>,
+    settings_open: Option<bool>,
+    settings_overlay: Option<PlayerSettings>,
+}
+
+impl From<SavedSettings> for SettingsState {
+    fn from(saved: SavedSettings) -> Self {
+        let open = saved
+            .settings_open
+            .unwrap_or(saved.settings_overlay.is_some());
+        let values = saved.settings.or(saved.settings_overlay);
+        Self {
+            open,
+            legacy_display_only: values.is_none(),
+            values: values.unwrap_or_default().sanitized(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameState {
     pub view: GameView,
@@ -107,8 +139,8 @@ pub struct GameState {
     pub gravity_elapsed: Duration,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<RecordedInput>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub settings_overlay: Option<PlayerSettings>,
+    #[serde(flatten)]
+    pub settings: SettingsState,
 }
 
 impl GameState {
@@ -137,8 +169,25 @@ impl GameState {
             gravity_interval,
             gravity_elapsed: Duration::ZERO,
             input: None,
-            settings_overlay: None,
+            settings: SettingsState::default(),
         }
+    }
+
+    pub fn restore_legacy_display_preferences(&mut self) {
+        if std::mem::take(&mut self.settings.legacy_display_only) {
+            self.settings.values.video.screen_shake_percent = self.display.screen_shake_percent;
+            self.settings.values.gameplay.show_round_timer = self.display.show_round_timer;
+        }
+    }
+
+    pub fn sync_display_preferences(&mut self) {
+        let settings = &self.settings.values;
+        self.display.screen_shake_percent = if settings.accessibility.reduce_motion {
+            0
+        } else {
+            settings.video.clamped_screen_shake()
+        };
+        self.display.show_round_timer = settings.gameplay.show_round_timer;
     }
 
     pub fn pointer(&self) -> Option<(u32, u32)> {

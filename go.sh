@@ -29,7 +29,8 @@ Live timeline (windowed game):
   --no-recording  Run standalone without opening a timeline.
   --timeline DIR  Open or create a timeline (default: target/timelines/headful).
   --fresh         Start a separate timeline. If DIR is given, it must be new.
-  --playback      Open a saved timeline paused at its first snapshot.
+  --playback      Play a saved timeline from its first snapshot.
+  Timeline shortcuts work while the editor Game panel has focus.
   Option+P (F5)     Pause live play or explicitly resume it from the cursor.
   Option+Left (F6)  Step backward one snapshot.
   Option+Right (F7) Step forward one snapshot.

@@ -12,8 +12,9 @@ use engine::app::{
 };
 use engine::audio::{MusicRuntime, Quantize, Scene, StepPattern, Track, Waveform};
 use engine::profiling::{FrameTimings, ProfileConfig};
-use engine::timeline::{StateSchema, TimelineCommand};
+use engine::timeline::StateSchema;
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
+#[cfg(test)]
 use winit::event::VirtualKeyCode;
 use winit::{
     dpi::PhysicalSize,
@@ -64,7 +65,6 @@ struct HeadfulApp {
     mouse_release_was_drag: bool,
     consume_next_mouse_up: bool,
     settings_store: SettingsStore,
-    player_settings: PlayerSettings,
     active_settings_slider: Option<ActiveSettingsSlider>,
     settings_dirty: bool,
 }
@@ -155,7 +155,6 @@ impl HeadfulApp {
         base_gravity_interval: Duration,
     ) -> Self {
         let settings_store = SettingsStore::from_env();
-        let player_settings = settings_store.load();
         let sfx = match Sfx::new() {
             Ok(sfx) => Some(sfx),
             Err(err) => {
@@ -173,7 +172,7 @@ impl HeadfulApp {
         if env_bool("ROLLOUT_DEBUG_DISABLE_ROUND_TIMER").unwrap_or(false) {
             debug_hud.set_round_timer_disabled(true);
         }
-        let app = Self {
+        Self {
             profile_mode: false,
             base_logic,
             base_round_limit,
@@ -192,50 +191,36 @@ impl HeadfulApp {
             mouse_release_was_drag: false,
             consume_next_mouse_up: false,
             settings_store,
-            player_settings,
             active_settings_slider: None,
             settings_dirty: false,
-        };
-        app.apply_audio_settings();
-        app
+        }
     }
 
-    fn update_display_preferences(&self, state: &mut GameState) {
-        let settings = state
-            .settings_overlay
-            .as_ref()
-            .unwrap_or(&self.player_settings);
-        state.display.screen_shake_percent = if settings.accessibility.reduce_motion {
-            0
-        } else {
-            settings.video.clamped_screen_shake()
-        };
-        state.display.show_round_timer = settings.gameplay.show_round_timer;
-    }
-
-    fn play_click_sfx(&self) {
+    fn play_click_sfx(&self, state: &GameState) {
         if let Some(sfx) = self.sfx.as_ref() {
-            let gain = self.player_settings.audio.effective_sfx_gain();
+            let gain = state.settings.values.audio.effective_sfx_gain();
             sfx.play_click(ACTION_SFX_VOLUME * gain);
         }
     }
 
-    fn apply_audio_settings(&self) {
+    fn apply_audio_settings(&self, audio: AudioSettings) {
         if let Some(sfx) = self.sfx.as_ref() {
-            sfx.apply_audio_settings(self.player_settings.audio);
+            sfx.apply_audio_settings(audio);
         }
     }
 
-    fn mark_settings_dirty(&mut self) {
+    fn settings_changed(&mut self, settings: &PlayerSettings, previous_audio: AudioSettings) {
+        if settings.audio != previous_audio {
+            self.apply_audio_settings(settings.audio);
+        }
         self.settings_dirty = true;
     }
 
-    fn save_settings_if_dirty(&mut self) {
+    fn save_settings_if_dirty(&mut self, settings: &PlayerSettings) {
         if !self.settings_dirty {
             return;
         }
-        self.player_settings = self.player_settings.clone().sanitized();
-        match self.settings_store.save(&self.player_settings) {
+        match self.settings_store.save(settings) {
             Ok(()) => {
                 self.settings_dirty = false;
             }
@@ -245,10 +230,12 @@ impl HeadfulApp {
         }
     }
 
-    fn toggle_music_enabled(&mut self) {
-        self.player_settings.audio.music_enabled = !self.player_settings.audio.music_enabled;
-        self.apply_audio_settings();
-        self.mark_settings_dirty();
+    fn toggle_music_enabled(&mut self, state: &mut GameState) {
+        let settings = &mut state.settings.values;
+        let previous_audio = settings.audio;
+        settings.audio.music_enabled = !settings.audio.music_enabled;
+        self.settings_changed(settings, previous_audio);
+        self.save_settings_if_dirty(settings);
     }
 
     fn settings_slider_from_pointer(
@@ -276,6 +263,7 @@ impl HeadfulApp {
         slider: ActiveSettingsSlider,
         x: u32,
     ) {
+        let previous_audio = settings.audio;
         let mut changed = false;
         match slider {
             ActiveSettingsSlider::Master => {
@@ -332,9 +320,7 @@ impl HeadfulApp {
             }
         }
         if changed {
-            self.player_settings = settings.clone();
-            self.apply_audio_settings();
-            self.mark_settings_dirty();
+            self.settings_changed(settings, previous_audio);
         }
     }
 
@@ -359,22 +345,16 @@ impl HeadfulApp {
                     self.debug_hud.toggle();
                 }
                 headful_input::HeadfulInputCommand::ToggleMusic => {
-                    self.toggle_music_enabled();
+                    self.toggle_music_enabled(runner.state_mut());
                 }
                 headful_input::HeadfulInputCommand::Ui(action) => {
                     self.handle_ui_action(runner, action);
                 }
                 headful_input::HeadfulInputCommand::PlayClick => {
-                    self.play_click_sfx();
+                    self.play_click_sfx(runner.state());
                 }
                 headful_input::HeadfulInputCommand::ApplyAction(action) => {
-                    apply_action(
-                        runner,
-                        self.sfx.as_ref(),
-                        self.player_settings.audio,
-                        &mut self.debug_hud,
-                        action,
-                    );
+                    apply_action(runner, self.sfx.as_ref(), &mut self.debug_hud, action);
                 }
             }
         }
@@ -414,7 +394,7 @@ impl HeadfulApp {
                 if view == GameView::SkillTree && state.skilltree.editor.enabled {
                     if state.skilltree.editor.search_open {
                         state.skilltree.editor_close_search();
-                        self.play_click_sfx();
+                        self.play_click_sfx(state);
                         return true;
                     }
                     state.skilltree.editor_toggle();
@@ -444,7 +424,6 @@ impl HeadfulApp {
                 apply_action(
                     state,
                     self.sfx.as_ref(),
-                    self.player_settings.audio,
                     &mut self.debug_hud,
                     InputAction::Hold,
                 );
@@ -456,28 +435,30 @@ impl HeadfulApp {
                 state.state_mut().skilltree.editor_set_tool(tool);
             }
             GameUiAction::OpenSettings
-                if view.can_open_settings() && state.state().settings_overlay.is_none() =>
+                if view.can_open_settings() && !state.state().settings.open =>
             {
-                state.state_mut().settings_overlay = Some(self.player_settings.clone());
+                state.state_mut().settings.open = true;
                 self.active_settings_slider = None;
             }
-            GameUiAction::CloseSettings if state.state().settings_overlay.is_some() => {
-                state.state_mut().settings_overlay = None;
+            GameUiAction::CloseSettings if state.state().settings.open => {
+                state.state_mut().settings.open = false;
                 self.active_settings_slider = None;
-                self.save_settings_if_dirty();
+                self.save_settings_if_dirty(&state.state().settings.values);
             }
             settings_action => {
                 return self.apply_settings_action(state.state_mut(), settings_action);
             }
         }
-        self.play_click_sfx();
+        self.play_click_sfx(state.state());
         true
     }
 
     fn apply_settings_action(&mut self, state: &mut GameState, action: GameUiAction) -> bool {
-        let Some(settings) = state.settings_overlay.as_mut() else {
+        if !state.settings.open {
             return false;
-        };
+        }
+        let settings = &mut state.settings.values;
+        let previous_audio = settings.audio;
         match action {
             GameUiAction::ResetSettings => *settings = PlayerSettings::default(),
             GameUiAction::ToggleMute => settings.audio.mute_all = !settings.audio.mute_all,
@@ -499,14 +480,9 @@ impl HeadfulApp {
             }
             _ => return false,
         }
-        let audio_changed = settings.audio != self.player_settings.audio;
-        self.player_settings = settings.clone();
-        if audio_changed {
-            self.apply_audio_settings();
-        }
-        self.mark_settings_dirty();
-        self.save_settings_if_dirty();
-        self.play_click_sfx();
+        self.settings_changed(settings, previous_audio);
+        self.save_settings_if_dirty(settings);
+        self.play_click_sfx(state);
         true
     }
 
@@ -585,13 +561,7 @@ impl HeadfulApp {
             |action| immediate_actions.push(action),
         );
         for action in immediate_actions {
-            apply_action(
-                runner,
-                self.sfx.as_ref(),
-                self.player_settings.audio,
-                &mut self.debug_hud,
-                action,
-            );
+            apply_action(runner, self.sfx.as_ref(), &mut self.debug_hud, action);
         }
     }
 
@@ -655,7 +625,9 @@ impl GameApp for HeadfulApp {
             .dig_camera
             .reset(state.tetris.background_depth_rows());
         state.round_timer_disabled = self.debug_hud.round_timer_disabled();
-        self.update_display_preferences(state);
+        state.settings.values = self.settings_store.load();
+        state.sync_display_preferences();
+        self.apply_audio_settings(state.settings.values.audio);
         runner
     }
 
@@ -666,9 +638,6 @@ impl GameApp for HeadfulApp {
         dt: Duration,
         ctx: &mut AppContext,
     ) {
-        if let Some(settings) = state.state_mut().settings_overlay.as_mut() {
-            settings.audio.master_volume = self.player_settings.audio.master_volume;
-        }
         let now = Instant::now();
 
         if let Some((mx, my)) = input.mouse_pos {
@@ -680,7 +649,12 @@ impl GameApp for HeadfulApp {
             self.skilltree_cam_input.left_down = false;
             self.skilltree_cam_input.drag_started = false;
             self.skilltree_cam_input.drag_started_in_view = false;
-            if self.player_settings.gameplay.auto_pause_on_focus_loss
+            if state
+                .state()
+                .settings
+                .values
+                .gameplay
+                .auto_pause_on_focus_loss
                 && matches!(state.state().view, GameView::Tetris { paused: false })
             {
                 let state = state.state_mut();
@@ -711,10 +685,13 @@ impl GameApp for HeadfulApp {
             } else if let Some(settings) = layout.settings {
                 self.active_settings_slider =
                     Self::settings_slider_from_pointer(settings, self.mouse_x, self.mouse_y);
-                if let Some(slider) = self.active_settings_slider
-                    && let Some(values) = state.state_mut().settings_overlay.as_mut()
-                {
-                    self.apply_settings_slider_x(values, settings, slider, self.mouse_x);
+                if let Some(slider) = self.active_settings_slider {
+                    self.apply_settings_slider_x(
+                        &mut state.state_mut().settings.values,
+                        settings,
+                        slider,
+                        self.mouse_x,
+                    );
                 }
             } else if state.state().view == GameView::SkillTree {
                 self.skilltree_cam_input.left_down = true;
@@ -731,11 +708,13 @@ impl GameApp for HeadfulApp {
         }
 
         if let Some(settings) = layout.settings {
-            if left_mouse_down
-                && let Some(slider) = self.active_settings_slider
-                && let Some(values) = state.state_mut().settings_overlay.as_mut()
-            {
-                self.apply_settings_slider_x(values, settings, slider, self.mouse_x);
+            if left_mouse_down && let Some(slider) = self.active_settings_slider {
+                self.apply_settings_slider_x(
+                    &mut state.state_mut().settings.values,
+                    settings,
+                    slider,
+                    self.mouse_x,
+                );
             }
         } else {
             self.update_skilltree_drag_from_frame(state, left_mouse_down);
@@ -752,13 +731,7 @@ impl GameApp for HeadfulApp {
         let view = state.state().view;
         if view.is_tetris_playing() {
             if let Some(action) = self.horizontal_repeat.next_repeat_action(now) {
-                apply_action(
-                    state,
-                    self.sfx.as_ref(),
-                    self.player_settings.audio,
-                    &mut self.debug_hud,
-                    action,
-                );
+                apply_action(state, self.sfx.as_ref(), &mut self.debug_hud, action);
             }
         }
 
@@ -775,7 +748,7 @@ impl GameApp for HeadfulApp {
             let handled = layout
                 .action_at(state.state(), pointer)
                 .is_some_and(|action| self.handle_ui_action(state, action));
-            if !handled && state.state().settings_overlay.is_none() {
+            if !handled && !state.state().settings.open {
                 let commands = headful_input::handle_skilltree_world_click(
                     state,
                     self.skilltree_layout,
@@ -786,8 +759,8 @@ impl GameApp for HeadfulApp {
                 self.apply_input_commands(state, commands);
             }
         }
-        if left_mouse_released && state.state().settings_overlay.is_some() {
-            self.save_settings_if_dirty();
+        if left_mouse_released && state.state().settings.open {
+            self.save_settings_if_dirty(&state.state().settings.values);
         }
 
         if left_mouse_released {
@@ -821,7 +794,7 @@ impl GameApp for HeadfulApp {
         let state = state.state_mut();
         update_dig_camera(state, dt);
         state.display.viewport = size;
-        self.update_display_preferences(state);
+        state.sync_display_preferences();
         state.input = Some(RecordedInput::from_frame(input));
     }
 
@@ -840,19 +813,20 @@ impl GameApp for HeadfulApp {
         self.debug_hud.on_frame(timings);
     }
 
-    fn master_volume(&self) -> Option<u8> {
-        Some((self.player_settings.audio.master_volume * 100.0).round() as u8)
+    fn master_volume(&self, state: &Self::State) -> Option<u8> {
+        Some((state.state().settings.values.audio.master_volume * 100.0).round() as u8)
     }
 
-    fn set_master_volume(&mut self, percent: u8, commit: bool) {
+    fn set_master_volume(&mut self, state: &mut Self::State, percent: u8, commit: bool) {
+        let settings = &mut state.state_mut().settings.values;
+        let previous_audio = settings.audio;
         let volume = f32::from(percent.min(100)) / 100.0;
-        if self.player_settings.audio.master_volume != volume {
-            self.player_settings.audio.master_volume = volume;
-            self.apply_audio_settings();
-            self.mark_settings_dirty();
+        if settings.audio.master_volume != volume {
+            settings.audio.master_volume = volume;
+            self.settings_changed(settings, previous_audio);
         }
         if commit {
-            self.save_settings_if_dirty();
+            self.save_settings_if_dirty(settings);
         }
     }
 
@@ -860,8 +834,8 @@ impl GameApp for HeadfulApp {
         self.exit_requested
     }
 
-    fn shutdown(&mut self) {
-        self.save_settings_if_dirty();
+    fn shutdown(&mut self, state: &Self::State) {
+        self.save_settings_if_dirty(&state.state().settings.values);
     }
 
     fn handle_event(
@@ -894,10 +868,6 @@ impl GameApp for HeadfulApp {
                     return true;
                 }
                 self.next_redraw = now + self.frame_interval;
-            }
-            Event::LoopDestroyed => {
-                self.shutdown();
-                return true;
             }
             _ => {}
         }
@@ -940,6 +910,9 @@ impl TimelineGame for HeadfulApp {
 
     fn restore_state(&mut self, mut snapshot: Self::Snapshot) -> Self::State {
         snapshot.skilltree.restore_definition_path();
+        snapshot.restore_legacy_display_preferences();
+        self.apply_audio_settings(snapshot.settings.values.audio);
+        self.settings_dirty = false;
         let logic = logic_for_run(&self.base_logic, snapshot.skilltree.run_mods());
         self.debug_hud
             .set_round_timer_disabled(snapshot.round_timer_disabled);
@@ -951,24 +924,6 @@ impl TimelineGame for HeadfulApp {
         self.mouse_release_was_drag = false;
         self.consume_next_mouse_up = false;
         runner
-    }
-
-    fn timeline_command(&self, input: &InputFrame) -> Option<TimelineCommand> {
-        use VirtualKeyCode::{F5, F6, F7, F8, LAlt, Left, P, RAlt, Right, Space};
-
-        let option_held = input.keys_down.contains(&LAlt) || input.keys_down.contains(&RAlt);
-        [
-            (F5, P, TimelineCommand::TogglePause),
-            (F6, Left, TimelineCommand::Rewind),
-            (F7, Right, TimelineCommand::Forward),
-            (F8, Space, TimelineCommand::TogglePlayback),
-        ]
-        .into_iter()
-        .find_map(|(function_key, alternate, command)| {
-            (input.keys_pressed.contains(&function_key)
-                || (option_held && input.keys_pressed.contains(&alternate)))
-            .then_some(command)
-        })
     }
 }
 
@@ -1066,6 +1021,7 @@ fn reset_run(
         state.skilltree = skilltree;
         state.view = view;
         state.display = runner.state().display;
+        state.settings = runner.state().settings.clone();
         state
             .display
             .dig_camera
@@ -1132,16 +1088,11 @@ Usage:
 Flags:
   --timeline DIR    Select a timeline (default: target/timelines/headful).
   --fresh           Start a separate timeline. With --timeline, DIR must be new.
-  --playback        Open a saved timeline paused at its first snapshot.
+  --playback        Play a saved timeline from its first snapshot.
   --no-recording    Run standalone without opening a timeline.
   --profile         Profile the standalone game and write a trace to target/perf_traces/.
   --export-video PATH
                     Render a saved timeline to MP4 without opening a window.
-  Option+P (F5)     Pause live play or explicitly resume it from the cursor.
-  Option+Left (F6)  Step backward one snapshot.
-  Option+Right (F7) Step forward one snapshot.
-  Option+Space (F8) Play / pause the recorded timeline. Playback stops at the end.
-  Use Alt in place of Option on other keyboards.
   --help, -h        Show this help.
 "#
     );
@@ -1435,7 +1386,6 @@ fn should_play_action_sfx(action: InputAction) -> bool {
 fn apply_action(
     runner: &mut HeadlessRunner<TetrisLogic>,
     sfx: Option<&Sfx>,
-    audio: AudioSettings,
     debug_hud: &mut DebugHud,
     action: InputAction,
 ) {
@@ -1444,6 +1394,7 @@ fn apply_action(
     runner.step(action);
 
     if let Some(sfx) = sfx {
+        let audio = runner.state().settings.values.audio;
         if should_play_action_sfx(action) {
             sfx.play_click(ACTION_SFX_VOLUME * audio.effective_sfx_gain());
         }

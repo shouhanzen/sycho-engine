@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::error::Error;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -86,11 +88,17 @@ impl Gesture {
     }
 }
 
+enum GameKeyRoute {
+    Gameplay,
+    Timeline,
+}
+
 #[derive(Default)]
 struct Interaction {
     cursor: Option<Point>,
     preview_focus: bool,
     preview_buttons: Vec<MouseButton>,
+    preview_keys: HashMap<VirtualKeyCode, GameKeyRoute>,
     gesture: Option<Gesture>,
     drag_ms: Option<u64>,
     pending_seek: Option<u64>,
@@ -165,6 +173,7 @@ impl Interaction {
             self.drag_ms = None;
         }
         self.preview_buttons.clear();
+        self.preview_keys.clear();
         if generation.is_some() {
             bridge.send(EditorEvent::Focus(window_focused));
         }
@@ -345,6 +354,7 @@ impl Interaction {
         if self.preview_focus != focused {
             self.preview_focus = focused;
             self.preview_buttons.clear();
+            self.preview_keys.clear();
             if !focused {
                 bridge.send(EditorEvent::ReleaseInput);
             }
@@ -533,16 +543,38 @@ impl Interaction {
                 }
             }
         } else if self.preview_focus {
-            bridge.send(EditorEvent::Key(key, state));
-        } else if state == ElementState::Pressed && self.modifiers.alt() {
-            let command = match key {
-                VirtualKeyCode::P => TimelineCommand::TogglePause,
-                VirtualKeyCode::Left => TimelineCommand::Rewind,
-                VirtualKeyCode::Right => TimelineCommand::Forward,
-                VirtualKeyCode::Space => TimelineCommand::TogglePlayback,
-                _ => return,
-            };
-            bridge.send(EditorEvent::Timeline(command));
+            self.game_key(bridge, key, state);
+        }
+    }
+
+    fn game_key(&mut self, bridge: &Bridge, key: VirtualKeyCode, state: ElementState) {
+        use VirtualKeyCode::{F5, F6, F7, F8, Left, P, Right, Space};
+
+        match state {
+            ElementState::Pressed => {
+                let Entry::Vacant(held) = self.preview_keys.entry(key) else {
+                    return;
+                };
+                let command = match (key, self.modifiers.alt()) {
+                    (F5, _) | (P, true) => Some(TimelineCommand::TogglePause),
+                    (F6, _) | (Left, true) => Some(TimelineCommand::Rewind),
+                    (F7, _) | (Right, true) => Some(TimelineCommand::Forward),
+                    (F8, _) | (Space, true) => Some(TimelineCommand::TogglePlayback),
+                    _ => None,
+                };
+                if let Some(command) = command {
+                    held.insert(GameKeyRoute::Timeline);
+                    bridge.send(EditorEvent::Timeline(command));
+                } else {
+                    held.insert(GameKeyRoute::Gameplay);
+                    bridge.send(EditorEvent::Key(key, state));
+                }
+            }
+            ElementState::Released => {
+                if matches!(self.preview_keys.remove(&key), Some(GameKeyRoute::Gameplay)) {
+                    bridge.send(EditorEvent::Key(key, state));
+                }
+            }
         }
     }
 
@@ -847,6 +879,7 @@ pub fn run(bridge: Bridge, game_name: &str, ready: impl FnOnce()) -> Result<(), 
                         if !focused {
                             input.commit_volume(&bridge);
                             input.preview_buttons.clear();
+                            input.preview_keys.clear();
                             input.modifiers = ModifiersState::empty();
                             input.gesture = None;
                             input.drag_ms = None;
@@ -939,6 +972,60 @@ mod tests {
             arrival: None,
         };
         (bridge, events, snapshot)
+    }
+
+    #[test]
+    fn game_panel_translates_timeline_shortcuts_once_per_key_press() {
+        use VirtualKeyCode::{F5, F6, F7, F8, Left, P, Right, Space};
+
+        let (bridge, events, _) = fixture();
+        let mut board = Board::default();
+        let display = Display {
+            surface: SurfaceSize::new(1000, 700),
+            dpi: 1.0,
+        };
+        let mut input = Interaction {
+            modifiers: ModifiersState::ALT,
+            ..Interaction::default()
+        };
+
+        input.key(&bridge, &mut board, display, P, ElementState::Pressed);
+        assert!(events.try_recv().is_err());
+        input.set_preview_focus(&bridge, true);
+        for (key, alt, command) in [
+            (F5, false, TimelineCommand::TogglePause),
+            (F6, false, TimelineCommand::Rewind),
+            (F7, false, TimelineCommand::Forward),
+            (F8, false, TimelineCommand::TogglePlayback),
+            (P, true, TimelineCommand::TogglePause),
+            (Left, true, TimelineCommand::Rewind),
+            (Right, true, TimelineCommand::Forward),
+            (Space, true, TimelineCommand::TogglePlayback),
+        ] {
+            input.modifiers.set(ModifiersState::ALT, alt);
+            input.key(&bridge, &mut board, display, key, ElementState::Pressed);
+            input.key(&bridge, &mut board, display, key, ElementState::Pressed);
+            input.modifiers = ModifiersState::empty();
+            input.key(&bridge, &mut board, display, key, ElementState::Released);
+            assert!(matches!(
+                events.try_recv().unwrap(), EditorEvent::Timeline(sent) if sent == command
+            ));
+            assert!(events.try_recv().is_err());
+        }
+
+        input.key(&bridge, &mut board, display, Left, ElementState::Pressed);
+        input.modifiers = ModifiersState::ALT;
+        input.key(&bridge, &mut board, display, Left, ElementState::Pressed);
+        input.key(&bridge, &mut board, display, Left, ElementState::Released);
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            EditorEvent::Key(Left, ElementState::Pressed)
+        ));
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            EditorEvent::Key(Left, ElementState::Released)
+        ));
+        assert!(events.try_recv().is_err());
     }
 
     #[test]

@@ -81,54 +81,38 @@ fn input_frame_for_keys(
 }
 
 #[test]
-fn header_master_volume_applies_to_music_and_sound_effects() {
-    let (mut app, _) = make_test_headful(GameView::MainMenu);
-    app.player_settings.audio = AudioSettings::default();
-    app.player_settings.audio.music_volume = 0.5;
-    app.player_settings.audio.sfx_volume = 0.75;
+fn header_master_volume_is_restored_from_game_state() {
+    let (mut app, mut runner) = make_test_headful(GameView::MainMenu);
+    runner.state_mut().settings.values.audio.music_volume = 0.5;
+    runner.state_mut().settings.values.audio.sfx_volume = 0.75;
 
-    app.set_master_volume(0, false);
-    assert_eq!(app.master_volume(), Some(0));
-    assert_eq!(app.player_settings.audio.effective_music_gain(), 0.0);
-    assert_eq!(app.player_settings.audio.effective_sfx_gain(), 0.0);
+    app.set_master_volume(&mut runner, 0, false);
+    assert_eq!(app.master_volume(&runner), Some(0));
+    assert_eq!(
+        runner.state().settings.values.audio.effective_music_gain(),
+        0.0
+    );
+    assert_eq!(
+        runner.state().settings.values.audio.effective_sfx_gain(),
+        0.0
+    );
+    let quiet = runner.state().clone();
 
-    app.set_master_volume(40, false);
-    assert_eq!(app.master_volume(), Some(40));
-    assert_approx_eq(app.player_settings.audio.effective_music_gain(), 0.2);
-    assert_approx_eq(app.player_settings.audio.effective_sfx_gain(), 0.3);
+    app.set_master_volume(&mut runner, 40, false);
+    assert_eq!(app.master_volume(&runner), Some(40));
+    assert_approx_eq(
+        runner.state().settings.values.audio.effective_music_gain(),
+        0.2,
+    );
+    assert_approx_eq(
+        runner.state().settings.values.audio.effective_sfx_gain(),
+        0.3,
+    );
     assert!(app.settings_dirty);
-}
 
-#[test]
-fn timeline_chords_use_either_option_key_and_keep_function_key_bindings() {
-    use VirtualKeyCode::{F5, F6, F7, F8, LAlt, Left, P, RAlt, Right, Space};
-
-    let (app, _) = make_test_headful(GameView::MainMenu);
-    for (function_key, alternate, command) in [
-        (F5, P, TimelineCommand::TogglePause),
-        (F6, Left, TimelineCommand::Rewind),
-        (F7, Right, TimelineCommand::Forward),
-        (F8, Space, TimelineCommand::TogglePlayback),
-    ] {
-        assert_eq!(
-            app.timeline_command(&input_frame_for_keys(&[function_key], &[function_key], &[])),
-            Some(command)
-        );
-        for option in [LAlt, RAlt] {
-            assert_eq!(
-                app.timeline_command(&input_frame_for_keys(
-                    &[alternate],
-                    &[option, alternate],
-                    &[]
-                )),
-                Some(command)
-            );
-        }
-        assert_eq!(
-            app.timeline_command(&input_frame_for_keys(&[alternate], &[alternate], &[])),
-            None
-        );
-    }
+    let restored = app.restore_state(quiet);
+    assert_eq!(app.master_volume(&restored), Some(0));
+    assert!(!app.settings_dirty);
 }
 
 #[test]
@@ -623,14 +607,13 @@ fn restored_settings_keeps_its_values_and_can_be_closed_with_the_mouse() {
     let (mut app, mut runner) = make_test_headful(GameView::MainMenu);
     let size = runner.state().display.viewport;
     let mut ctx = AppContext { surface_size: size };
-    app.player_settings.gameplay.show_round_timer = true;
     app.process_keyboard_frame(
         &mut runner,
         &input_frame_for_keys(&[VirtualKeyCode::O], &[VirtualKeyCode::O], &[]),
         Instant::now(),
     );
-    let overlay = runner.state_mut().settings_overlay.as_mut().unwrap();
-    overlay.gameplay.show_round_timer = false;
+    assert!(runner.state().settings.open);
+    runner.state_mut().settings.values.gameplay.show_round_timer = false;
     let saved = serde_json::to_vec(runner.state()).unwrap();
     let mut restored = app.restore_state(serde_json::from_slice(&saved).unwrap());
 
@@ -656,7 +639,7 @@ fn restored_settings_keeps_its_values_and_can_be_closed_with_the_mouse() {
         ..InputFrame::default()
     };
     app.update_state(&mut restored, &click, Duration::ZERO, &mut ctx);
-    assert!(restored.state().settings_overlay.is_none());
-    assert!(restored.state().display.show_round_timer);
+    assert!(!restored.state().settings.open);
+    assert!(!restored.state().display.show_round_timer);
     assert_eq!(restored.state().view, GameView::MainMenu);
 }

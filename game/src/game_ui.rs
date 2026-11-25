@@ -63,9 +63,9 @@ impl GameUiLayout {
                 SkillTreeLayout::default()
             },
             settings: state
-                .settings_overlay
-                .as_ref()
-                .map(|_| SettingsMenuLayout::compute(width, height)),
+                .settings
+                .open
+                .then(|| SettingsMenuLayout::compute(width, height)),
             menu,
         }
     }
