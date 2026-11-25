@@ -27,14 +27,20 @@ fn tetris_timeline_can_be_loaded_as_a_test_fixture() {
     let logic = TetrisLogic::new(123, vec![Piece::T]);
     let mut runner = HeadlessRunner::new(logic.clone());
 
-    runner.step(InputAction::MoveLeft);
-    runner.step(InputAction::RotateCw);
-    runner.step(InputAction::MoveRight);
-
     let out = unique_temp_timeline_path();
     let (mut timeline, _) = Timeline::open::<GameState>(&out, TIMELINE_SCHEMA).unwrap();
-    for (i, state) in runner.history().iter().enumerate() {
-        timeline.capture_at(state, i as u64 * 200).unwrap();
+    timeline.capture_at(runner.state(), 0).unwrap();
+    let mut expected = vec![serde_json::to_value(runner.state()).unwrap()];
+    for input in [
+        InputAction::MoveLeft,
+        InputAction::RotateCw,
+        InputAction::MoveRight,
+    ] {
+        let frame = runner.step(input);
+        timeline
+            .capture_at(runner.state(), frame as u64 * 200)
+            .unwrap();
+        expected.push(serde_json::to_value(runner.state()).unwrap());
     }
     drop(timeline);
 
@@ -43,13 +49,11 @@ fn tetris_timeline_can_be_loaded_as_a_test_fixture() {
         .snapshots::<GameState>()
         .collect::<std::io::Result<Vec<_>>>()
         .unwrap();
-    assert_eq!(snapshots.len(), runner.history().len());
-    for (snapshot, original) in snapshots.iter().zip(runner.history()) {
-        assert_eq!(
-            serde_json::to_value(&snapshot.state).unwrap(),
-            serde_json::to_value(original).unwrap()
-        );
-    }
+    let actual: Vec<_> = snapshots
+        .iter()
+        .map(|snapshot| serde_json::to_value(&snapshot.state).unwrap())
+        .collect();
+    assert_eq!(actual, expected);
 
     let fixture = reader.load::<GameState>(2).unwrap();
     let mut restored = HeadlessRunner::from_state(logic, fixture.state);

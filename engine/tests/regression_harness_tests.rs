@@ -6,10 +6,9 @@ use std::{
 
 use engine::{
     GameLogic,
-    graphics::CpuRenderer,
+    graphics::{CpuRenderer, Renderer2d},
     recording::{Mp4Config, Mp4Recorder},
     regression::{VideoCaptureConfig, record_state_and_video_then_replay_and_compare},
-    render::{CELL_SIZE, draw_board},
     surface::SurfaceSize,
 };
 
@@ -21,33 +20,18 @@ fn unique_temp_dir() -> PathBuf {
     std::env::temp_dir().join(format!("rollout_engine_regression_harness_{nanos}"))
 }
 
-#[derive(Debug, Clone)]
-struct GridGame {
-    width: usize,
-    height: usize,
-}
+struct Counter;
 
-#[derive(Debug, Clone, Copy)]
-struct SetCell {
-    x: usize,
-    y: usize,
-    v: u8,
-}
-
-impl GameLogic for GridGame {
-    type State = Vec<Vec<u8>>;
-    type Input = SetCell;
+impl GameLogic for Counter {
+    type State = u8;
+    type Input = u8;
 
     fn initial_state(&self) -> Self::State {
-        vec![vec![0u8; self.width]; self.height]
+        0
     }
 
-    fn step(&self, state: &Self::State, input: Self::Input) -> Self::State {
-        let mut next = state.clone();
-        if input.y < next.len() && input.x < next[input.y].len() {
-            next[input.y][input.x] = input.v;
-        }
-        next
+    fn step(&self, state: &mut Self::State, input: Self::Input) {
+        *state += input;
     }
 }
 
@@ -63,14 +47,7 @@ fn engine_regression_harness_record_replay_video_roundtrips() {
         return;
     }
 
-    let game = GridGame {
-        width: 4,
-        height: 4,
-    };
-
-    // Render the board into a tightly sized buffer (no extra padding needed for this test).
-    let width = game.width as u32 * CELL_SIZE;
-    let height = game.height as u32 * CELL_SIZE;
+    let (width, height) = (96, 96);
     let video = VideoCaptureConfig {
         mp4: Mp4Config {
             width,
@@ -81,22 +58,15 @@ fn engine_regression_harness_record_replay_video_roundtrips() {
     };
 
     let out_dir = unique_temp_dir();
-    let inputs = [
-        SetCell { x: 0, y: 0, v: 1 },
-        SetCell { x: 1, y: 0, v: 2 },
-        SetCell { x: 2, y: 1, v: 3 },
-        SetCell { x: 3, y: 2, v: 4 },
-    ];
-
     let artifacts = record_state_and_video_then_replay_and_compare(
         "engine_regression_harness_record_replay_video_roundtrips",
         &out_dir,
-        game,
-        inputs,
+        Counter,
+        [20, 30, 40, 50],
         video,
-        |state: &Vec<Vec<u8>>, buf: &mut [u8], width: u32, height: u32| {
+        |state: &u8, buf: &mut [u8], width: u32, height: u32| {
             let mut gfx = CpuRenderer::new(buf, SurfaceSize::new(width, height));
-            draw_board(&mut gfx, state);
+            gfx.clear([*state, 0, 0, 255]);
         },
     )
     .expect("regression harness should complete");

@@ -1,39 +1,26 @@
 use std::time::{Duration, Instant};
 use std::{io, path::Path};
 
-use engine::graphics::Renderer2d;
+use engine::embedded::valid_preview_size;
+use engine::graphics::{FittedRenderer, Renderer2d};
 use engine::recording::{Mp4Config, export_timeline};
+use engine::surface::SurfaceSize;
 use engine::timeline::TimelineReader;
-use engine::ui_tree::UiTree;
 
 use crate::debug::DebugHud;
-use crate::settings::PlayerSettings;
+use crate::game_ui::{GameUiLayout, Menu};
 use crate::state::{GameState, TIMELINE_SCHEMA};
 use crate::tetris_ui::{
-    GameOverMenuLayout, MainMenuLayout, PauseMenuLayout, Rect, SettingsMenuLayout, SkillTreeLayout,
-    UiLayout, draw_game_over_menu_with_ui, draw_main_menu_with_ui, draw_pause_menu_with_ui,
-    draw_settings_menu_with_ui, draw_skilltree_runtime_with_ui_and_mouse, draw_tetris_hud_view,
-    draw_tetris_world_with_camera_offset,
+    GameOverMenuView, MainMenuView, PauseMenuView, Rect, SettingsMenuView,
+    draw_skilltree_in_layout, draw_tetris_hud_view, draw_tetris_world_in_layout,
 };
-use crate::ui_ids::UI_CANVAS;
 use crate::view::GameView;
 
-#[derive(Clone, Copy, Default)]
-pub struct RenderCache {
-    pub last_layout: UiLayout,
-    pub last_main_menu: MainMenuLayout,
-    pub last_pause_menu: PauseMenuLayout,
-    pub last_skilltree: SkillTreeLayout,
-    pub last_game_over_menu: GameOverMenuLayout,
-    pub last_settings_menu: SettingsMenuLayout,
-}
-
 pub struct RenderInputs {
-    pub mouse: (u32, u32),
     pub world_offset_y_px: i32,
     pub frame_dt: Duration,
-    pub settings_overlay: Option<PlayerSettings>,
     pub show_round_timer: bool,
+    pub historical: bool,
 }
 
 pub struct DrawTimings {
@@ -59,26 +46,21 @@ impl DrawTimings {
 
 pub fn export_video(directory: &Path, output: &Path) -> io::Result<()> {
     let timeline = TimelineReader::open(directory, TIMELINE_SCHEMA)?;
-    let mut ui_tree = UiTree::new();
     let mut debug_hud = DebugHud::new();
-    let mut cache = RenderCache::default();
     let config = Mp4Config {
         width: 1280,
         height: 720,
-        fps: 30,
+        fps: 60,
     };
     export_timeline(&timeline, output, config, |state, renderer| {
         render_frame(
             renderer,
-            &mut ui_tree,
             &debug_hud,
             state,
-            &mut cache,
             RenderInputs {
-                mouse: (u32::MAX, u32::MAX),
                 world_offset_y_px: 0,
                 frame_dt: Duration::ZERO,
-                settings_overlay: None,
+                historical: true,
                 show_round_timer: true,
             },
         )
@@ -88,10 +70,31 @@ pub fn export_video(directory: &Path, output: &Path) -> io::Result<()> {
 
 pub fn render_frame(
     renderer: &mut dyn Renderer2d,
-    ui_tree: &mut UiTree,
     debug_hud: &DebugHud,
     state: &GameState,
-    cache: &mut RenderCache,
+    inputs: RenderInputs,
+) -> DrawTimings {
+    if inputs.historical
+        && let Some(input) = &state.input
+    {
+        let viewport = SurfaceSize::new(input.viewport.0, input.viewport.1);
+        if viewport != renderer.size() && valid_preview_size(viewport) {
+            renderer.clear([0, 0, 0, 255]);
+            return draw_frame(
+                &mut FittedRenderer::new(renderer, viewport),
+                debug_hud,
+                state,
+                inputs,
+            );
+        }
+    }
+    draw_frame(renderer, debug_hud, state, inputs)
+}
+
+fn draw_frame(
+    renderer: &mut dyn Renderer2d,
+    debug_hud: &DebugHud,
+    state: &GameState,
     inputs: RenderInputs,
 ) -> DrawTimings {
     let frame_start = Instant::now();
@@ -100,19 +103,22 @@ pub fn render_frame(
     let board_dt = board_start.elapsed();
 
     let size = renderer.size();
-    ui_tree.begin_frame();
-    ui_tree.ensure_canvas(UI_CANVAS, Rect::from_size(size.width, size.height));
-    ui_tree.add_root(UI_CANVAS);
+    let pointer = state
+        .input
+        .as_ref()
+        .and_then(|input| input.pointer_at(size));
+    let settings = state.settings_overlay.as_ref();
+    let layout = GameUiLayout::compute(state, size, settings.is_some());
+    let game_pointer = if settings.is_some() { None } else { pointer };
 
     let draw_start = Instant::now();
-    if matches!(view, GameView::SkillTree | GameView::MainMenu) {
-        cache.last_layout = UiLayout::default();
-    } else {
-        let tetris_layout = draw_tetris_world_with_camera_offset(
+    if let Some(tetris) = layout.tetris {
+        draw_tetris_world_in_layout(
             renderer,
             size.width,
             size.height,
             state.tetris(),
+            tetris,
             inputs.world_offset_y_px,
         );
         if view.is_tetris() {
@@ -121,21 +127,18 @@ pub fn render_frame(
                 size.width,
                 size.height,
                 state.tetris(),
-                tetris_layout,
-                Some(inputs.mouse),
+                tetris,
+                game_pointer,
             );
         }
-        cache.last_layout = tetris_layout;
     }
 
-    if view.is_tetris() && inputs.show_round_timer {
-        let hud_x = cache.last_layout.pause_button.x.saturating_sub(180);
-        let hud_y = cache
-            .last_layout
-            .pause_button
-            .y
-            .saturating_add(6)
-            .saturating_add(28);
+    if let Some(tetris) = layout
+        .tetris
+        .filter(|_| view.is_tetris() && inputs.show_round_timer)
+    {
+        let hud_x = tetris.pause_button.x.saturating_sub(180);
+        let hud_y = tetris.pause_button.y.saturating_add(34);
         let timer_disabled = debug_hud.round_timer_disabled();
         let timer_text = if timer_disabled {
             "TIME OFF".to_string()
@@ -154,60 +157,33 @@ pub fn render_frame(
     let draw_dt = draw_start.elapsed();
 
     let overlay_start = Instant::now();
-    match view {
-        GameView::MainMenu => {
-            cache.last_main_menu =
-                draw_main_menu_with_ui(renderer, size.width, size.height, ui_tree);
-            cache.last_pause_menu = PauseMenuLayout::default();
-            cache.last_skilltree = SkillTreeLayout::default();
-            cache.last_game_over_menu = GameOverMenuLayout::default();
-            cache.last_settings_menu = SettingsMenuLayout::default();
+    match layout.menu {
+        Some(Menu::Main(menu)) => {
+            MainMenuView::draw(renderer, size.width, size.height, menu, game_pointer)
         }
-        GameView::SkillTree => {
-            cache.last_main_menu = MainMenuLayout::default();
-            cache.last_pause_menu = PauseMenuLayout::default();
-            cache.last_skilltree = draw_skilltree_runtime_with_ui_and_mouse(
-                renderer,
-                size.width,
-                size.height,
-                ui_tree,
-                &state.skilltree,
-                Some(inputs.mouse),
-            );
-            cache.last_game_over_menu = GameOverMenuLayout::default();
-            cache.last_settings_menu = SettingsMenuLayout::default();
+        Some(Menu::Pause(menu)) => {
+            PauseMenuView::draw(renderer, size.width, size.height, menu, game_pointer)
         }
-        GameView::Tetris { paused: true } => {
-            cache.last_main_menu = MainMenuLayout::default();
-            cache.last_pause_menu =
-                draw_pause_menu_with_ui(renderer, size.width, size.height, ui_tree);
-            cache.last_skilltree = SkillTreeLayout::default();
-            cache.last_game_over_menu = GameOverMenuLayout::default();
-            cache.last_settings_menu = SettingsMenuLayout::default();
+        Some(Menu::GameOver(menu)) => {
+            GameOverMenuView::draw(renderer, size.width, size.height, menu, game_pointer)
         }
-        GameView::Tetris { paused: false } => {
-            cache.last_main_menu = MainMenuLayout::default();
-            cache.last_pause_menu = PauseMenuLayout::default();
-            cache.last_skilltree = SkillTreeLayout::default();
-            cache.last_game_over_menu = GameOverMenuLayout::default();
-            cache.last_settings_menu = SettingsMenuLayout::default();
-        }
-        GameView::GameOver => {
-            cache.last_main_menu = MainMenuLayout::default();
-            cache.last_pause_menu = PauseMenuLayout::default();
-            cache.last_skilltree = SkillTreeLayout::default();
-            cache.last_game_over_menu =
-                draw_game_over_menu_with_ui(renderer, size.width, size.height, ui_tree);
-            cache.last_settings_menu = SettingsMenuLayout::default();
-        }
+        None if view == GameView::SkillTree => draw_skilltree_in_layout(
+            renderer,
+            size.width,
+            size.height,
+            layout.skilltree,
+            &state.skilltree,
+            game_pointer,
+        ),
+        None => {}
     }
-    if let Some(settings) = &inputs.settings_overlay {
-        cache.last_settings_menu =
-            draw_settings_menu_with_ui(renderer, size.width, size.height, ui_tree, settings);
-    } else {
-        cache.last_settings_menu = SettingsMenuLayout::default();
+    if let Some((settings, menu)) = settings.zip(layout.settings) {
+        SettingsMenuView::draw(renderer, size.width, size.height, menu, settings, pointer);
     }
     debug_hud.draw_overlay(renderer, size.width, size.height);
+    if let Some((x, y)) = pointer.filter(|_| inputs.historical) {
+        draw_recorded_cursor(renderer, x, y);
+    }
     let overlay_dt = overlay_start.elapsed();
 
     DrawTimings {
@@ -216,5 +192,16 @@ pub fn render_frame(
         draw_dt,
         overlay_dt,
         frame_total_dt: frame_start.elapsed(),
+    }
+}
+
+// A small outlined pointer remains visible over both light and dark game scenes.
+fn draw_recorded_cursor(renderer: &mut dyn Renderer2d, x: u32, y: u32) {
+    for (dy, width) in [2, 3, 4, 5, 6, 7, 8, 5, 4, 2].into_iter().enumerate() {
+        let y = y.saturating_add(dy as u32);
+        renderer.fill_rect(Rect::new(x, y, width, 1), [18, 18, 24, 255]);
+        if dy > 0 && dy < 9 && width > 2 {
+            renderer.fill_rect(Rect::new(x + 1, y, width - 2, 1), [245, 245, 255, 255]);
+        }
     }
 }

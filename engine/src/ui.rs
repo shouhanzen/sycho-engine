@@ -143,6 +143,47 @@ pub enum Anchor {
     BottomRight,
 }
 
+/// Clip a screen-space rect to a viewport, returning the visible intersection.
+pub fn clip_rect_to_viewport(rect: Rect, viewport: Rect) -> Option<Rect> {
+    clip_rect_i32_to_viewport(rect.x as i32, rect.y as i32, rect.w, rect.h, viewport)
+}
+
+/// Clip an `i32`-positioned rect to a viewport, returning the visible intersection.
+///
+/// This is useful when world-space content can be temporarily translated outside the
+/// viewport bounds (for example camera impulses) but must still render with fixed
+/// viewport clipping.
+pub fn clip_rect_i32_to_viewport(x: i32, y: i32, w: u32, h: u32, viewport: Rect) -> Option<Rect> {
+    if w == 0 || h == 0 || viewport.w == 0 || viewport.h == 0 {
+        return None;
+    }
+
+    let vx0 = viewport.x.min(i32::MAX as u32) as i32;
+    let vy0 = viewport.y.min(i32::MAX as u32) as i32;
+    let vx1 = viewport.x.saturating_add(viewport.w).min(i32::MAX as u32) as i32;
+    let vy1 = viewport.y.saturating_add(viewport.h).min(i32::MAX as u32) as i32;
+
+    let w_i32 = w.min(i32::MAX as u32) as i32;
+    let h_i32 = h.min(i32::MAX as u32) as i32;
+    let x1 = x.saturating_add(w_i32);
+    let y1 = y.saturating_add(h_i32);
+
+    let clipped_x0 = x.max(vx0);
+    let clipped_y0 = y.max(vy0);
+    let clipped_x1 = x1.min(vx1);
+    let clipped_y1 = y1.min(vy1);
+    if clipped_x1 <= clipped_x0 || clipped_y1 <= clipped_y0 {
+        return None;
+    }
+
+    Some(Rect::new(
+        clipped_x0 as u32,
+        clipped_y0 as u32,
+        (clipped_x1 - clipped_x0) as u32,
+        (clipped_y1 - clipped_y0) as u32,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +214,20 @@ mod tests {
         let parent = Rect::from_size(50, 40);
         let child = parent.place(Size::new(999, 999), Anchor::TopLeft);
         assert_eq!(child, Rect::new(0, 0, 50, 40));
+    }
+
+    #[test]
+    fn clip_rect_to_viewport_returns_intersection() {
+        let rect = Rect::new(12, 20, 40, 30);
+        let viewport = Rect::new(24, 10, 20, 20);
+        let clipped = clip_rect_to_viewport(rect, viewport);
+        assert_eq!(clipped, Some(Rect::new(24, 20, 20, 10)));
+    }
+
+    #[test]
+    fn clip_rect_i32_to_viewport_handles_negative_origin() {
+        let viewport = Rect::new(10, 10, 20, 20);
+        let clipped = clip_rect_i32_to_viewport(-8, 18, 20, 8, viewport);
+        assert_eq!(clipped, Some(Rect::new(10, 18, 2, 8)));
     }
 }

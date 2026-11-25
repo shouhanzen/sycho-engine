@@ -1,7 +1,7 @@
 use engine::HeadlessRunner;
 use engine::graphics::CpuRenderer;
-use engine::render::draw_board;
 use engine::surface::{RgbaBufferSurface, Surface, SurfaceSize};
+use game::board_render::draw_board;
 
 use game::playtest::TetrisLogic;
 use game::tetris_core::Piece;

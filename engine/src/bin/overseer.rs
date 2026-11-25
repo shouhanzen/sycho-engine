@@ -13,7 +13,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use engine::embedded::{ADDRESS_ENV, GPU_PREVIEW_EXIT_CODE};
+use engine::embedded::{ADDRESS_ENV, GPU_PREVIEW_EXIT_CODE, SURFACE_ENV};
 use engine::reload::{MANAGED_ENV, RELOAD_EXIT_CODE, RELOAD_REJECTED, RELOAD_REQUEST};
 use engine::timeline::session_directory;
 use serde::Deserialize;
@@ -121,13 +121,19 @@ fn main() -> io::Result<()> {
     let game_name = options.package.clone();
     let worker_bridge = bridge.clone();
     let worker_stop = stop.clone();
+    let (ready, initialized) = mpsc::channel();
     let worker = thread::spawn(move || {
+        if initialized.recv().is_err() {
+            return;
+        }
         if let Err(err) = supervise(&options, Some(&worker_bridge), &worker_stop) {
             worker_bridge.set_phase(Phase::Failed);
             eprintln!("editor supervision failed: {err}");
         }
     });
-    let result = editor::run(bridge, &game_name);
+    let result = editor::run(bridge, &game_name, move || {
+        let _ = ready.send(());
+    });
     stop.store(true, Ordering::Relaxed);
     worker
         .join()
@@ -428,15 +434,19 @@ impl RunningGame {
     fn launch(
         executable: StagedGame,
         timeline: &Path,
-        address: Option<SocketAddr>,
+        address: Option<(SocketAddr, Option<String>)>,
     ) -> io::Result<Self> {
         let mut command = Command::new(&executable.0);
         command
             .arg("--timeline")
             .arg(timeline)
             .env(MANAGED_ENV, "1");
-        if let Some(address) = address {
+        command.env_remove(SURFACE_ENV);
+        if let Some((address, surface)) = address {
             command.env(ADDRESS_ENV, address.to_string());
+            if let Some(surface) = surface {
+                command.env(SURFACE_ENV, surface);
+            }
         } else {
             command.env_remove(ADDRESS_ENV);
         }

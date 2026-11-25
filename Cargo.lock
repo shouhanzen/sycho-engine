@@ -549,12 +549,18 @@ name = "engine"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "core-foundation",
+ "foreign-types",
  "hex",
+ "mach2",
+ "metal",
+ "objc",
  "pixels",
  "pollster",
  "serde",
  "serde_json",
  "sha2",
+ "wgpu-hal",
  "winit",
 ]
 

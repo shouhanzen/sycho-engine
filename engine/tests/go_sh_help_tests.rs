@@ -8,11 +8,11 @@ fn go_sh_help_mentions_game_launch_modes() {
     let go_sh = fs::read_to_string(&go_sh_path).expect("read go.sh");
 
     assert!(
-        go_sh.contains("--headful"),
+        go_sh.contains("./go.sh --start "),
         "go.sh should document windowed game launches"
     );
     assert!(
-        go_sh.contains("--headless"),
+        go_sh.contains("./go.sh --e2e "),
         "go.sh should document headless playtests"
     );
 }
@@ -56,15 +56,15 @@ fn go_sh_help_mentions_build_cache_knobs_for_worktrees() {
 }
 
 #[test]
-fn go_sh_help_mentions_fast_and_light_test_modes() {
+fn go_sh_help_mentions_workspace_and_light_test_modes() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let go_sh_path = manifest_dir.join("..").join("go.sh");
 
     let go_sh = fs::read_to_string(&go_sh_path).expect("read go.sh");
 
     assert!(
-        go_sh.contains("--test-fast"),
-        "go.sh help should mention --test-fast for engine+game local loops"
+        go_sh.contains("./go.sh --test "),
+        "go.sh help should mention --test for the engine and game workspace"
     );
     assert!(
         go_sh.contains("--test-light"),

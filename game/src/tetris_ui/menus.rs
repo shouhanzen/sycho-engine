@@ -1,11 +1,9 @@
 use engine::graphics::Renderer2d;
-use engine::render::color_for_cell;
 use engine::slider::Slider;
 use engine::ui;
-use engine::ui_tree::UiTree;
 
+use crate::board_render::color_for_cell;
 use crate::settings::PlayerSettings;
-use crate::ui_ids::*;
 
 use super::{
     COLOR_PAUSE_MENU_BG, COLOR_PAUSE_MENU_BORDER, COLOR_PAUSE_MENU_DIM, COLOR_PAUSE_MENU_TEXT,
@@ -26,6 +24,9 @@ pub struct MainMenuLayout {
     pub panel: Rect,
     pub start_button: Rect,
     pub skilltree_editor_button: Rect,
+    title_x: u32,
+    title_y: u32,
+    title_scale: u32,
     pub settings_button: Rect,
     pub quit_button: Rect,
 }
@@ -59,18 +60,19 @@ pub struct PauseMenuView;
 
 impl PauseMenuView {
     pub fn render(frame: &mut dyn Renderer2d, width: u32, height: u32) -> PauseMenuLayout {
-        let mut ui_tree = UiTree::new();
-        ui_tree.ensure_canvas(UI_CANVAS, ui::Rect::from_size(width, height));
-        ui_tree.add_root(UI_CANVAS);
-        Self::render_with_ui(frame, width, height, &mut ui_tree)
+        let layout = PauseMenuLayout::compute(width, height);
+        Self::draw(frame, width, height, layout, None);
+        layout
     }
 
-    pub fn render_with_ui(
+    pub(crate) fn draw(
         frame: &mut dyn Renderer2d,
         width: u32,
         height: u32,
-        ui_tree: &mut UiTree,
-    ) -> PauseMenuLayout {
+        layout: PauseMenuLayout,
+        pointer: Option<(u32, u32)>,
+    ) {
+        let hovered = |rect: Rect| pointer.is_some_and(|(x, y)| rect.contains(x, y));
         // Dim the entire game view.
         blend_rect(
             frame,
@@ -84,30 +86,16 @@ impl PauseMenuView {
             PAUSE_MENU_DIM_ALPHA,
         );
 
-        let margin = 32u32;
+        let PauseMenuLayout {
+            panel,
+            resume_button,
+            end_run_button,
+            settings_button,
+        } = layout;
+        if panel.w == 0 || panel.h == 0 {
+            return;
+        }
         let pad = 18u32;
-
-        // Layout is expressed via the engine UI layout helpers, then converted to our local `Rect`
-        // for hit-testing and drawing.
-        let screen = ui::Rect::from_size(width, height);
-        let safe = screen.inset(ui::Insets::all(margin));
-        if safe.w == 0 || safe.h == 0 {
-            return PauseMenuLayout::default();
-        }
-
-        let panel_size = ui::Size::new(380, 320).clamp_max(safe.size());
-        if panel_size.w == 0 || panel_size.h == 0 {
-            return PauseMenuLayout::default();
-        }
-
-        let panel_ui = safe.place(panel_size, ui::Anchor::Center);
-        let panel = Rect {
-            x: panel_ui.x,
-            y: panel_ui.y,
-            w: panel_ui.w,
-            h: panel_ui.h,
-        };
-
         fill_rect(
             frame,
             width,
@@ -148,6 +136,59 @@ impl PauseMenuView {
             COLOR_PAUSE_MENU_TEXT,
         );
 
+        draw_button(
+            frame,
+            width,
+            height,
+            resume_button,
+            "RESUME",
+            hovered(resume_button),
+        );
+        draw_button(
+            frame,
+            width,
+            height,
+            settings_button,
+            "SETTINGS",
+            hovered(settings_button),
+        );
+        draw_button(
+            frame,
+            width,
+            height,
+            end_run_button,
+            "END RUN",
+            hovered(end_run_button),
+        );
+    }
+}
+
+impl PauseMenuLayout {
+    pub(crate) fn compute(width: u32, height: u32) -> Self {
+        let margin = 32u32;
+        let pad = 18u32;
+
+        // Layout is expressed via the engine UI layout helpers, then converted to our local `Rect`
+        // for hit-testing and drawing.
+        let screen = ui::Rect::from_size(width, height);
+        let safe = screen.inset(ui::Insets::all(margin));
+        if safe.w == 0 || safe.h == 0 {
+            return PauseMenuLayout::default();
+        }
+
+        let panel_size = ui::Size::new(380, 320).clamp_max(safe.size());
+        if panel_size.w == 0 || panel_size.h == 0 {
+            return PauseMenuLayout::default();
+        }
+
+        let panel_ui = safe.place(panel_size, ui::Anchor::Center);
+        let panel = Rect {
+            x: panel_ui.x,
+            y: panel_ui.y,
+            w: panel_ui.w,
+            h: panel_ui.h,
+        };
+
         let content = panel_ui.inset(ui::Insets::all(pad));
         let gap = 12u32;
         let button_size = ui::Size::new(240, 44).clamp_max(content.size());
@@ -175,40 +216,6 @@ impl PauseMenuView {
             h: resume_button.h,
         };
 
-        ui_tree.ensure_container(UI_PAUSE_MENU_CONTAINER, panel);
-        ui_tree.add_child(UI_CANVAS, UI_PAUSE_MENU_CONTAINER);
-        ui_tree.ensure_button(UI_PAUSE_RESUME, resume_button, Some(ACTION_PAUSE_RESUME));
-        ui_tree.add_child(UI_PAUSE_MENU_CONTAINER, UI_PAUSE_RESUME);
-        ui_tree.ensure_button(UI_PAUSE_END_RUN, end_run_button, Some(ACTION_PAUSE_END_RUN));
-        ui_tree.add_child(UI_PAUSE_MENU_CONTAINER, UI_PAUSE_END_RUN);
-        ui_tree.ensure_button(UI_PAUSE_SETTINGS, settings_button, None);
-        ui_tree.add_child(UI_PAUSE_MENU_CONTAINER, UI_PAUSE_SETTINGS);
-
-        draw_button(
-            frame,
-            width,
-            height,
-            resume_button,
-            "RESUME",
-            ui_tree.is_hovered(UI_PAUSE_RESUME),
-        );
-        draw_button(
-            frame,
-            width,
-            height,
-            settings_button,
-            "SETTINGS",
-            ui_tree.is_hovered(UI_PAUSE_SETTINGS),
-        );
-        draw_button(
-            frame,
-            width,
-            height,
-            end_run_button,
-            "END RUN",
-            ui_tree.is_hovered(UI_PAUSE_END_RUN),
-        );
-
         PauseMenuLayout {
             panel,
             resume_button,
@@ -222,21 +229,60 @@ pub struct MainMenuView;
 
 impl MainMenuView {
     pub fn render(frame: &mut dyn Renderer2d, width: u32, height: u32) -> MainMenuLayout {
-        let mut ui_tree = UiTree::new();
-        ui_tree.ensure_canvas(UI_CANVAS, ui::Rect::from_size(width, height));
-        ui_tree.add_root(UI_CANVAS);
-        Self::render_with_ui(frame, width, height, &mut ui_tree)
+        let layout = MainMenuLayout::compute(width, height);
+        Self::draw(frame, width, height, layout, None);
+        layout
     }
 
-    pub fn render_with_ui(
+    pub(crate) fn draw(
         frame: &mut dyn Renderer2d,
         width: u32,
         height: u32,
-        ui_tree: &mut UiTree,
-    ) -> MainMenuLayout {
+        layout: MainMenuLayout,
+        pointer: Option<(u32, u32)>,
+    ) {
+        let hovered = |rect: Rect| pointer.is_some_and(|(x, y)| rect.contains(x, y));
         // Main menu is its own scene: clear the frame so the Tetris board is not visible underneath.
         fill_rect(frame, width, height, 0, 0, width, height, color_for_cell(0));
 
+        let MainMenuLayout {
+            panel,
+            title_x,
+            title_y,
+            title_scale,
+            start_button,
+            skilltree_editor_button,
+            settings_button,
+            quit_button,
+        } = layout;
+        if panel.w == 0 || panel.h == 0 {
+            return;
+        }
+        draw_text_scaled(
+            frame,
+            width,
+            height,
+            title_x,
+            title_y,
+            MAIN_MENU_TITLE,
+            COLOR_PAUSE_MENU_TEXT,
+            title_scale,
+        );
+
+        for (rect, label) in [
+            (start_button, "START"),
+            (skilltree_editor_button, "SKILLTREE EDITOR"),
+            (settings_button, "SETTINGS"),
+            (quit_button, "QUIT"),
+        ] {
+            let hovered = hovered(rect);
+            draw_button(frame, width, height, rect, label, hovered);
+        }
+    }
+}
+
+impl MainMenuLayout {
+    pub(crate) fn compute(width: u32, height: u32) -> Self {
         let margin = 32u32;
         let pad = 18u32;
 
@@ -253,9 +299,6 @@ impl MainMenuView {
             w: safe.w,
             h: safe.h,
         };
-        ui_tree.ensure_container(UI_SKILLTREE_CONTAINER, panel);
-        ui_tree.add_child(UI_CANVAS, UI_SKILLTREE_CONTAINER);
-
         // Layout: a vertical stack (title, start, skilltree editor, settings, quit), centered.
         let title = MAIN_MENU_TITLE;
         let title_chars = title.chars().count() as u32;
@@ -282,17 +325,6 @@ impl MainMenuView {
             .x
             .saturating_add(content.w.saturating_sub(title_w) / 2);
         let title_y = top_y;
-        draw_text_scaled(
-            frame,
-            width,
-            height,
-            title_x,
-            title_y,
-            title,
-            COLOR_PAUSE_MENU_TEXT,
-            title_scale,
-        );
-
         let buttons_y = title_y
             .saturating_add(title_h)
             .saturating_add(title_button_gap);
@@ -332,41 +364,11 @@ impl MainMenuView {
             h: start_button.h,
         };
 
-        ui_tree.ensure_container(UI_MAIN_MENU_CONTAINER, panel);
-        ui_tree.add_child(UI_CANVAS, UI_MAIN_MENU_CONTAINER);
-        ui_tree.ensure_button(
-            UI_MAIN_MENU_START,
-            start_button,
-            Some(ACTION_MAIN_MENU_START),
-        );
-        ui_tree.add_child(UI_MAIN_MENU_CONTAINER, UI_MAIN_MENU_START);
-        ui_tree.ensure_button(
-            UI_MAIN_MENU_SKILLTREE_EDITOR,
-            skilltree_editor_button,
-            Some(ACTION_MAIN_MENU_SKILLTREE_EDITOR),
-        );
-        ui_tree.add_child(UI_MAIN_MENU_CONTAINER, UI_MAIN_MENU_SKILLTREE_EDITOR);
-        ui_tree.ensure_button(UI_MAIN_MENU_SETTINGS, settings_button, None);
-        ui_tree.add_child(UI_MAIN_MENU_CONTAINER, UI_MAIN_MENU_SETTINGS);
-        ui_tree.ensure_button(UI_MAIN_MENU_QUIT, quit_button, Some(ACTION_MAIN_MENU_QUIT));
-        ui_tree.add_child(UI_MAIN_MENU_CONTAINER, UI_MAIN_MENU_QUIT);
-
-        for (id, rect, label) in [
-            (UI_MAIN_MENU_START, start_button, "START"),
-            (
-                UI_MAIN_MENU_SKILLTREE_EDITOR,
-                skilltree_editor_button,
-                "SKILLTREE EDITOR",
-            ),
-            (UI_MAIN_MENU_SETTINGS, settings_button, "SETTINGS"),
-            (UI_MAIN_MENU_QUIT, quit_button, "QUIT"),
-        ] {
-            let hovered = ui_tree.is_hovered(id);
-            draw_button(frame, width, height, rect, label, hovered);
-        }
-
         MainMenuLayout {
             panel,
+            title_x,
+            title_y,
+            title_scale,
             start_button,
             skilltree_editor_button,
             settings_button,
@@ -379,18 +381,19 @@ pub struct GameOverMenuView;
 
 impl GameOverMenuView {
     pub fn render(frame: &mut dyn Renderer2d, width: u32, height: u32) -> GameOverMenuLayout {
-        let mut ui_tree = UiTree::new();
-        ui_tree.ensure_canvas(UI_CANVAS, ui::Rect::from_size(width, height));
-        ui_tree.add_root(UI_CANVAS);
-        Self::render_with_ui(frame, width, height, &mut ui_tree)
+        let layout = GameOverMenuLayout::compute(width, height);
+        Self::draw(frame, width, height, layout, None);
+        layout
     }
 
-    pub fn render_with_ui(
+    pub(crate) fn draw(
         frame: &mut dyn Renderer2d,
         width: u32,
         height: u32,
-        ui_tree: &mut UiTree,
-    ) -> GameOverMenuLayout {
+        layout: GameOverMenuLayout,
+        pointer: Option<(u32, u32)>,
+    ) {
+        let hovered = |rect: Rect| pointer.is_some_and(|(x, y)| rect.contains(x, y));
         // Dim the entire game view.
         blend_rect(
             frame,
@@ -404,22 +407,16 @@ impl GameOverMenuView {
             PAUSE_MENU_DIM_ALPHA,
         );
 
-        let margin = 32u32;
-        let pad = 18u32;
-
-        let panel_w = 420u32.min(width.saturating_sub(margin.saturating_mul(2)));
-        let panel_h = 280u32.min(height.saturating_sub(margin.saturating_mul(2)));
-        if panel_w == 0 || panel_h == 0 {
-            return GameOverMenuLayout::default();
+        let GameOverMenuLayout {
+            panel,
+            restart_button,
+            skilltree_button,
+            quit_button,
+        } = layout;
+        if panel.w == 0 || panel.h == 0 {
+            return;
         }
-
-        let panel = Rect {
-            x: width.saturating_sub(panel_w) / 2,
-            y: height.saturating_sub(panel_h) / 2,
-            w: panel_w,
-            h: panel_h,
-        };
-
+        let pad = 18u32;
         fill_rect(
             frame,
             width,
@@ -487,6 +484,35 @@ impl GameOverMenuView {
             COLOR_PAUSE_MENU_TEXT,
         );
 
+        for (rect, label) in [
+            (restart_button, "RESTART"),
+            (skilltree_button, "SKILL TREE"),
+            (quit_button, "QUIT"),
+        ] {
+            let hovered = hovered(rect);
+            draw_button(frame, width, height, rect, label, hovered);
+        }
+    }
+}
+
+impl GameOverMenuLayout {
+    pub(crate) fn compute(width: u32, height: u32) -> Self {
+        let margin = 32u32;
+        let pad = 18u32;
+
+        let panel_w = 420u32.min(width.saturating_sub(margin.saturating_mul(2)));
+        let panel_h = 280u32.min(height.saturating_sub(margin.saturating_mul(2)));
+        if panel_w == 0 || panel_h == 0 {
+            return GameOverMenuLayout::default();
+        }
+
+        let panel = Rect {
+            x: width.saturating_sub(panel_w) / 2,
+            y: height.saturating_sub(panel_h) / 2,
+            w: panel_w,
+            h: panel_h,
+        };
+
         let button_h = 44u32.min(panel.h.saturating_sub(pad.saturating_mul(2)));
         let button_w = 240u32.min(panel.w.saturating_sub(pad.saturating_mul(2)));
         let gap = 12u32;
@@ -516,32 +542,6 @@ impl GameOverMenuView {
             h: button_h,
         };
 
-        ui_tree.ensure_container(UI_GAME_OVER_CONTAINER, panel);
-        ui_tree.add_child(UI_CANVAS, UI_GAME_OVER_CONTAINER);
-        ui_tree.ensure_button(
-            UI_GAME_OVER_RESTART,
-            restart_button,
-            Some(ACTION_GAME_OVER_RESTART),
-        );
-        ui_tree.add_child(UI_GAME_OVER_CONTAINER, UI_GAME_OVER_RESTART);
-        ui_tree.ensure_button(
-            UI_GAME_OVER_SKILLTREE,
-            skilltree_button,
-            Some(ACTION_GAME_OVER_SKILLTREE),
-        );
-        ui_tree.add_child(UI_GAME_OVER_CONTAINER, UI_GAME_OVER_SKILLTREE);
-        ui_tree.ensure_button(UI_GAME_OVER_QUIT, quit_button, Some(ACTION_GAME_OVER_QUIT));
-        ui_tree.add_child(UI_GAME_OVER_CONTAINER, UI_GAME_OVER_QUIT);
-
-        for (id, rect, label) in [
-            (UI_GAME_OVER_RESTART, restart_button, "RESTART"),
-            (UI_GAME_OVER_SKILLTREE, skilltree_button, "SKILL TREE"),
-            (UI_GAME_OVER_QUIT, quit_button, "QUIT"),
-        ] {
-            let hovered = ui_tree.is_hovered(id);
-            draw_button(frame, width, height, rect, label, hovered);
-        }
-
         GameOverMenuLayout {
             panel,
             restart_button,
@@ -560,19 +560,20 @@ impl SettingsMenuView {
         height: u32,
         settings: &PlayerSettings,
     ) -> SettingsMenuLayout {
-        let mut ui_tree = UiTree::new();
-        ui_tree.ensure_canvas(UI_CANVAS, ui::Rect::from_size(width, height));
-        ui_tree.add_root(UI_CANVAS);
-        Self::render_with_ui(frame, width, height, &mut ui_tree, settings)
+        let layout = SettingsMenuLayout::compute(width, height);
+        Self::draw(frame, width, height, layout, settings, None);
+        layout
     }
 
-    pub fn render_with_ui(
+    pub(crate) fn draw(
         frame: &mut dyn Renderer2d,
         width: u32,
         height: u32,
-        ui_tree: &mut UiTree,
+        layout: SettingsMenuLayout,
         settings: &PlayerSettings,
-    ) -> SettingsMenuLayout {
+        pointer: Option<(u32, u32)>,
+    ) {
+        let hovered = |rect: Rect| pointer.is_some_and(|(x, y)| rect.contains(x, y));
         blend_rect(
             frame,
             width,
@@ -585,21 +586,25 @@ impl SettingsMenuView {
             PAUSE_MENU_DIM_ALPHA,
         );
 
-        let margin = 32u32;
+        let SettingsMenuLayout {
+            panel,
+            master_track,
+            music_track,
+            sfx_track,
+            shake_track,
+            mute_toggle,
+            music_toggle,
+            show_timer_toggle,
+            auto_pause_toggle,
+            high_contrast_toggle,
+            reduce_motion_toggle,
+            back_button,
+            reset_button,
+        } = layout;
+        if panel.w == 0 || panel.h == 0 {
+            return;
+        }
         let pad = 18u32;
-        let screen = ui::Rect::from_size(width, height);
-        let safe = screen.inset(ui::Insets::all(margin));
-        if safe.w == 0 || safe.h == 0 {
-            return SettingsMenuLayout::default();
-        }
-
-        let panel_size = ui::Size::new(760, 560).clamp_max(safe.size());
-        if panel_size.w == 0 || panel_size.h == 0 {
-            return SettingsMenuLayout::default();
-        }
-
-        let panel_ui = safe.place(panel_size, ui::Anchor::Center);
-        let panel = Rect::new(panel_ui.x, panel_ui.y, panel_ui.w, panel_ui.h);
         fill_rect(
             frame,
             width,
@@ -640,11 +645,119 @@ impl SettingsMenuView {
             COLOR_PAUSE_MENU_TEXT,
         );
 
-        ui_tree.ensure_container(UI_SETTINGS_MENU_CONTAINER, panel);
-        ui_tree.add_child(UI_CANVAS, UI_SETTINGS_MENU_CONTAINER);
+        let slider_label_x = panel.x.saturating_add(pad + 8);
+        draw_slider_row(
+            frame,
+            width,
+            height,
+            slider_label_x,
+            master_track.y.saturating_sub(10),
+            "MASTER VOLUME",
+            Slider::new(master_track, 0.0, 1.0, settings.audio.master_volume),
+            true,
+        );
+        draw_slider_row(
+            frame,
+            width,
+            height,
+            slider_label_x,
+            music_track.y.saturating_sub(10),
+            "MUSIC VOLUME",
+            Slider::new(music_track, 0.0, 1.0, settings.audio.music_volume),
+            true,
+        );
+        draw_slider_row(
+            frame,
+            width,
+            height,
+            slider_label_x,
+            sfx_track.y.saturating_sub(10),
+            "SFX VOLUME",
+            Slider::new(sfx_track, 0.0, 1.0, settings.audio.sfx_volume),
+            true,
+        );
+        draw_slider_row(
+            frame,
+            width,
+            height,
+            slider_label_x,
+            shake_track.y.saturating_sub(10),
+            "SCREEN SHAKE",
+            Slider::new(
+                shake_track,
+                0.0,
+                100.0,
+                settings.video.clamped_screen_shake() as f32,
+            ),
+            false,
+        );
 
+        for (rect, label, on) in [
+            (mute_toggle, "MUTE ALL", settings.audio.mute_all),
+            (music_toggle, "MUSIC ENABLED", settings.audio.music_enabled),
+            (
+                show_timer_toggle,
+                "SHOW TIMER",
+                settings.gameplay.show_round_timer,
+            ),
+            (
+                auto_pause_toggle,
+                "AUTO PAUSE (FOCUS)",
+                settings.gameplay.auto_pause_on_focus_loss,
+            ),
+            (
+                high_contrast_toggle,
+                "HIGH CONTRAST UI",
+                settings.accessibility.high_contrast_ui,
+            ),
+            (
+                reduce_motion_toggle,
+                "REDUCE MOTION",
+                settings.accessibility.reduce_motion,
+            ),
+        ] {
+            let state = if on { "ON" } else { "OFF" };
+            let line = format!("{label}: {state}");
+            draw_button(frame, width, height, rect, &line, hovered(rect));
+        }
+
+        draw_button(
+            frame,
+            width,
+            height,
+            back_button,
+            "BACK",
+            hovered(back_button),
+        );
+        draw_button(
+            frame,
+            width,
+            height,
+            reset_button,
+            "RESET DEFAULTS",
+            hovered(reset_button),
+        );
+    }
+}
+
+impl SettingsMenuLayout {
+    pub(crate) fn compute(width: u32, height: u32) -> Self {
+        let margin = 32u32;
+        let pad = 18u32;
+        let screen = ui::Rect::from_size(width, height);
+        let safe = screen.inset(ui::Insets::all(margin));
+        if safe.w == 0 || safe.h == 0 {
+            return SettingsMenuLayout::default();
+        }
+
+        let panel_size = ui::Size::new(760, 560).clamp_max(safe.size());
+        if panel_size.w == 0 || panel_size.h == 0 {
+            return SettingsMenuLayout::default();
+        }
+
+        let panel_ui = safe.place(panel_size, ui::Anchor::Center);
+        let panel = Rect::new(panel_ui.x, panel_ui.y, panel_ui.w, panel_ui.h);
         let content = panel.inset(ui::Insets::all(pad));
-        let slider_label_x = content.x.saturating_add(8);
         let slider_track_x = content.x.saturating_add(250);
         let slider_track_w = content.w.saturating_sub(270);
         let slider_track_h = 12u32;
@@ -673,52 +786,6 @@ impl SettingsMenuView {
                 .saturating_add(10),
             slider_track_w,
             slider_track_h,
-        );
-
-        draw_slider_row(
-            frame,
-            width,
-            height,
-            slider_label_x,
-            row0_y,
-            "MASTER VOLUME",
-            Slider::new(master_track, 0.0, 1.0, settings.audio.master_volume),
-            true,
-        );
-        draw_slider_row(
-            frame,
-            width,
-            height,
-            slider_label_x,
-            row0_y.saturating_add(slider_row_h),
-            "MUSIC VOLUME",
-            Slider::new(music_track, 0.0, 1.0, settings.audio.music_volume),
-            true,
-        );
-        draw_slider_row(
-            frame,
-            width,
-            height,
-            slider_label_x,
-            row0_y.saturating_add(slider_row_h.saturating_mul(2)),
-            "SFX VOLUME",
-            Slider::new(sfx_track, 0.0, 1.0, settings.audio.sfx_volume),
-            true,
-        );
-        draw_slider_row(
-            frame,
-            width,
-            height,
-            slider_label_x,
-            row0_y.saturating_add(slider_row_h.saturating_mul(3)),
-            "SCREEN SHAKE",
-            Slider::new(
-                shake_track,
-                0.0,
-                100.0,
-                settings.video.clamped_screen_shake() as f32,
-            ),
-            false,
         );
 
         let toggle_y0 = row0_y
@@ -759,51 +826,6 @@ impl SettingsMenuView {
             toggle_h,
         );
 
-        for (id, rect, label, on) in [
-            (
-                UI_SETTINGS_TOGGLE_MUTE,
-                mute_toggle,
-                "MUTE ALL",
-                settings.audio.mute_all,
-            ),
-            (
-                UI_SETTINGS_TOGGLE_MUSIC,
-                music_toggle,
-                "MUSIC ENABLED",
-                settings.audio.music_enabled,
-            ),
-            (
-                UI_SETTINGS_TOGGLE_TIMER,
-                show_timer_toggle,
-                "SHOW TIMER",
-                settings.gameplay.show_round_timer,
-            ),
-            (
-                UI_SETTINGS_TOGGLE_AUTO_PAUSE,
-                auto_pause_toggle,
-                "AUTO PAUSE (FOCUS)",
-                settings.gameplay.auto_pause_on_focus_loss,
-            ),
-            (
-                UI_SETTINGS_TOGGLE_HIGH_CONTRAST,
-                high_contrast_toggle,
-                "HIGH CONTRAST UI",
-                settings.accessibility.high_contrast_ui,
-            ),
-            (
-                UI_SETTINGS_TOGGLE_REDUCE_MOTION,
-                reduce_motion_toggle,
-                "REDUCE MOTION",
-                settings.accessibility.reduce_motion,
-            ),
-        ] {
-            ui_tree.ensure_button(id, rect, None);
-            ui_tree.add_child(UI_SETTINGS_MENU_CONTAINER, id);
-            let state = if on { "ON" } else { "OFF" };
-            let line = format!("{label}: {state}");
-            draw_button(frame, width, height, rect, &line, ui_tree.is_hovered(id));
-        }
-
         let button_size = ui::Size::new(220, 42).clamp_max(content.size());
         let back_button_ui = content.place(button_size, ui::Anchor::BottomRight);
         let back_button = Rect::new(
@@ -819,27 +841,6 @@ impl SettingsMenuView {
             back_button.y,
             button_size.w,
             button_size.h,
-        );
-        ui_tree.ensure_button(UI_SETTINGS_BACK, back_button, None);
-        ui_tree.add_child(UI_SETTINGS_MENU_CONTAINER, UI_SETTINGS_BACK);
-        ui_tree.ensure_button(UI_SETTINGS_RESET, reset_button, None);
-        ui_tree.add_child(UI_SETTINGS_MENU_CONTAINER, UI_SETTINGS_RESET);
-
-        draw_button(
-            frame,
-            width,
-            height,
-            back_button,
-            "BACK",
-            ui_tree.is_hovered(UI_SETTINGS_BACK),
-        );
-        draw_button(
-            frame,
-            width,
-            height,
-            reset_button,
-            "RESET DEFAULTS",
-            ui_tree.is_hovered(UI_SETTINGS_RESET),
         );
 
         SettingsMenuLayout {
@@ -957,26 +958,8 @@ pub fn draw_pause_menu(frame: &mut dyn Renderer2d, width: u32, height: u32) -> P
     PauseMenuView::render(frame, width, height)
 }
 
-pub fn draw_pause_menu_with_ui(
-    frame: &mut dyn Renderer2d,
-    width: u32,
-    height: u32,
-    ui_tree: &mut UiTree,
-) -> PauseMenuLayout {
-    PauseMenuView::render_with_ui(frame, width, height, ui_tree)
-}
-
 pub fn draw_main_menu(frame: &mut dyn Renderer2d, width: u32, height: u32) -> MainMenuLayout {
     MainMenuView::render(frame, width, height)
-}
-
-pub fn draw_main_menu_with_ui(
-    frame: &mut dyn Renderer2d,
-    width: u32,
-    height: u32,
-    ui_tree: &mut UiTree,
-) -> MainMenuLayout {
-    MainMenuView::render_with_ui(frame, width, height, ui_tree)
 }
 
 pub fn draw_game_over_menu(
@@ -987,15 +970,6 @@ pub fn draw_game_over_menu(
     GameOverMenuView::render(frame, width, height)
 }
 
-pub fn draw_game_over_menu_with_ui(
-    frame: &mut dyn Renderer2d,
-    width: u32,
-    height: u32,
-    ui_tree: &mut UiTree,
-) -> GameOverMenuLayout {
-    GameOverMenuView::render_with_ui(frame, width, height, ui_tree)
-}
-
 pub fn draw_settings_menu(
     frame: &mut dyn Renderer2d,
     width: u32,
@@ -1003,14 +977,4 @@ pub fn draw_settings_menu(
     settings: &PlayerSettings,
 ) -> SettingsMenuLayout {
     SettingsMenuView::render(frame, width, height, settings)
-}
-
-pub fn draw_settings_menu_with_ui(
-    frame: &mut dyn Renderer2d,
-    width: u32,
-    height: u32,
-    ui_tree: &mut UiTree,
-    settings: &PlayerSettings,
-) -> SettingsMenuLayout {
-    SettingsMenuView::render_with_ui(frame, width, height, ui_tree, settings)
 }

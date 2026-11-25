@@ -1,17 +1,16 @@
 use engine::graphics::CpuRenderer;
-use engine::render::{
-    CELL_SIZE, clip_rect_i32_to_viewport, clip_rect_to_viewport, color_for_cell, draw_board,
-    draw_board_cells, draw_board_cells_in_rect, draw_board_cells_in_rect_clipped,
-    draw_board_cells_in_rect_clipped_with_owners,
-};
 use engine::surface::SurfaceSize;
 use engine::ui::Rect;
+use game::board_render::{
+    CELL_SIZE, color_for_cell, draw_board, draw_board_cells, draw_board_cells_in_rect,
+    draw_board_cells_in_rect_clipped, draw_board_cells_in_rect_clipped_with_owners,
+};
 
 #[test]
 fn color_mapping_is_stable() {
     assert_eq!(color_for_cell(0), [0, 0, 0, 255]);
-    assert_eq!(color_for_cell(1), [0, 229, 255, 255]);
-    assert_eq!(color_for_cell(2), [255, 215, 0, 255]);
+    assert_eq!(color_for_cell(1), [143, 92, 53, 255]);
+    assert_eq!(color_for_cell(2), [126, 124, 120, 255]);
     assert_eq!(color_for_cell(3), [150, 208, 232, 255]);
 }
 
@@ -35,7 +34,7 @@ fn draw_board_renders_bottom_row_at_buffer_bottom() {
     let sample_y = height - 7;
     let sample_index = ((sample_y * width + sample_x) * 4) as usize;
     let pixel = &frame[sample_index..sample_index + 4];
-    assert_eq!(pixel, &[0, 229, 255, 255]);
+    assert_eq!(pixel, &color_for_cell(1));
 }
 
 #[test]
@@ -64,7 +63,7 @@ fn draw_board_centers_board_in_larger_buffer() {
     let expected_index = ((expected_y * width + expected_x) * 4) as usize;
     assert_eq!(
         &frame[expected_index..expected_index + 4],
-        &[0, 229, 255, 255]
+        &color_for_cell(1)
     );
 
     let window_bottom_left_index = ((height - 1) * width * 4) as usize;
@@ -189,21 +188,6 @@ fn draw_board_cells_in_rect_applies_origin_offset() {
 }
 
 #[test]
-fn clip_rect_to_viewport_returns_intersection() {
-    let rect = Rect::new(12, 20, 40, 30);
-    let viewport = Rect::new(24, 10, 20, 20);
-    let clipped = clip_rect_to_viewport(rect, viewport);
-    assert_eq!(clipped, Some(Rect::new(24, 20, 20, 10)));
-}
-
-#[test]
-fn clip_rect_i32_to_viewport_handles_negative_origin() {
-    let viewport = Rect::new(10, 10, 20, 20);
-    let clipped = clip_rect_i32_to_viewport(-8, 18, 20, 8, viewport);
-    assert_eq!(clipped, Some(Rect::new(10, 18, 2, 8)));
-}
-
-#[test]
 fn draw_board_cells_in_rect_clipped_keeps_content_inside_viewport() {
     let width = 6 * CELL_SIZE;
     let height = 8 * CELL_SIZE;
@@ -315,7 +299,13 @@ fn draw_board_cells_in_rect_clipped_with_owners_draws_seam_between_pieces() {
     let viewport = Rect::new(CELL_SIZE, CELL_SIZE, 2 * CELL_SIZE, CELL_SIZE);
 
     let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
-    draw_board_cells_in_rect_clipped_with_owners(&mut gfx, &board, Some(&owners), viewport, viewport);
+    draw_board_cells_in_rect_clipped_with_owners(
+        &mut gfx,
+        &board,
+        Some(&owners),
+        viewport,
+        viewport,
+    );
 
     let fill = color_for_cell(1);
     let stroke = [
@@ -352,7 +342,13 @@ fn draw_board_cells_in_rect_clipped_with_owners_keeps_same_piece_interior_unstro
     let viewport = Rect::new(CELL_SIZE, CELL_SIZE, 2 * CELL_SIZE, CELL_SIZE);
 
     let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
-    draw_board_cells_in_rect_clipped_with_owners(&mut gfx, &board, Some(&owners), viewport, viewport);
+    draw_board_cells_in_rect_clipped_with_owners(
+        &mut gfx,
+        &board,
+        Some(&owners),
+        viewport,
+        viewport,
+    );
 
     let fill = color_for_cell(1);
 
@@ -384,7 +380,13 @@ fn draw_board_cells_in_rect_clipped_with_owners_draws_seam_for_mixed_owner_neigh
     let viewport = Rect::new(CELL_SIZE, CELL_SIZE, 2 * CELL_SIZE, CELL_SIZE);
 
     let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
-    draw_board_cells_in_rect_clipped_with_owners(&mut gfx, &board, Some(&owners), viewport, viewport);
+    draw_board_cells_in_rect_clipped_with_owners(
+        &mut gfx,
+        &board,
+        Some(&owners),
+        viewport,
+        viewport,
+    );
 
     let left_fill = color_for_cell(1);
     let left_stroke = [
@@ -422,7 +424,13 @@ fn draw_board_cells_in_rect_clipped_with_owners_uses_three_px_internal_seams() {
     let viewport = Rect::new(CELL_SIZE, CELL_SIZE, 2 * CELL_SIZE, CELL_SIZE);
 
     let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
-    draw_board_cells_in_rect_clipped_with_owners(&mut gfx, &board, Some(&owners), viewport, viewport);
+    draw_board_cells_in_rect_clipped_with_owners(
+        &mut gfx,
+        &board,
+        Some(&owners),
+        viewport,
+        viewport,
+    );
 
     let left_fill = color_for_cell(1);
     let left_stroke = [
@@ -466,7 +474,13 @@ fn draw_board_cells_in_rect_clipped_with_owners_bridges_interior_seam_corners() 
     let viewport = Rect::new(CELL_SIZE, CELL_SIZE, 2 * CELL_SIZE, 2 * CELL_SIZE);
 
     let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
-    draw_board_cells_in_rect_clipped_with_owners(&mut gfx, &board, Some(&owners), viewport, viewport);
+    draw_board_cells_in_rect_clipped_with_owners(
+        &mut gfx,
+        &board,
+        Some(&owners),
+        viewport,
+        viewport,
+    );
 
     let fill = color_for_cell(1);
     let stroke = [
@@ -494,14 +508,17 @@ fn draw_board_cells_in_rect_clipped_with_owners_keeps_unowned_same_type_neighbor
     let viewport = Rect::new(CELL_SIZE, CELL_SIZE, 2 * CELL_SIZE, CELL_SIZE);
 
     let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
-    draw_board_cells_in_rect_clipped_with_owners(&mut gfx, &board, Some(&owners), viewport, viewport);
+    draw_board_cells_in_rect_clipped_with_owners(
+        &mut gfx,
+        &board,
+        Some(&owners),
+        viewport,
+        viewport,
+    );
 
     let fill = color_for_cell(9);
     let y = viewport.y + 8;
-    assert_eq!(
-        pixel_at(&frame, width, viewport.x + CELL_SIZE - 1, y),
-        fill
-    );
+    assert_eq!(pixel_at(&frame, width, viewport.x + CELL_SIZE - 1, y), fill);
     assert_eq!(pixel_at(&frame, width, viewport.x + CELL_SIZE, y), fill);
 }
 

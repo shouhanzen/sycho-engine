@@ -24,7 +24,7 @@ fn duration_to_ms_u32(duration: Duration) -> u32 {
 }
 
 #[derive(Debug, Clone)]
-pub struct BlockLogic {
+pub struct TetrisLogic {
     seed: u64,
     available_pieces: Vec<Piece>,
     gravity_enabled: bool,
@@ -35,7 +35,7 @@ pub struct BlockLogic {
     depth_wall_damage_tuning: Option<(u32, u32)>,
 }
 
-impl BlockLogic {
+impl TetrisLogic {
     pub fn new(seed: u64, available_pieces: Vec<Piece>) -> Self {
         Self {
             seed,
@@ -84,7 +84,7 @@ impl BlockLogic {
     }
 }
 
-impl GameLogic for BlockLogic {
+impl GameLogic for TetrisLogic {
     type State = GameState;
     type Input = InputAction;
 
@@ -103,69 +103,91 @@ impl GameLogic for BlockLogic {
         GameState::new(core)
     }
 
-    fn step(&self, state: &Self::State, input: Self::Input) -> Self::State {
-        let mut next = state.clone();
+    fn step(&self, state: &mut Self::State, input: Self::Input) {
         let prev_lines = state.tetris.lines_cleared();
         let mut apply_gravity = self.gravity_enabled;
 
         match input {
             InputAction::Noop => {}
             InputAction::MoveLeft => {
-                next.tetris.move_piece(Vec2i::new(-1, 0));
+                state.tetris.move_piece(Vec2i::new(-1, 0));
             }
             InputAction::MoveRight => {
-                next.tetris.move_piece(Vec2i::new(1, 0));
+                state.tetris.move_piece(Vec2i::new(1, 0));
             }
             InputAction::SoftDrop => {
-                next.tetris.move_piece_down();
+                state.tetris.move_piece_down();
                 apply_gravity = false;
             }
             InputAction::GravityTick { dt_ms } => {
-                next.tetris.advance_with_gravity(dt_ms);
+                state.tetris.advance_with_gravity(dt_ms);
                 apply_gravity = false;
             }
             InputAction::RotateCw => {
-                next.tetris.rotate_piece(RotationDir::Cw);
+                state.tetris.rotate_piece(RotationDir::Cw);
             }
             InputAction::RotateCcw => {
-                next.tetris.rotate_piece(RotationDir::Ccw);
+                state.tetris.rotate_piece(RotationDir::Ccw);
             }
             InputAction::Rotate180 => {
-                next.tetris.rotate_piece(RotationDir::Half);
+                state.tetris.rotate_piece(RotationDir::Half);
             }
             InputAction::HardDrop => {
-                next.tetris.hard_drop();
+                state.tetris.hard_drop();
                 apply_gravity = false;
             }
             InputAction::Hold => {
-                next.tetris.hold_piece();
+                state.tetris.hold_piece();
             }
         }
 
         if apply_gravity {
-            next.tetris
+            state
+                .tetris
                 .advance_with_gravity(duration_to_ms_u32(state.gravity_interval));
         }
 
-        next.tetris.advance_material_turn();
+        state.tetris.advance_material_turn();
 
-        let delta_lines = next.tetris.lines_cleared().saturating_sub(prev_lines);
+        let delta_lines = state.tetris.lines_cleared().saturating_sub(prev_lines);
         if delta_lines > 0 && self.score_bonus_per_line > 0 {
             let bonus = self.score_bonus_per_line.saturating_mul(delta_lines);
-            next.tetris.add_score(bonus);
+            state.tetris.add_score(bonus);
         }
-
-        next
     }
 }
-
-// Compatibility alias while gameplay terminology migrates away from "tetris".
-pub type TetrisLogic = BlockLogic;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tetris_core::{BOARD_HEIGHT, BOARD_WIDTH};
+
+    #[test]
+    fn spawns_the_configured_piece_and_moves_it_left() {
+        let logic = TetrisLogic::new(0, vec![Piece::O]);
+        let mut state = logic.initial_state();
+        assert_eq!(state.tetris.current_piece(), Some(Piece::O));
+        assert_eq!(state.tetris.next_piece(), Some(Piece::O));
+        assert_eq!(
+            state.tetris.current_piece_pos(),
+            Vec2i::new(4, BOARD_HEIGHT as i32)
+        );
+
+        logic.step(&mut state, InputAction::MoveLeft);
+        assert_eq!(
+            state.tetris.current_piece_pos(),
+            Vec2i::new(3, BOARD_HEIGHT as i32)
+        );
+    }
+
+    #[test]
+    fn square_piece_keeps_its_orientation_when_rotated() {
+        let logic = TetrisLogic::new(0, vec![Piece::O]);
+        let mut state = logic.initial_state();
+
+        logic.step(&mut state, InputAction::RotateCw);
+        assert_eq!(state.tetris.current_piece_rotation(), 0);
+    }
 
     #[test]
     fn score_bonus_is_added_per_line_cleared() {
@@ -199,11 +221,9 @@ mod tests {
         state.tetris.set_line_clear_delay_ms(0);
 
         let logic_no_bonus = TetrisLogic::new(0, vec![Piece::O]);
-        let next_no_bonus_pending = logic_no_bonus.step(&state, InputAction::HardDrop);
-        let next_no_bonus = logic_no_bonus.step(
-            &next_no_bonus_pending,
-            InputAction::GravityTick { dt_ms: 0 },
-        );
+        let mut next_no_bonus = state.clone();
+        logic_no_bonus.step(&mut next_no_bonus, InputAction::HardDrop);
+        logic_no_bonus.step(&mut next_no_bonus, InputAction::GravityTick { dt_ms: 0 });
         assert_eq!(next_no_bonus.tetris.lines_cleared(), 1);
         assert_eq!(
             next_no_bonus.tetris.score(),
@@ -212,8 +232,9 @@ mod tests {
         );
 
         let logic_bonus = TetrisLogic::new(0, vec![Piece::O]).with_score_bonus_per_line(100);
-        let next_bonus_pending = logic_bonus.step(&state, InputAction::HardDrop);
-        let next_bonus = logic_bonus.step(&next_bonus_pending, InputAction::GravityTick { dt_ms: 0 });
+        let mut next_bonus = state;
+        logic_bonus.step(&mut next_bonus, InputAction::HardDrop);
+        logic_bonus.step(&mut next_bonus, InputAction::GravityTick { dt_ms: 0 });
         assert_eq!(next_bonus.tetris.lines_cleared(), 1);
         assert_eq!(
             next_bonus.tetris.score(),
@@ -247,9 +268,9 @@ mod tests {
             .tetris
             .set_current_piece_for_test(Piece::O, Vec2i::new(4, 10), 0);
 
-        let next = logic.step(&state, InputAction::SoftDrop);
+        logic.step(&mut state, InputAction::SoftDrop);
         assert_eq!(
-            next.tetris.current_piece_pos(),
+            state.tetris.current_piece_pos(),
             Vec2i::new(4, 9),
             "soft drop should move by one row, not apply an additional gravity move in the same step"
         );
@@ -263,18 +284,18 @@ mod tests {
             .tetris
             .set_current_piece_for_test(Piece::O, Vec2i::new(4, 2), 0);
 
-        let next = logic.step(&state, InputAction::SoftDrop);
+        logic.step(&mut state, InputAction::SoftDrop);
         assert_eq!(
-            next.tetris.current_piece_pos(),
+            state.tetris.current_piece_pos(),
             Vec2i::new(4, 1),
             "soft drop should land the piece without locking in the same step"
         );
         assert!(
-            next.tetris.current_piece().is_some(),
+            state.tetris.current_piece().is_some(),
             "active piece should still be present right after soft-drop ground contact"
         );
         assert_eq!(
-            next.tetris.board()[0][4],
+            state.tetris.board()[0][4],
             0,
             "piece should not have been locked into the board on the soft-drop contact step"
         );
@@ -288,18 +309,19 @@ mod tests {
             .tetris
             .set_current_piece_for_test(Piece::O, Vec2i::new(4, 1), 0);
 
-        let next = logic.step(&state, InputAction::MoveRight);
+        logic.step(&mut state, InputAction::MoveRight);
         assert_eq!(
-            next.tetris.current_piece_pos(),
+            state.tetris.current_piece_pos(),
             Vec2i::new(5, 1),
             "grounded horizontal adjustment should move the piece for lock-delay stalling"
         );
         assert!(
-            next.tetris.current_piece().is_some(),
+            state.tetris.current_piece().is_some(),
             "move-right stall should keep the active piece alive after the same-step gravity phase"
         );
         assert_eq!(
-            next.tetris.board()[0][5], 0,
+            state.tetris.board()[0][5],
+            0,
             "piece should not lock into the board on the same step as a valid grounded horizontal move"
         );
     }

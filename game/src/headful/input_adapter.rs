@@ -2,7 +2,6 @@ use std::time::{Duration, Instant};
 
 use engine::HeadlessRunner;
 use engine::app::InputFrame;
-use engine::ui_tree::UiAction;
 use winit::event::VirtualKeyCode;
 
 use super::skilltree_camera as headful_camera;
@@ -11,13 +10,6 @@ use crate::playtest::{InputAction, TetrisLogic};
 use crate::skilltree::{SkillTreeEditorTool, SkillTreeRuntime};
 use crate::tetris_core::Vec2i;
 use crate::tetris_ui::SkillTreeLayout;
-use crate::ui_ids::{
-    ACTION_GAME_OVER_QUIT, ACTION_GAME_OVER_RESTART, ACTION_GAME_OVER_SKILLTREE,
-    ACTION_MAIN_MENU_QUIT, ACTION_MAIN_MENU_SKILLTREE_EDITOR, ACTION_MAIN_MENU_START,
-    ACTION_PAUSE_END_RUN, ACTION_PAUSE_RESUME, ACTION_SKILLTREE_START_RUN,
-    ACTION_SKILLTREE_TOOL_ADD_CELL, ACTION_SKILLTREE_TOOL_LINK, ACTION_SKILLTREE_TOOL_MOVE,
-    ACTION_SKILLTREE_TOOL_REMOVE_CELL, ACTION_SKILLTREE_TOOL_SELECT,
-};
 use crate::view::GameView;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,12 +34,6 @@ pub enum HeadfulInputCommand {
     PlayClick,
     ResetRun,
     ApplyAction(InputAction),
-}
-
-#[derive(Debug, Default)]
-pub struct UiActionResult {
-    pub handled: bool,
-    pub commands: Vec<HeadfulInputCommand>,
 }
 
 impl HorizontalRepeat {
@@ -742,113 +728,6 @@ pub fn process_keyboard_frame(
     commands
 }
 
-pub fn handle_ui_tree_click_action(
-    runner: &mut HeadlessRunner<TetrisLogic>,
-    action: UiAction,
-) -> UiActionResult {
-    let mut result = UiActionResult::default();
-    match action {
-        ACTION_MAIN_MENU_START => {
-            let view = runner.state().view;
-            if matches!(view, GameView::MainMenu) {
-                let transition = headful_view::start_game(view);
-                runner.state_mut().view = transition.next_view;
-                if transition.reset_tetris {
-                    result.commands.push(HeadfulInputCommand::ResetRun);
-                }
-                result.commands.push(HeadfulInputCommand::PlayClick);
-                result.handled = true;
-            }
-        }
-        ACTION_MAIN_MENU_SKILLTREE_EDITOR => {
-            let view = runner.state().view;
-            if matches!(view, GameView::MainMenu) {
-                let transition = headful_view::open_skilltree_editor(view);
-                runner.state_mut().view = transition.next_view;
-                let skilltree = &mut runner.state_mut().skilltree;
-                if !skilltree.editor.enabled {
-                    skilltree.editor_toggle();
-                }
-                result.commands.push(HeadfulInputCommand::PlayClick);
-                result.handled = true;
-            }
-        }
-        ACTION_MAIN_MENU_QUIT => {
-            if matches!(runner.state().view, GameView::MainMenu) {
-                result.commands.push(HeadfulInputCommand::ExitRequested);
-                result.handled = true;
-            }
-        }
-        ACTION_PAUSE_RESUME => {
-            let view = runner.state().view;
-            if matches!(view, GameView::Tetris { paused: true }) {
-                let transition = headful_view::toggle_pause(view);
-                let state = runner.state_mut();
-                state.view = transition.next_view;
-                state.gravity_elapsed = Duration::ZERO;
-                result.commands.push(HeadfulInputCommand::PlayClick);
-                result.handled = true;
-            }
-        }
-        ACTION_PAUSE_END_RUN => {
-            let view = runner.state().view;
-            if matches!(view, GameView::Tetris { paused: true }) {
-                let transition = headful_view::game_over(view);
-                runner.state_mut().view = transition.next_view;
-                result.commands.push(HeadfulInputCommand::PlayClick);
-                result.handled = true;
-            }
-        }
-        ACTION_GAME_OVER_RESTART => {
-            let view = runner.state().view;
-            if matches!(view, GameView::GameOver) {
-                let transition = headful_view::start_game(view);
-                runner.state_mut().view = transition.next_view;
-                if transition.reset_tetris {
-                    result.commands.push(HeadfulInputCommand::ResetRun);
-                }
-                result.commands.push(HeadfulInputCommand::PlayClick);
-                result.handled = true;
-            }
-        }
-        ACTION_GAME_OVER_SKILLTREE => {
-            let view = runner.state().view;
-            if matches!(view, GameView::GameOver) {
-                let transition = headful_view::open_skilltree(view);
-                runner.state_mut().view = transition.next_view;
-                result.commands.push(HeadfulInputCommand::PlayClick);
-                result.handled = true;
-            }
-        }
-        ACTION_GAME_OVER_QUIT => {
-            if matches!(runner.state().view, GameView::GameOver) {
-                result.commands.push(HeadfulInputCommand::ExitRequested);
-                result.handled = true;
-            }
-        }
-        ACTION_SKILLTREE_START_RUN => {
-            let view = runner.state().view;
-            let skilltree_editor_enabled = runner.state().skilltree.editor.enabled;
-            if matches!(view, GameView::SkillTree) && !skilltree_editor_enabled {
-                let transition = headful_view::start_game(view);
-                runner.state_mut().view = transition.next_view;
-                if transition.reset_tetris {
-                    result.commands.push(HeadfulInputCommand::ResetRun);
-                }
-                result.commands.push(HeadfulInputCommand::PlayClick);
-                result.handled = true;
-            }
-        }
-        ACTION_SKILLTREE_TOOL_SELECT
-        | ACTION_SKILLTREE_TOOL_MOVE
-        | ACTION_SKILLTREE_TOOL_ADD_CELL
-        | ACTION_SKILLTREE_TOOL_REMOVE_CELL
-        | ACTION_SKILLTREE_TOOL_LINK => {}
-        _ => {}
-    }
-    result
-}
-
 pub fn handle_skilltree_world_click(
     runner: &mut HeadlessRunner<TetrisLogic>,
     last_skilltree: SkillTreeLayout,
@@ -862,48 +741,36 @@ pub fn handle_skilltree_world_click(
         return commands;
     }
 
-    let skilltree_editor_enabled = runner.state().skilltree.editor.enabled;
-    if skilltree_editor_enabled {
-        if let Some(world) = headful_camera::skilltree_world_cell_at_screen(
-            &runner.state().skilltree,
-            last_skilltree,
-            mouse_x,
-            mouse_y,
-        ) {
-            let skilltree = &mut runner.state_mut().skilltree;
-            if apply_editor_tool_at_world(skilltree, world) {
-                commands.push(HeadfulInputCommand::PlayClick);
-            }
+    let Some(world) =
+        headful_camera::skilltree_world_cell_at_screen(last_skilltree, mouse_x, mouse_y)
+    else {
+        return commands;
+    };
+    if runner.state().skilltree.editor.enabled {
+        if apply_editor_tool_at_world(&mut runner.state_mut().skilltree, world) {
+            commands.push(HeadfulInputCommand::PlayClick);
         }
         return commands;
     }
 
-    if let Some(world) = headful_camera::skilltree_world_cell_at_screen(
-        &runner.state().skilltree,
-        last_skilltree,
-        mouse_x,
-        mouse_y,
-    ) {
-        let hit_id = runner.state().skilltree.def.nodes.iter().find_map(|node| {
-            node.shape.iter().find_map(|rel| {
-                let wx = node.pos.x + rel.x;
-                let wy = node.pos.y + rel.y;
-                if wx == world.x && wy == world.y {
-                    Some(node.id.clone())
-                } else {
-                    None
-                }
-            })
-        });
-        if let Some(id) = hit_id {
-            let transition = headful_view::open_skilltree(runner.state().view);
-            let state = runner.state_mut();
-            state.view = transition.next_view;
-            state.skilltree.try_buy(&id);
-            commands.push(HeadfulInputCommand::PlayClick);
-        }
+    let hit_id = runner.state().skilltree.def.nodes.iter().find_map(|node| {
+        node.shape.iter().find_map(|rel| {
+            let wx = node.pos.x + rel.x;
+            let wy = node.pos.y + rel.y;
+            if wx == world.x && wy == world.y {
+                Some(node.id.clone())
+            } else {
+                None
+            }
+        })
+    });
+    if let Some(id) = hit_id {
+        let transition = headful_view::open_skilltree(runner.state().view);
+        let state = runner.state_mut();
+        state.view = transition.next_view;
+        state.skilltree.try_buy(&id);
+        commands.push(HeadfulInputCommand::PlayClick);
     }
-
     commands
 }
 
@@ -1065,21 +932,20 @@ mod tests {
     fn skilltree_start_run_ui_action_requires_editor_disabled() {
         let mut runner = make_runner(GameView::SkillTree);
         runner.state_mut().skilltree.editor.enabled = false;
-        let result = handle_ui_tree_click_action(&mut runner, ACTION_SKILLTREE_START_RUN);
-        assert!(result.handled);
+        use crate::game_ui::{GameUiAction, GameUiLayout};
+        use engine::surface::SurfaceSize;
+        let size = SurfaceSize::new(1280, 720);
+        let layout = GameUiLayout::compute(runner.state(), size, false);
+        let button = layout.skilltree.start_new_game_button;
+        let pointer = (button.x + button.w / 2, button.y + button.h / 2);
         assert_eq!(
-            result.commands,
-            vec![
-                HeadfulInputCommand::ResetRun,
-                HeadfulInputCommand::PlayClick
-            ]
+            layout.action_at(runner.state(), pointer),
+            Some(GameUiAction::StartGame)
         );
 
-        runner.state_mut().view = GameView::SkillTree;
         runner.state_mut().skilltree.editor.enabled = true;
-        let blocked = handle_ui_tree_click_action(&mut runner, ACTION_SKILLTREE_START_RUN);
-        assert!(!blocked.handled);
-        assert!(blocked.commands.is_empty());
+        let layout = GameUiLayout::compute(runner.state(), size, false);
+        assert_eq!(layout.action_at(runner.state(), pointer), None);
     }
 
     #[test]

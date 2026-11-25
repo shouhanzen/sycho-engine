@@ -6,6 +6,7 @@
 # === Logs / runtime artifacts (go.sh control surface) ===
 .go*.log
 .go*.pid
+/.sycho-board.json
 
 # === Editor / OS cruft ===
 .DS_Store

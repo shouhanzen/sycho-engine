@@ -2,9 +2,9 @@ use engine::HeadlessRunner;
 use engine::graphics::CpuRenderer;
 use engine::recording::{Mp4Config, Mp4Recorder, export_timeline};
 use engine::regression::{VideoCaptureConfig, record_state_and_video_then_replay_and_compare};
-use engine::render::{CELL_SIZE, draw_board};
 use engine::surface::SurfaceSize;
 use engine::timeline::{Timeline, TimelineReader, session_directory};
+use game::board_render::{CELL_SIZE, draw_board};
 
 use game::playtest::{InputAction, TetrisLogic};
 use game::state::{GameState, TIMELINE_SCHEMA};
@@ -18,53 +18,62 @@ use std::sync::Once;
 static WARNED_FFMPEG_MISSING: Once = Once::new();
 static WARNED_E2E_IMAGE_CAPTURE_FAILED: Once = Once::new();
 
-struct E2eMp4 {
+struct PlaytestRecording {
     timeline: Timeline,
     directory: PathBuf,
-    output: PathBuf,
-    config: Mp4Config,
+    video: Option<(PathBuf, Mp4Config)>,
     next_ms: u64,
     spacing_ms: u64,
 }
 
-impl E2eMp4 {
-    fn maybe_start(test_name: &str) -> Option<Self> {
-        if !env_flag("ROLLOUT_E2E_RECORD_MP4") {
-            return None;
-        }
-
-        if !Mp4Recorder::ffmpeg_available() {
-            let msg = "ROLLOUT_E2E_RECORD_MP4 is set, but `ffmpeg` was not found (install ffmpeg or set ROLLOUT_FFMPEG_BIN to a full path)";
-            if env_flag("ROLLOUT_E2E_RECORD_STRICT") {
-                panic!("{msg}");
-            }
-            WARNED_FFMPEG_MISSING
-                .call_once(|| eprintln!("warning: {msg}; recording disabled for this run"));
-            return None;
-        }
-
+impl PlaytestRecording {
+    fn start(test_name: &str) -> Self {
         let fps = env_u32("ROLLOUT_E2E_RECORD_FPS").unwrap_or(30);
         let hold_frames = env_usize("ROLLOUT_E2E_RECORD_HOLD_FRAMES")
             .unwrap_or(10)
             .max(1);
-
-        let (width, height) = board_capture_dimensions();
-
-        let out = default_record_dir().join(format!("{}.mp4", sanitize_filename(test_name)));
-        let config = Mp4Config { width, height, fps };
-        let directory = session_directory(out.with_extension("timeline"), None, true)
-            .expect("reserve a test timeline");
+        let test_name = sanitize_filename(test_name);
+        let video = if env_flag("ROLLOUT_E2E_RECORD_MP4") && Self::can_record_video() {
+            let (width, height) = board_capture_dimensions();
+            Some((
+                default_record_dir().join(format!("{test_name}.mp4")),
+                Mp4Config { width, height, fps },
+            ))
+        } else {
+            None
+        };
+        let directory = session_directory(
+            video.as_ref().map_or_else(
+                || std::env::temp_dir().join(format!("sycho-{test_name}.timeline")),
+                |(output, _)| output.with_extension("timeline"),
+            ),
+            None,
+            true,
+        )
+        .expect("reserve a test timeline");
         let (timeline, _) =
             Timeline::open::<GameState>(&directory, TIMELINE_SCHEMA).expect("open a test timeline");
         let spacing_ms = (hold_frames as u64).saturating_mul(1_000) / u64::from(fps.max(1));
-        Some(Self {
+        Self {
             timeline,
             directory,
-            output: out,
-            config,
+            video,
             next_ms: 0,
             spacing_ms: spacing_ms.max(1),
-        })
+        }
+    }
+
+    fn can_record_video() -> bool {
+        if Mp4Recorder::ffmpeg_available() {
+            return true;
+        }
+        let msg = "ROLLOUT_E2E_RECORD_MP4 is set, but `ffmpeg` was not found (install ffmpeg or set ROLLOUT_FFMPEG_BIN to a full path)";
+        if env_flag("ROLLOUT_E2E_RECORD_STRICT") {
+            panic!("{msg}");
+        }
+        WARNED_FFMPEG_MISSING
+            .call_once(|| eprintln!("warning: {msg}; recording disabled for this run"));
+        false
     }
 
     fn capture(&mut self, runner: &HeadlessRunner<TetrisLogic>) {
@@ -74,24 +83,26 @@ impl E2eMp4 {
         self.next_ms = self.next_ms.saturating_add(self.spacing_ms);
     }
 
-    fn finish(self) -> PathBuf {
+    fn finish(self) {
         let Self {
             timeline,
             directory,
-            output,
-            config,
+            video,
             ..
         } = self;
         drop(timeline);
-        let reader =
-            TimelineReader::open(&directory, TIMELINE_SCHEMA).expect("read playtest timeline");
-        export_timeline(&reader, &output, config, |state: &GameState, gfx| {
-            draw_board(gfx, &state.tetris.board_with_active_piece());
-        })
-        .expect("export playtest video");
-        eprintln!("timeline: {}", directory.display());
-        eprintln!("mp4 recording: {}", output.display());
-        output
+        if let Some((output, config)) = video {
+            let reader =
+                TimelineReader::open(&directory, TIMELINE_SCHEMA).expect("read playtest timeline");
+            export_timeline(&reader, &output, config, |state: &GameState, gfx| {
+                draw_board(gfx, &state.tetris.board_with_active_piece());
+            })
+            .expect("export playtest video");
+            eprintln!("timeline: {}", directory.display());
+            eprintln!("mp4 recording: {}", output.display());
+        } else {
+            fs::remove_dir_all(&directory).expect("remove temporary playtest timeline");
+        }
     }
 }
 
@@ -241,20 +252,16 @@ fn default_image_dir() -> PathBuf {
 fn e2e_hard_drop_places_o_piece() {
     let logic = TetrisLogic::new(0, vec![Piece::O]);
     let mut runner = HeadlessRunner::new(logic);
-    let mut rec = E2eMp4::maybe_start("e2e_hard_drop_places_o_piece");
+    let mut rec = PlaytestRecording::start("e2e_hard_drop_places_o_piece");
     let mut images = E2eImageCapture::maybe_start("e2e_hard_drop_places_o_piece");
 
-    if let Some(r) = rec.as_mut() {
-        r.capture(&runner);
-    }
+    rec.capture(&runner);
     if let Some(capture) = images.as_mut() {
         capture.capture(&runner, "initial");
     }
 
     runner.step(InputAction::HardDrop);
-    if let Some(r) = rec.as_mut() {
-        r.capture(&runner);
-    }
+    rec.capture(&runner);
     if let Some(capture) = images.as_mut() {
         capture.capture(&runner, "after_hard_drop");
     }
@@ -281,9 +288,7 @@ fn e2e_hard_drop_places_o_piece() {
     );
     assert!(!snapshot.game_over);
 
-    if let Some(r) = rec.take() {
-        r.finish();
-    }
+    rec.finish();
 }
 
 #[test]
@@ -315,7 +320,6 @@ fn e2e_state_recording_replay_video_matches_live_video() {
         hold_frames,
     };
 
-    // Deterministic, forward-only run (so replay = iterate 0..history_len).
     let logic = TetrisLogic::new(123, vec![Piece::T, Piece::O, Piece::I]);
 
     let actions = [
@@ -359,27 +363,21 @@ fn e2e_state_recording_replay_video_matches_live_video() {
 fn e2e_rewind_restores_previous_frame() {
     let logic = TetrisLogic::new(123, vec![Piece::T]);
     let mut runner = HeadlessRunner::new(logic);
-    let mut rec = E2eMp4::maybe_start("e2e_rewind_restores_previous_frame");
+    let mut rec = PlaytestRecording::start("e2e_rewind_restores_previous_frame");
     let mut images = E2eImageCapture::maybe_start("e2e_rewind_restores_previous_frame");
 
-    if let Some(r) = rec.as_mut() {
-        r.capture(&runner);
-    }
+    rec.capture(&runner);
     if let Some(capture) = images.as_mut() {
         capture.capture(&runner, "initial");
     }
 
     runner.step(InputAction::MoveLeft);
-    if let Some(r) = rec.as_mut() {
-        r.capture(&runner);
-    }
+    rec.capture(&runner);
     if let Some(capture) = images.as_mut() {
         capture.capture(&runner, "after_move_left");
     }
     runner.step(InputAction::RotateCw);
-    if let Some(r) = rec.as_mut() {
-        r.capture(&runner);
-    }
+    rec.capture(&runner);
     if let Some(capture) = images.as_mut() {
         capture.capture(&runner, "after_rotate");
     }
@@ -387,9 +385,7 @@ fn e2e_rewind_restores_previous_frame() {
     assert_eq!(after_rotate.current_piece_rotation, 1);
 
     runner.step(InputAction::MoveRight);
-    if let Some(r) = rec.as_mut() {
-        r.capture(&runner);
-    }
+    rec.timeline.pause_at(runner.state(), rec.next_ms).unwrap();
     if let Some(capture) = images.as_mut() {
         capture.capture(&runner, "after_move_right");
     }
@@ -399,10 +395,7 @@ fn e2e_rewind_restores_previous_frame() {
         after_move_right.current_piece_pos
     );
 
-    runner.rewind(1);
-    if let Some(r) = rec.as_mut() {
-        r.capture(&runner);
-    }
+    *runner.state_mut() = rec.timeline.rewind::<GameState>().unwrap().unwrap();
     if let Some(capture) = images.as_mut() {
         capture.capture(&runner, "after_rewind");
     }
@@ -413,7 +406,5 @@ fn e2e_rewind_restores_previous_frame() {
         after_rotate.current_piece_rotation
     );
 
-    if let Some(r) = rec.take() {
-        r.finish();
-    }
+    rec.finish();
 }

@@ -77,7 +77,7 @@ fn incompatible_schema_and_interrupted_writes_preserve_the_committed_state() {
     fs::write(directory.0.join("head.tmp"), b"{ \"tip\":").unwrap();
     fs::write(
         directory.0.join("00000000000000000001.json"),
-        br#"{"previous":0,"state":999}"#,
+        br#"{"previous":0,"at_ms":12,"state":999}"#,
     )
     .unwrap();
     let newer = StateSchema {
@@ -205,49 +205,35 @@ fn timed_deltas_reconstruct_nested_states_and_playback_branches_only_on_resume()
 }
 
 #[test]
-fn format_one_timelines_open_with_nominal_timing_and_can_continue() {
+fn old_timeline_formats_are_rejected_by_readers_and_writers() {
     use engine::timeline::TimelineReader;
+    use serde_json::json;
 
     let directory = TestDirectory::new();
     fs::create_dir_all(&directory.0).unwrap();
     fs::File::create(directory.0.join("writer.lock")).unwrap();
-    fs::write(
-        directory.0.join("head.json"),
-        br#"{"format":1,"game":"test","schema":1,"next_id":2,"tip":1,"cursor":1,"paused":false}"#,
-    )
-    .unwrap();
-    fs::write(
-        directory.0.join("00000000000000000000.json"),
-        br#"{"previous":null,"state":42}"#,
-    )
-    .unwrap();
-    fs::write(
-        directory.0.join("00000000000000000001.json"),
-        br#"{"previous":0,"state":45}"#,
-    )
-    .unwrap();
-
-    let (mut timeline, restored) = Timeline::open::<u32>(&directory.0, SCHEMA).unwrap();
-    assert_eq!(restored, Some(45));
-    assert_eq!(timeline.position().unwrap().at_ms, 250);
-    timeline.capture_at(&47u32, 450).unwrap();
-    drop(timeline);
-    let reader = TimelineReader::open(&directory.0, SCHEMA).unwrap();
-    assert_eq!(
-        reader
-            .snapshots::<u32>()
-            .map(|s| s.unwrap().state)
-            .collect::<Vec<_>>(),
-        [42, 45, 47]
-    );
-    assert_eq!(
-        reader
-            .frames()
-            .iter()
-            .map(|frame| frame.at_ms)
-            .collect::<Vec<_>>(),
-        [0, 250, 450]
-    );
+    let head_path = directory.0.join("head.json");
+    for format in [1, 2] {
+        let head = json!({
+            "format": format,
+            "game": "test",
+            "schema": 1,
+            "next_id": 1,
+            "tip": 0,
+            "cursor": 0,
+            "paused": false,
+        });
+        let json = serde_json::to_vec(&head).unwrap();
+        fs::write(&head_path, &json).unwrap();
+        let reader_error = TimelineReader::open(&directory.0, SCHEMA).err().unwrap();
+        let writer_error = Timeline::open::<u32>(&directory.0, SCHEMA).err().unwrap();
+        for err in [reader_error, writer_error] {
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("incompatible timeline"));
+            assert!(err.to_string().contains("--fresh"));
+        }
+        assert_eq!(fs::read(&head_path).unwrap(), json);
+    }
 }
 
 #[test]

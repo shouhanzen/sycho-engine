@@ -36,38 +36,22 @@ pub fn skilltree_grid_viewport(layout: SkillTreeLayout) -> Option<Rect> {
     Some(Rect::new(layout.grid_origin_x, layout.grid_origin_y, w, h))
 }
 
-pub fn skilltree_world_cell_at_screen(
-    skilltree: &SkillTreeRuntime,
-    layout: SkillTreeLayout,
-    sx: u32,
-    sy: u32,
-) -> Option<Vec2i> {
+pub fn skilltree_world_cell_at_screen(layout: SkillTreeLayout, sx: u32, sy: u32) -> Option<Vec2i> {
     let view = skilltree_grid_viewport(layout)?;
     if !view.contains(sx, sy) {
         return None;
     }
-
-    let cell = layout.grid_cell as f32;
-    if cell <= 0.0 {
-        return None;
-    }
-
-    // Camera min in world cells (float).
-    let default_cam_min_x = -(layout.grid_cols as i32) / 2;
-    let cam_min_x = default_cam_min_x as f32 + skilltree.camera.pan.x;
-    let cam_min_y = skilltree.camera.pan.y;
-
-    // Pixel centers (avoid boundary edge-cases).
-    let sx = sx as f32 + 0.5;
-    let sy = sy as f32 + 0.5;
-
-    let col_f = (sx - layout.grid_origin_x as f32) / cell;
-    let row_from_top_f = (sy - layout.grid_origin_y as f32) / cell;
-
-    let world_x = cam_min_x + col_f;
-    let world_y = cam_min_y + (layout.grid_rows as f32) - row_from_top_f;
-
-    Some(Vec2i::new(world_x.floor() as i32, world_y.floor() as i32))
+    let cell = i64::from(layout.grid_cell);
+    let x = i64::from(sx) - i64::from(layout.grid_origin_x) - i64::from(layout.grid_pan_px_x);
+    let y = i64::from(sy) - i64::from(layout.grid_origin_y) - i64::from(layout.grid_pan_px_y);
+    let column = x.div_euclid(cell) as i32;
+    let row = y.div_euclid(cell) as i32;
+    Some(Vec2i::new(
+        layout.grid_cam_min_x.saturating_add(column),
+        layout
+            .grid_cam_min_y
+            .saturating_add(layout.grid_rows as i32 - 1 - row),
+    ))
 }
 
 pub fn skilltree_node_at_world<'a>(

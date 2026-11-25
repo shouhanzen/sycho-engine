@@ -44,6 +44,115 @@ pub trait Renderer2d {
     }
 }
 
+/// Fits drawing at a recorded viewport into the current render target.
+pub struct FittedRenderer<'a> {
+    target: &'a mut dyn Renderer2d,
+    viewport: SurfaceSize,
+    fitted: Rect,
+}
+
+impl<'a> FittedRenderer<'a> {
+    pub fn new(target: &'a mut dyn Renderer2d, viewport: SurfaceSize) -> Self {
+        let fitted = Self::fit(viewport, target.size());
+        Self {
+            target,
+            viewport,
+            fitted,
+        }
+    }
+
+    fn fit(viewport: SurfaceSize, output: SurfaceSize) -> Rect {
+        if viewport.is_empty() || output.is_empty() {
+            return Rect::default();
+        }
+        let scale = (f64::from(output.width) / f64::from(viewport.width))
+            .min(f64::from(output.height) / f64::from(viewport.height));
+        let width = (f64::from(viewport.width) * scale).round().max(1.0) as u32;
+        let height = (f64::from(viewport.height) * scale).round().max(1.0) as u32;
+        Rect::new(
+            (output.width - width) / 2,
+            (output.height - height) / 2,
+            width,
+            height,
+        )
+    }
+
+    fn transform(&self, rect: Rect) -> Rect {
+        if self.viewport.is_empty() {
+            return Rect::default();
+        }
+        let fit = |coordinate: u32, from: u32, to: u32| {
+            (u64::from(coordinate.min(from)) * u64::from(to) / u64::from(from)) as u32
+        };
+        let x = fit(rect.x, self.viewport.width, self.fitted.w);
+        let y = fit(rect.y, self.viewport.height, self.fitted.h);
+        let right = fit(
+            rect.x.saturating_add(rect.w),
+            self.viewport.width,
+            self.fitted.w,
+        );
+        let bottom = fit(
+            rect.y.saturating_add(rect.h),
+            self.viewport.height,
+            self.fitted.h,
+        );
+        Rect::new(self.fitted.x + x, self.fitted.y + y, right - x, bottom - y)
+    }
+}
+
+impl Renderer2d for FittedRenderer<'_> {
+    fn begin_frame(&mut self, size: SurfaceSize) {
+        self.viewport = size;
+        self.fitted = Self::fit(size, self.target.size());
+    }
+
+    fn size(&self) -> SurfaceSize {
+        self.viewport
+    }
+
+    fn fill_rect(&mut self, rect: Rect, color: Color) {
+        self.target.fill_rect(self.transform(rect), color);
+    }
+
+    fn blend_rect(&mut self, rect: Rect, color: Color, alpha: u8) {
+        self.target.blend_rect(self.transform(rect), color, alpha);
+    }
+
+    fn rect_outline(&mut self, rect: Rect, color: Color) {
+        self.target.rect_outline(self.transform(rect), color);
+    }
+
+    fn draw_text_scaled(&mut self, x: u32, y: u32, text: &str, color: Color, scale: u32) {
+        let scale = scale.max(1);
+        let (mut cursor_x, mut cursor_y) = (x, y);
+        for ch in text.chars() {
+            if ch == '\n' {
+                cursor_x = x;
+                cursor_y = cursor_y.saturating_add(line_advance_y(scale));
+                continue;
+            }
+            if ch != ' ' {
+                for (row, bits) in glyph_rows(ch).into_iter().enumerate() {
+                    for col in 0..GLYPH_W {
+                        if bits & (1 << (GLYPH_W - 1 - col)) != 0 {
+                            self.fill_rect(
+                                Rect::new(
+                                    cursor_x.saturating_add(col.saturating_mul(scale)),
+                                    cursor_y.saturating_add((row as u32).saturating_mul(scale)),
+                                    scale,
+                                    scale,
+                                ),
+                                color,
+                            );
+                        }
+                    }
+                }
+            }
+            cursor_x = cursor_x.saturating_add(glyph_advance_x(scale));
+        }
+    }
+}
+
 /// CPU renderer that draws into an RGBA frame buffer.
 pub struct CpuRenderer<'a> {
     frame: &'a mut [u8],

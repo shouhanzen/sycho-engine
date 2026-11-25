@@ -1,6 +1,8 @@
 use std::convert::Infallible;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SurfaceSize {
     pub width: u32,
     pub height: u32,

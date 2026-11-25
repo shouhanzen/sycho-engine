@@ -8,8 +8,9 @@
 use std::sync::OnceLock;
 
 use engine::graphics::{Color, Renderer2d};
-use engine::render::{CELL_SIZE, clip_rect_i32_to_viewport, clip_rect_to_viewport};
-use engine::ui::Rect;
+use engine::ui::{Rect, clip_rect_i32_to_viewport, clip_rect_to_viewport};
+
+use crate::board_render::CELL_SIZE;
 
 // ── Biome model ─────────────────────────────────────────────────────
 
@@ -142,13 +143,8 @@ fn biome_for_world_depth_at_near_col(
     world_depth: u32,
     near_col: u32,
     seed: u64,
-    legacy_underground_start: bool,
 ) -> BackgroundBiome {
-    let surface_depth_start = if legacy_underground_start {
-        0
-    } else {
-        surface_boundary_depth_for_near_col(seed, near_col)
-    };
+    let surface_depth_start = surface_boundary_depth_for_near_col(seed, near_col);
     biome_at_depth_with_surface(world_depth, surface_depth_start)
 }
 
@@ -317,7 +313,6 @@ const DISABLE_LAYER_FAR_ENV: &str = "ROLLOUT_DISABLE_LAYER_FAR";
 const DISABLE_LAYER_MID_ENV: &str = "ROLLOUT_DISABLE_LAYER_MID";
 const DISABLE_LAYER_NEAR_ENV: &str = "ROLLOUT_DISABLE_LAYER_NEAR";
 const BLEND_DEBUG_ENV: &str = "ROLLOUT_BLEND_DEBUG";
-const LEGACY_UNDERGROUND_START_ENV: &str = "ROLLOUT_BG_FORCE_LEGACY_UNDERGROUND_START";
 
 /// Environment-controlled kill switch for quick debugging.
 ///
@@ -389,15 +384,6 @@ fn blend_debug_enabled() -> bool {
     *ENABLED.get_or_init(|| env_flag(BLEND_DEBUG_ENV))
 }
 
-/// Force old behavior where runs start underground (Dirt).
-///
-/// Set `ROLLOUT_BG_FORCE_LEGACY_UNDERGROUND_START=1` to bypass the Overworld
-/// surface region entirely.
-fn legacy_underground_start_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| env_flag(LEGACY_UNDERGROUND_START_ENV))
-}
-
 // ── Draw entry point ────────────────────────────────────────────────
 
 /// Draws the depth-scrolling tile background behind the board.
@@ -450,7 +436,7 @@ pub fn draw_surface_grass_overlay_in_viewport(
     if viewport_rect.w == 0 || viewport_rect.h == 0 || !tile_background_enabled() {
         return;
     }
-    if layer_disabled(BackgroundLayerId::Near) || legacy_underground_start_enabled() {
+    if layer_disabled(BackgroundLayerId::Near) {
         return;
     }
     if forced_biome().is_some() {
@@ -550,7 +536,7 @@ fn draw_surface_grass_overlay_impl(
 
             let hash = tile_hash(seed, world_depth, tile_x, layer_id_u32);
             let near_col = near_col_for_tile(viewport_rect, x, w);
-            if biome_for_world_depth_at_near_col(world_depth, near_col, seed, false)
+            if biome_for_world_depth_at_near_col(world_depth, near_col, seed)
                 != BackgroundBiome::Dirt
                 || world_depth != surface_boundary_depth_for_near_col(seed, near_col)
             {
@@ -603,7 +589,6 @@ fn draw_tile_layer(
 
     let tile_px_i32 = tile_px.min(i32::MAX as u32) as i32;
     let viewport_h_i32 = viewport_rect.h.min(i32::MAX as u32) as i32;
-    let legacy_underground_start = legacy_underground_start_enabled();
     let forced = forced_biome();
 
     // Apply parallax multiplier override for non-near layers.
@@ -658,12 +643,7 @@ fn draw_tile_layer(
             let biome = if let Some(forced_biome) = forced {
                 forced_biome
             } else {
-                biome_for_world_depth_at_near_col(
-                    world_depth,
-                    near_col,
-                    seed,
-                    legacy_underground_start,
-                )
+                biome_for_world_depth_at_near_col(world_depth, near_col, seed)
             };
             let palette = palette_for_biome(biome);
 
@@ -680,7 +660,6 @@ fn draw_tile_layer(
 
             // Draw only the Overworld->Dirt separator as a jagged grassline.
             if forced.is_none()
-                && !legacy_underground_start
                 && layer.layer_id == BackgroundLayerId::Near
                 && biome == BackgroundBiome::Dirt
                 && world_depth == surface_boundary_depth_for_near_col(seed, near_col)
@@ -882,13 +861,8 @@ fn draw_blend_debug_overlay(
         .w
         .saturating_div(CELL_SIZE.max(1))
         .saturating_div(2);
-    let legacy = legacy_underground_start_enabled();
-    let surface_depth = if legacy {
-        0
-    } else {
-        surface_boundary_depth_for_near_col(seed, center_col)
-    };
-    let biome = biome_for_world_depth_at_near_col(sample_depth, center_col, seed, legacy);
+    let surface_depth = surface_boundary_depth_for_near_col(seed, center_col);
+    let biome = biome_for_world_depth_at_near_col(sample_depth, center_col, seed);
     let biome_name = |b: BackgroundBiome| match b {
         BackgroundBiome::Overworld => "OVERWORLD",
         BackgroundBiome::Dirt => "DIRT",
@@ -1033,7 +1007,7 @@ mod tests {
         for col in 0..48 {
             for &depth in &bottom_three {
                 assert_eq!(
-                    biome_for_world_depth_at_near_col(depth, col, seed, false),
+                    biome_for_world_depth_at_near_col(depth, col, seed),
                     BackgroundBiome::Dirt,
                     "expected start bottom rows to be Dirt at col={col}, depth={depth}"
                 );
@@ -1057,11 +1031,11 @@ mod tests {
 
         // At depth_rows=0, row_at_depth0 is first Dirt row.
         assert_eq!(
-            biome_for_world_depth_at_near_col(row_at_depth0, col, seed, false),
+            biome_for_world_depth_at_near_col(row_at_depth0, col, seed),
             BackgroundBiome::Dirt
         );
         assert_eq!(
-            biome_for_world_depth_at_near_col(row_at_depth0 - 1, col, seed, false),
+            biome_for_world_depth_at_near_col(row_at_depth0 - 1, col, seed),
             BackgroundBiome::Overworld
         );
 
@@ -1070,14 +1044,6 @@ mod tests {
         assert_eq!(
             world_depth_new_separator, boundary,
             "new separator row should map to the same boundary depth"
-        );
-    }
-
-    #[test]
-    fn legacy_underground_start_skips_overworld() {
-        assert_eq!(
-            biome_for_world_depth_at_near_col(0, 0, 1, true),
-            BackgroundBiome::Dirt
         );
     }
 
@@ -1376,11 +1342,11 @@ mod tests {
         let col = 7u32;
         for layer in BackgroundLayerId::ALL {
             let h = tile_hash(seed, depth, col, layer as u32);
-            let biome = biome_for_world_depth_at_near_col(depth, col, seed, false);
+            let biome = biome_for_world_depth_at_near_col(depth, col, seed);
             let kind = BackgroundTileKind::from_hash(h, biome);
 
             let h2 = tile_hash(seed, depth, col, layer as u32);
-            let biome2 = biome_for_world_depth_at_near_col(depth, col, seed, false);
+            let biome2 = biome_for_world_depth_at_near_col(depth, col, seed);
             let kind2 = BackgroundTileKind::from_hash(h2, biome2);
 
             assert_eq!(biome, biome2);

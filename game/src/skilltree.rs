@@ -40,7 +40,7 @@ pub struct SkillNodeDef {
     /// Polyblock cells relative to `pos` (disconnected shapes are allowed).
     pub shape: Vec<Vec2i>,
 
-    /// Optional visual identifier; by default we map 0..=7 via `engine::render::color_for_cell`.
+    /// Optional visual identifier; by default we map 0..=7 via `crate::board_render::color_for_cell`.
     pub color: u8,
 
     /// Purchase cost in meta-currency ("money").

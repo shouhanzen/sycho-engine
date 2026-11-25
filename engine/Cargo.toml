@@ -12,3 +12,11 @@ pixels = "0.13"
 pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
 winit = { version = "0.28", features = ["serde"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.9"
+foreign-types = "0.3"
+mach2 = "0.4"
+metal = "0.24"
+objc = "0.2"
+wgpu-hal = { version = "0.16", features = ["metal"] }

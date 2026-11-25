@@ -8,7 +8,7 @@ use crate::perf_budget::{
     classify_budget, summarize_statuses,
 };
 use engine::graphics::Renderer2d;
-use engine::profiling::{Profiler, StepTimings};
+use engine::profiling::Profiler;
 use engine::ui::Rect;
 
 const COLOR_TEXT: [u8; 4] = [235, 235, 245, 255];
@@ -95,9 +95,7 @@ pub struct DebugHud {
     last_input_at: Option<Instant>,
 
     frame_dt: RollingMs,
-    engine_step_dt: RollingMs,
-    engine_total_dt: RollingMs,
-    engine_record_dt: RollingMs,
+    engine_dt: RollingMs,
     input_dt: RollingMs,
     gravity_dt: RollingMs,
     board_dt: RollingMs,
@@ -126,9 +124,7 @@ impl DebugHud {
             pending_gravity: Duration::ZERO,
             last_input_at: None,
             frame_dt: RollingMs::new(window),
-            engine_step_dt: RollingMs::new(window),
-            engine_total_dt: RollingMs::new(window),
-            engine_record_dt: RollingMs::new(window),
+            engine_dt: RollingMs::new(window),
             input_dt: RollingMs::new(window),
             gravity_dt: RollingMs::new(window),
             board_dt: RollingMs::new(window),
@@ -262,10 +258,9 @@ impl DebugHud {
                 since_input_ms
             )),
             HudLine::plain(format!(
-                "ENGINE STEP {:>5.2}MS  TOT {:>5.2}MS  REC {:>5.2}MS",
-                self.engine_step_dt.last(),
-                self.engine_total_dt.last(),
-                self.engine_record_dt.last()
+                "ENGINE STEP {:>5.2}MS (AVG {:>5.2})",
+                self.engine_dt.last(),
+                self.engine_dt.avg()
             )),
             HudLine::plain(format!(
                 "GRAV  {:>5.2}MS (AVG {:>5.2})",
@@ -483,8 +478,8 @@ impl DebugHud {
             self.budget_config.frame_total,
         );
         let engine_status = self.budget_engine_total.observe(
-            self.engine_total_dt.last(),
-            self.engine_total_dt.avg(),
+            self.engine_dt.last(),
+            self.engine_dt.avg(),
             self.budget_config.engine_total,
         );
         let draw_status = self.budget_draw.observe(
@@ -537,12 +532,10 @@ impl DebugHud {
 }
 
 impl Profiler for DebugHud {
-    fn on_step(&mut self, _frame: usize, timings: StepTimings) {
+    fn on_step(&mut self, _frame: usize, elapsed: Duration) {
         if !self.enabled {
             return;
         }
-        self.engine_step_dt.push(timings.step);
-        self.engine_total_dt.push(timings.total);
-        self.engine_record_dt.push(timings.record);
+        self.engine_dt.push(elapsed);
     }
 }

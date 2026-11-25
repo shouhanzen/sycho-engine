@@ -1,3 +1,6 @@
+use engine::graphics::Renderer2d;
+use engine::ui::{Rect, clip_rect_i32_to_viewport, clip_rect_to_viewport};
+
 pub const CELL_SIZE: u32 = 24;
 
 const COLOR_BACKGROUND: [u8; 4] = [0, 0, 0, 255];
@@ -47,62 +50,12 @@ pub fn color_for_cell(cell: u8) -> [u8; 4] {
     }
 }
 
-/// Clip a screen-space rect to a viewport, returning the visible intersection.
-pub fn clip_rect_to_viewport(
-    rect: crate::ui::Rect,
-    viewport: crate::ui::Rect,
-) -> Option<crate::ui::Rect> {
-    clip_rect_i32_to_viewport(rect.x as i32, rect.y as i32, rect.w, rect.h, viewport)
-}
-
-/// Clip an `i32`-positioned rect to a viewport, returning the visible intersection.
-///
-/// This is useful when world-space content can be temporarily translated outside the
-/// viewport bounds (for example camera impulses) but must still render with fixed
-/// viewport clipping.
-pub fn clip_rect_i32_to_viewport(
-    x: i32,
-    y: i32,
-    w: u32,
-    h: u32,
-    viewport: crate::ui::Rect,
-) -> Option<crate::ui::Rect> {
-    if w == 0 || h == 0 || viewport.w == 0 || viewport.h == 0 {
-        return None;
-    }
-
-    let vx0 = viewport.x.min(i32::MAX as u32) as i32;
-    let vy0 = viewport.y.min(i32::MAX as u32) as i32;
-    let vx1 = viewport.x.saturating_add(viewport.w).min(i32::MAX as u32) as i32;
-    let vy1 = viewport.y.saturating_add(viewport.h).min(i32::MAX as u32) as i32;
-
-    let w_i32 = w.min(i32::MAX as u32) as i32;
-    let h_i32 = h.min(i32::MAX as u32) as i32;
-    let x1 = x.saturating_add(w_i32);
-    let y1 = y.saturating_add(h_i32);
-
-    let clipped_x0 = x.max(vx0);
-    let clipped_y0 = y.max(vy0);
-    let clipped_x1 = x1.min(vx1);
-    let clipped_y1 = y1.min(vy1);
-    if clipped_x1 <= clipped_x0 || clipped_y1 <= clipped_y0 {
-        return None;
-    }
-
-    Some(crate::ui::Rect::new(
-        clipped_x0 as u32,
-        clipped_y0 as u32,
-        (clipped_x1 - clipped_x0) as u32,
-        (clipped_y1 - clipped_y0) as u32,
-    ))
-}
-
-pub fn draw_board(gfx: &mut dyn crate::graphics::Renderer2d, board: &[Vec<u8>]) {
+pub fn draw_board(gfx: &mut dyn Renderer2d, board: &[Vec<u8>]) {
     let size = gfx.size();
     let width = size.width;
     let height = size.height;
 
-    gfx.fill_rect(crate::ui::Rect::from_size(width, height), COLOR_BACKGROUND);
+    gfx.fill_rect(Rect::from_size(width, height), COLOR_BACKGROUND);
 
     draw_board_cells(gfx, board);
 }
@@ -112,7 +65,7 @@ pub fn draw_board(gfx: &mut dyn crate::graphics::Renderer2d, board: &[Vec<u8>]) 
 /// Use this when you want to composite the board on top of a previously-drawn background
 /// layer (e.g. tile background).  The full-clearing `draw_board` is still available for
 /// callers that don't need layered compositing.
-pub fn draw_board_cells(gfx: &mut dyn crate::graphics::Renderer2d, board: &[Vec<u8>]) {
+pub fn draw_board_cells(gfx: &mut dyn Renderer2d, board: &[Vec<u8>]) {
     if board.is_empty() {
         return;
     }
@@ -132,7 +85,7 @@ pub fn draw_board_cells(gfx: &mut dyn crate::graphics::Renderer2d, board: &[Vec<
     draw_board_cells_in_rect(
         gfx,
         board,
-        crate::ui::Rect::new(offset_x, offset_y, board_pixel_width, board_pixel_height),
+        Rect::new(offset_x, offset_y, board_pixel_width, board_pixel_height),
     );
 }
 
@@ -140,11 +93,7 @@ pub fn draw_board_cells(gfx: &mut dyn crate::graphics::Renderer2d, board: &[Vec<
 ///
 /// `board_rect.w` / `board_rect.h` are currently ignored and board dimensions are derived from
 /// `board` and `CELL_SIZE`. This keeps rendering deterministic while exposing world-offset control.
-pub fn draw_board_cells_in_rect(
-    gfx: &mut dyn crate::graphics::Renderer2d,
-    board: &[Vec<u8>],
-    board_rect: crate::ui::Rect,
-) {
+pub fn draw_board_cells_in_rect(gfx: &mut dyn Renderer2d, board: &[Vec<u8>], board_rect: Rect) {
     if board.is_empty() {
         return;
     }
@@ -160,7 +109,7 @@ pub fn draw_board_cells_in_rect(
     let board_pixel_height = board_height.saturating_mul(CELL_SIZE);
     let offset_x = board_rect.x;
     let offset_y = board_rect.y;
-    let screen_rect = crate::ui::Rect::from_size(width, height);
+    let screen_rect = Rect::from_size(width, height);
 
     draw_board_outline(
         gfx,
@@ -188,16 +137,10 @@ pub fn draw_board_cells_in_rect(
                 let dot_size = 2u32;
                 let dot_x = pixel_x + (CELL_SIZE / 2).saturating_sub(dot_size / 2);
                 let dot_y = pixel_y + (CELL_SIZE / 2).saturating_sub(dot_size / 2);
-                gfx.fill_rect(
-                    crate::ui::Rect::new(dot_x, dot_y, dot_size, dot_size),
-                    COLOR_GRID_DOT,
-                );
+                gfx.fill_rect(Rect::new(dot_x, dot_y, dot_size, dot_size), COLOR_GRID_DOT);
             } else {
                 let color = color_for_cell(cell);
-                gfx.fill_rect(
-                    crate::ui::Rect::new(pixel_x, pixel_y, CELL_SIZE, CELL_SIZE),
-                    color,
-                );
+                gfx.fill_rect(Rect::new(pixel_x, pixel_y, CELL_SIZE, CELL_SIZE), color);
                 draw_exposed_cell_edges(gfx, board, None, x, y, pixel_x, pixel_y, screen_rect);
             }
         }
@@ -211,10 +154,10 @@ pub fn draw_board_cells_in_rect(
 /// This keeps `clip_rect` anchored as the board viewport while allowing camera-style
 /// content offsets inside that viewport.
 pub fn draw_board_cells_in_rect_clipped(
-    gfx: &mut dyn crate::graphics::Renderer2d,
+    gfx: &mut dyn Renderer2d,
     board: &[Vec<u8>],
-    board_rect: crate::ui::Rect,
-    clip_rect: crate::ui::Rect,
+    board_rect: Rect,
+    clip_rect: Rect,
 ) {
     draw_board_cells_in_rect_clipped_with_owners(gfx, board, None, board_rect, clip_rect);
 }
@@ -225,11 +168,11 @@ pub fn draw_board_cells_in_rect_clipped(
 /// When `board_owners` is provided, interior seams are drawn between adjacent non-empty cells
 /// that belong to different piece IDs.
 pub fn draw_board_cells_in_rect_clipped_with_owners(
-    gfx: &mut dyn crate::graphics::Renderer2d,
+    gfx: &mut dyn Renderer2d,
     board: &[Vec<u8>],
     board_owners: Option<&[Vec<Option<u32>>]>,
-    board_rect: crate::ui::Rect,
-    clip_rect: crate::ui::Rect,
+    board_rect: Rect,
+    clip_rect: Rect,
 ) {
     if board.is_empty() || clip_rect.w == 0 || clip_rect.h == 0 {
         return;
@@ -260,18 +203,27 @@ pub fn draw_board_cells_in_rect_clipped_with_owners(
                 let dot_size = 2u32;
                 let dot_x = pixel_x + (CELL_SIZE / 2).saturating_sub(dot_size / 2);
                 let dot_y = pixel_y + (CELL_SIZE / 2).saturating_sub(dot_size / 2);
-                let dot_rect = crate::ui::Rect::new(dot_x, dot_y, dot_size, dot_size);
+                let dot_rect = Rect::new(dot_x, dot_y, dot_size, dot_size);
                 if let Some(clipped_dot) = clip_rect_to_viewport(dot_rect, clip_rect) {
                     gfx.fill_rect(clipped_dot, COLOR_GRID_DOT);
                 }
             } else {
-                let cell_rect = crate::ui::Rect::new(pixel_x, pixel_y, CELL_SIZE, CELL_SIZE);
+                let cell_rect = Rect::new(pixel_x, pixel_y, CELL_SIZE, CELL_SIZE);
                 let Some(clipped_cell_rect) = clip_rect_to_viewport(cell_rect, clip_rect) else {
                     continue;
                 };
                 let color = color_for_cell(cell);
                 gfx.fill_rect(clipped_cell_rect, color);
-                draw_exposed_cell_edges(gfx, board, board_owners, x, y, pixel_x, pixel_y, clip_rect);
+                draw_exposed_cell_edges(
+                    gfx,
+                    board,
+                    board_owners,
+                    x,
+                    y,
+                    pixel_x,
+                    pixel_y,
+                    clip_rect,
+                );
             }
         }
     }
@@ -281,14 +233,14 @@ pub fn draw_board_cells_in_rect_clipped_with_owners(
 }
 
 fn draw_exposed_cell_edges(
-    gfx: &mut dyn crate::graphics::Renderer2d,
+    gfx: &mut dyn Renderer2d,
     board: &[Vec<u8>],
     board_owners: Option<&[Vec<Option<u32>>]>,
     x: usize,
     y: usize,
     pixel_x: u32,
     pixel_y: u32,
-    clip_rect: crate::ui::Rect,
+    clip_rect: Rect,
 ) {
     if board.is_empty() {
         return;
@@ -326,13 +278,13 @@ fn draw_exposed_cell_edges(
     };
 
     if let Some(stroke_px) = stroke_px_for_edge(left_kind, EdgeDir::Left) {
-        let edge_rect = crate::ui::Rect::new(pixel_x, pixel_y, stroke_px, CELL_SIZE);
+        let edge_rect = Rect::new(pixel_x, pixel_y, stroke_px, CELL_SIZE);
         if let Some(clipped) = clip_rect_to_viewport(edge_rect, clip_rect) {
             gfx.fill_rect(clipped, stroke_color);
         }
     }
     if let Some(stroke_px) = stroke_px_for_edge(right_kind, EdgeDir::Right) {
-        let edge_rect = crate::ui::Rect::new(
+        let edge_rect = Rect::new(
             pixel_x.saturating_add(CELL_SIZE.saturating_sub(stroke_px)),
             pixel_y,
             stroke_px,
@@ -343,13 +295,13 @@ fn draw_exposed_cell_edges(
         }
     }
     if let Some(stroke_px) = stroke_px_for_edge(up_kind, EdgeDir::Up) {
-        let edge_rect = crate::ui::Rect::new(pixel_x, pixel_y, CELL_SIZE, stroke_px);
+        let edge_rect = Rect::new(pixel_x, pixel_y, CELL_SIZE, stroke_px);
         if let Some(clipped) = clip_rect_to_viewport(edge_rect, clip_rect) {
             gfx.fill_rect(clipped, stroke_color);
         }
     }
     if let Some(stroke_px) = stroke_px_for_edge(down_kind, EdgeDir::Down) {
-        let edge_rect = crate::ui::Rect::new(
+        let edge_rect = Rect::new(
             pixel_x,
             pixel_y.saturating_add(CELL_SIZE.saturating_sub(stroke_px)),
             CELL_SIZE,
@@ -434,12 +386,12 @@ fn owner_at(board_owners: Option<&[Vec<Option<u32>>]>, x: usize, y: usize) -> Op
 }
 
 fn draw_interior_seam_corner_bridges(
-    gfx: &mut dyn crate::graphics::Renderer2d,
+    gfx: &mut dyn Renderer2d,
     board: &[Vec<u8>],
     board_owners: Option<&[Vec<Option<u32>>]>,
     offset_x: u32,
     offset_y: u32,
-    clip_rect: crate::ui::Rect,
+    clip_rect: Rect,
 ) {
     let Some(_owners) = board_owners else {
         return;
@@ -494,11 +446,11 @@ fn draw_interior_seam_corner_bridges(
 }
 
 fn draw_inside_corner_bridges(
-    gfx: &mut dyn crate::graphics::Renderer2d,
+    gfx: &mut dyn Renderer2d,
     board: &[Vec<u8>],
     offset_x: u32,
     offset_y: u32,
-    clip_rect: crate::ui::Rect,
+    clip_rect: Rect,
 ) {
     if board.is_empty() {
         return;
@@ -610,12 +562,12 @@ fn draw_inside_corner_bridges(
 }
 
 fn fill_rect_i32_clipped(
-    gfx: &mut dyn crate::graphics::Renderer2d,
+    gfx: &mut dyn Renderer2d,
     x: i32,
     y: i32,
     w: u32,
     h: u32,
-    clip_rect: crate::ui::Rect,
+    clip_rect: Rect,
     color: [u8; 4],
 ) {
     if let Some(clipped) = clip_rect_i32_to_viewport(x, y, w, h, clip_rect) {
@@ -634,7 +586,7 @@ fn edge_stroke_color_for_cell(cell: u8) -> [u8; 4] {
 }
 
 fn draw_board_outline(
-    gfx: &mut dyn crate::graphics::Renderer2d,
+    gfx: &mut dyn Renderer2d,
     offset_x: u32,
     offset_y: u32,
     board_pixel_width: u32,
@@ -650,7 +602,7 @@ fn draw_board_outline(
     // Top border
     if offset_y > 0 {
         gfx.fill_rect(
-            crate::ui::Rect::new(offset_x, offset_y - 1, board_pixel_width, 1),
+            Rect::new(offset_x, offset_y - 1, board_pixel_width, 1),
             COLOR_BOARD_OUTLINE,
         );
     }
@@ -658,7 +610,7 @@ fn draw_board_outline(
     // Bottom border
     if offset_y + board_pixel_height < height {
         gfx.fill_rect(
-            crate::ui::Rect::new(
+            Rect::new(
                 offset_x,
                 offset_y + board_pixel_height,
                 board_pixel_width,
@@ -671,7 +623,7 @@ fn draw_board_outline(
     // Left border
     if offset_x > 0 {
         gfx.fill_rect(
-            crate::ui::Rect::new(offset_x - 1, offset_y, 1, board_pixel_height),
+            Rect::new(offset_x - 1, offset_y, 1, board_pixel_height),
             COLOR_BOARD_OUTLINE,
         );
     }
@@ -679,7 +631,7 @@ fn draw_board_outline(
     // Right border
     if offset_x + board_pixel_width < width {
         gfx.fill_rect(
-            crate::ui::Rect::new(
+            Rect::new(
                 offset_x + board_pixel_width,
                 offset_y,
                 1,
@@ -692,25 +644,25 @@ fn draw_board_outline(
     // Corners (only if both adjacent sides exist)
     if offset_x > 0 && offset_y > 0 {
         gfx.fill_rect(
-            crate::ui::Rect::new(offset_x - 1, offset_y - 1, 1, 1),
+            Rect::new(offset_x - 1, offset_y - 1, 1, 1),
             COLOR_BOARD_OUTLINE,
         );
     }
     if offset_x + board_pixel_width < width && offset_y > 0 {
         gfx.fill_rect(
-            crate::ui::Rect::new(offset_x + board_pixel_width, offset_y - 1, 1, 1),
+            Rect::new(offset_x + board_pixel_width, offset_y - 1, 1, 1),
             COLOR_BOARD_OUTLINE,
         );
     }
     if offset_x > 0 && offset_y + board_pixel_height < height {
         gfx.fill_rect(
-            crate::ui::Rect::new(offset_x - 1, offset_y + board_pixel_height, 1, 1),
+            Rect::new(offset_x - 1, offset_y + board_pixel_height, 1, 1),
             COLOR_BOARD_OUTLINE,
         );
     }
     if offset_x + board_pixel_width < width && offset_y + board_pixel_height < height {
         gfx.fill_rect(
-            crate::ui::Rect::new(
+            Rect::new(
                 offset_x + board_pixel_width,
                 offset_y + board_pixel_height,
                 1,

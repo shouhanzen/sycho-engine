@@ -8,12 +8,12 @@ use engine::{
     GameLogic,
     graphics::CpuRenderer,
     regression::{
-        assert_or_update_golden_hashes, record_state_then_replay_and_compare_render_hashes_with,
+        assert_or_update_golden_hashes, record_state_then_replay_and_compare_render_hashes,
         update_goldens_enabled,
     },
-    render::{CELL_SIZE, draw_board},
     surface::SurfaceSize,
 };
+use game::board_render::{CELL_SIZE, draw_board};
 
 fn unique_temp_dir() -> PathBuf {
     let nanos = SystemTime::now()
@@ -44,12 +44,8 @@ impl GameLogic for GridGame {
         vec![vec![0u8; self.width]; self.height]
     }
 
-    fn step(&self, state: &Self::State, input: Self::Input) -> Self::State {
-        let mut next = state.clone();
-        if input.y < next.len() && input.x < next[input.y].len() {
-            next[input.y][input.x] = input.v;
-        }
-        next
+    fn step(&self, state: &mut Self::State, input: Self::Input) {
+        state[input.y][input.x] = input.v;
     }
 }
 
@@ -72,15 +68,11 @@ fn golden_gridgame_render_hashes_are_stable() {
         SetCell { x: 3, y: 2, v: 4 },
     ];
 
-    let artifacts = record_state_then_replay_and_compare_render_hashes_with(
+    let artifacts = record_state_then_replay_and_compare_render_hashes(
         name,
         &out_dir,
         game,
-        |runner| {
-            for input in inputs {
-                runner.step(input);
-            }
-        },
+        inputs,
         width,
         height,
         |state: &Vec<Vec<u8>>, buf: &mut [u8], width: u32, height: u32| {

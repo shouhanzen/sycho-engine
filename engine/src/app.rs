@@ -19,7 +19,8 @@ use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{Window, WindowBuilder};
 
 use crate::embedded::{
-    EditorEvent, GPU_PREVIEW_EXIT_CODE, GameLink, PREVIEW_HEIGHT, PREVIEW_WIDTH, TimelineStatus,
+    DEFAULT_PREVIEW_SIZE, EditorEvent, GPU_PREVIEW_EXIT_CODE, GameLink, TimelineStatus,
+    valid_preview_size,
 };
 use crate::graphics::Renderer2d;
 use crate::offscreen::{GpuPreview, PreviewWorker};
@@ -27,8 +28,6 @@ use crate::pixels_renderer::PixelsRenderer2d;
 use crate::reload::{self, ProcessCommand, RELOAD_EXIT_CODE};
 use crate::surface::SurfaceSize;
 use crate::timeline::{Frame, StateSchema, Timeline, TimelineCommand, TimelineWorker};
-use crate::ui_tree::UiInput;
-use crate::view_tree::{ViewTree, hit_test_actions};
 
 pub struct AppConfig {
     pub title: String,
@@ -41,7 +40,6 @@ pub struct AppConfig {
 #[derive(Debug, Clone)]
 pub struct TimelineConfig {
     pub directory: PathBuf,
-    pub checkpoint_interval: Duration,
     pub playback: bool,
 }
 
@@ -61,7 +59,6 @@ pub struct TimelineCli {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunMode {
-    Normal,
     Timeline,
     Profile,
 }
@@ -115,10 +112,10 @@ pub struct AppContext {
 }
 
 /// Native window and presentation state for host-level applications.
-pub struct WindowContext {
-    pub window: Window,
-    pub renderer: PixelsRenderer2d,
-    pub app: AppContext,
+struct WindowContext {
+    window: Window,
+    renderer: PixelsRenderer2d,
+    app: AppContext,
 }
 
 impl WindowContext {
@@ -138,8 +135,6 @@ impl WindowContext {
 #[derive(Debug, Clone)]
 pub struct InputFrame {
     pub mouse_pos: Option<(u32, u32)>,
-    pub mouse_down: bool,
-    pub mouse_up: bool,
     pub mouse_buttons_down: HashSet<MouseButton>,
     pub mouse_buttons_pressed: HashSet<MouseButton>,
     pub mouse_buttons_released: HashSet<MouseButton>,
@@ -155,8 +150,6 @@ impl Default for InputFrame {
     fn default() -> Self {
         Self {
             mouse_pos: None,
-            mouse_down: false,
-            mouse_up: false,
             mouse_buttons_down: HashSet::new(),
             mouse_buttons_pressed: HashSet::new(),
             mouse_buttons_released: HashSet::new(),
@@ -183,7 +176,6 @@ impl InputFrame {
     }
 
     fn apply_mouse_button_state(&mut self, button: MouseButton, state: ElementState) {
-        let was_down = self.mouse_buttons_down.contains(&button);
         apply_button_transition(
             &mut self.mouse_buttons_down,
             &mut self.mouse_buttons_pressed,
@@ -191,14 +183,6 @@ impl InputFrame {
             button,
             state,
         );
-
-        if button == MouseButton::Left {
-            if !was_down && matches!(state, ElementState::Pressed) {
-                self.mouse_down = true;
-            } else if was_down && matches!(state, ElementState::Released) {
-                self.mouse_up = true;
-            }
-        }
     }
 
     fn apply_scroll_delta(&mut self, delta: &MouseScrollDelta) {
@@ -223,8 +207,6 @@ impl InputFrame {
             self.mouse_buttons_down.clear();
             self.mouse_buttons_pressed.clear();
             self.mouse_buttons_released.clear();
-            self.mouse_down = false;
-            self.mouse_up = false;
         }
     }
 
@@ -244,13 +226,14 @@ impl InputFrame {
                 self.window_focused = focused;
                 self.mouse_pos = None;
             }
-            EditorEvent::Timeline(_) => {}
+            EditorEvent::Resize(_)
+            | EditorEvent::Timeline(_)
+            | EditorEvent::ReleaseSurface(_)
+            | EditorEvent::UseRgba => {}
         }
     }
 
     fn clear_frame_transients(&mut self) {
-        self.mouse_down = false;
-        self.mouse_up = false;
         self.mouse_buttons_pressed.clear();
         self.mouse_buttons_released.clear();
         self.keys_pressed.clear();
@@ -290,6 +273,7 @@ fn apply_window_event_to_input(input: &mut InputFrame, event: &WindowEvent) {
             let new_y = position.y.max(0.0) as u32;
             input.mouse_pos = Some((new_x, new_y));
         }
+        WindowEvent::CursorLeft { .. } => input.mouse_pos = None,
         WindowEvent::MouseInput {
             state: mouse_state,
             button,
@@ -320,30 +304,18 @@ fn apply_window_event_to_input(input: &mut InputFrame, event: &WindowEvent) {
 
 pub trait GameApp {
     type State;
-    type Action: Clone;
-    type Effect;
 
     fn init_state(&mut self, _ctx: &mut AppContext) -> Self::State;
-
-    fn build_view(&self, state: &Self::State, _ctx: &AppContext) -> ViewTree<Self::Action>;
 
     fn update_state(
         &mut self,
         state: &mut Self::State,
-        input: InputFrame,
+        input: &InputFrame,
         dt: Duration,
-        actions: &[Self::Action],
         _ctx: &mut AppContext,
-    ) -> Vec<Self::Effect>;
-
-    fn render(
-        &mut self,
-        state: &Self::State,
-        view: &ViewTree<Self::Action>,
-        renderer: &mut dyn Renderer2d,
     );
 
-    fn handle_effects(&mut self, _effects: Vec<Self::Effect>, _ctx: &mut AppContext) {}
+    fn render(&mut self, state: &Self::State, renderer: &mut dyn Renderer2d);
 
     fn on_run_mode(&mut self, _mode: RunMode, _state: &mut Self::State, _ctx: &mut AppContext) {}
 
@@ -365,19 +337,6 @@ pub trait GameApp {
         // Gameplay/UI keyboard+mouse decisions should read from `InputFrame` in `update_state`.
         false
     }
-}
-
-pub trait AppHandler {
-    fn init(&mut self, _ctx: &mut WindowContext) -> Result<(), Box<dyn Error>> {
-        Ok(())
-    }
-
-    fn handle_event(
-        &mut self,
-        event: Event<()>,
-        control_flow: &mut ControlFlow,
-        ctx: &mut WindowContext,
-    );
 }
 
 fn create_app_context(
@@ -443,22 +402,6 @@ fn create_app_context(
     })
 }
 
-pub fn run_app<H: AppHandler + 'static>(
-    config: AppConfig,
-    mut handler: H,
-) -> Result<(), Box<dyn Error>> {
-    let event_loop = EventLoop::new();
-    let mut ctx = create_app_context(&config, &event_loop)?;
-    handler.init(&mut ctx)?;
-
-    event_loop.run(move |event, _, control_flow| {
-        handler.handle_event(event, control_flow, &mut ctx);
-    });
-
-    #[allow(unreachable_code)]
-    Ok(())
-}
-
 /// Hooks for a game whose simulation can continue from a recorded snapshot.
 pub trait TimelineGame: GameApp {
     type Snapshot: Clone + Send + Serialize + DeserializeOwned + 'static;
@@ -479,13 +422,11 @@ pub trait TimelineGame: GameApp {
 
     fn apply_preview_feedback(&mut self, _state: &Self::State, _feedback: Self::PreviewFeedback) {}
 
+    fn set_history_view(&mut self, _historical: bool) {}
+
     fn timeline_command(&self, _input: &InputFrame) -> Option<TimelineCommand> {
         None
     }
-}
-
-pub fn run_game<G: GameApp + 'static>(config: AppConfig, game: G) -> Result<(), Box<dyn Error>> {
-    run_live(config, game, NormalSession)
 }
 
 pub fn run_game_with_timeline<G>(
@@ -527,54 +468,14 @@ where
         playback: None,
         writer: TimelineWorker::start(timeline)?,
         snapshot,
-        pending: None,
-        interval: options.checkpoint_interval,
-        last_checkpoint: Instant::now(),
+        capture_failed: false,
         overseer: reload::listen_for_overseer(),
     };
     if let Some((editor, preview)) = editor {
         run_embedded(game, session, editor, preview)
     } else {
-        run_live(config, game, session)
+        run_windowed_timeline(config, game, session)
     }
-}
-
-trait LiveSession<G: GameApp> {
-    const MODE: RunMode;
-
-    fn start(&mut self, game: &mut G, ctx: &mut AppContext) -> io::Result<G::State> {
-        Ok(game.init_state(ctx))
-    }
-
-    fn should_update(
-        &mut self,
-        _game: &mut G,
-        _state: &mut G::State,
-        _input: &InputFrame,
-        _command: Option<TimelineCommand>,
-    ) -> bool {
-        true
-    }
-
-    fn timeline_status(&self) -> Option<TimelineStatus> {
-        None
-    }
-
-    fn after_update(&mut self, _state: &G::State, _now: Instant) {}
-
-    fn process_command(&mut self) -> Option<ProcessCommand> {
-        None
-    }
-
-    fn save(&mut self, _state: &G::State) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-struct NormalSession;
-
-impl<G: GameApp> LiveSession<G> for NormalSession {
-    const MODE: RunMode = RunMode::Normal;
 }
 
 struct Playback {
@@ -588,41 +489,17 @@ enum TimelineAction {
     PlayUntil(u64),
 }
 
-struct TimelineSession<S> {
-    writer: TimelineWorker,
-    pending: Option<Receiver<io::Result<Option<Frame>>>>,
+struct TimelineSession<G: TimelineGame> {
+    writer: TimelineWorker<G::Snapshot>,
+    capture_failed: bool,
     paused: bool,
     cursor: Option<Frame>,
     tip: Option<Frame>,
     clock_position: u64,
     clock_start: Instant,
     playback: Option<Playback>,
-    snapshot: Option<S>,
-    interval: Duration,
-    last_checkpoint: Instant,
+    snapshot: Option<G::Snapshot>,
     overseer: Option<Receiver<ProcessCommand>>,
-}
-
-impl<S> TimelineSession<S> {
-    fn live_time_ms(&self) -> u64 {
-        self.clock_position
-            .saturating_add(elapsed_ms(self.clock_start))
-    }
-
-    fn poll_capture(&mut self) {
-        let Some(pending) = &self.pending else { return };
-        match pending.try_recv() {
-            Ok(Ok(frame)) if !self.paused => {
-                self.cursor = frame;
-                self.tip = frame;
-            }
-            Ok(Ok(_)) => {}
-            Ok(Err(err)) => eprintln!("could not record timeline checkpoint: {err}"),
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => eprintln!("timeline writer stopped"),
-        }
-        self.pending = None;
-    }
 }
 
 fn update_timeline_title(window: &Window, title: &str, status: TimelineStatus) {
@@ -642,8 +519,27 @@ fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-impl<G: TimelineGame> LiveSession<G> for TimelineSession<G::Snapshot> {
-    const MODE: RunMode = RunMode::Timeline;
+impl<G: TimelineGame> TimelineSession<G> {
+    fn live_time_ms(&self) -> u64 {
+        self.clock_position
+            .saturating_add(elapsed_ms(self.clock_start))
+    }
+
+    fn poll_capture(&mut self) {
+        for result in self.writer.commits() {
+            match result {
+                Ok(frame) if !self.paused => {
+                    self.cursor = Some(frame);
+                    self.tip = Some(frame);
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    eprintln!("could not record timeline checkpoint: {err}");
+                    self.capture_failed = true;
+                }
+            }
+        }
+    }
 
     fn start(&mut self, game: &mut G, ctx: &mut AppContext) -> io::Result<G::State> {
         let state = if let Some(snapshot) = self.snapshot.take() {
@@ -659,8 +555,8 @@ impl<G: TimelineGame> LiveSession<G> for TimelineSession<G::Snapshot> {
             self.tip = position;
             state
         };
-        self.last_checkpoint = Instant::now();
-        self.clock_start = self.last_checkpoint;
+        game.set_history_view(self.paused);
+        self.clock_start = Instant::now();
         Ok(state)
     }
 
@@ -673,6 +569,18 @@ impl<G: TimelineGame> LiveSession<G> for TimelineSession<G::Snapshot> {
     ) -> bool {
         self.poll_capture();
         let action = if let Some(command) = command.or_else(|| game.timeline_command(input)) {
+            let command = match command {
+                TimelineCommand::TogglePlayPause
+                    if self.paused
+                        && self.playback.is_none()
+                        && self.tip.is_some()
+                        && self.cursor == self.tip =>
+                {
+                    TimelineCommand::ResumeLive
+                }
+                TimelineCommand::TogglePlayPause => TimelineCommand::TogglePlayback,
+                command => command,
+            };
             let was_playing = self.playback.take().is_some();
             if command == TimelineCommand::TogglePlayback && was_playing {
                 return false;
@@ -734,8 +642,9 @@ impl<G: TimelineGame> LiveSession<G> for TimelineSession<G::Snapshot> {
         });
         match result {
             Ok((paused, cursor, tip, changed, next)) => {
-                self.pending = None;
+                self.poll_capture();
                 self.paused = paused;
+                game.set_history_view(paused);
                 self.cursor = cursor;
                 match tip {
                     Ok(tip) => self.tip = tip,
@@ -774,33 +683,28 @@ impl<G: TimelineGame> LiveSession<G> for TimelineSession<G::Snapshot> {
                 eprintln!("timeline control failed: {err}");
             }
         }
-        self.last_checkpoint = Instant::now();
         false
     }
 
-    fn timeline_status(&self) -> Option<TimelineStatus> {
-        Some(TimelineStatus {
+    fn status(&self) -> TimelineStatus {
+        TimelineStatus {
             cursor: self.cursor,
             tip: self.tip,
             paused: self.paused,
             playing: self.playback.is_some(),
-        })
+        }
     }
 
-    fn after_update(&mut self, state: &G::State, now: Instant) {
-        if self.pending.is_some() {
+    fn after_update(&mut self, state: &G::State) {
+        if self.capture_failed {
             return;
         }
-        if now.saturating_duration_since(self.last_checkpoint) >= self.interval {
-            self.last_checkpoint = now;
-            let snapshot = G::snapshot(state).clone();
-            let at_ms = self.live_time_ms();
-            match self.writer.submit(move |timeline| {
-                timeline.capture_at(&snapshot, at_ms)?;
-                Ok(timeline.position())
-            }) {
-                Ok(pending) => self.pending = Some(pending),
-                Err(err) => eprintln!("could not queue timeline checkpoint: {err}"),
+        let at_ms = self.live_time_ms();
+        if let Err(err) = self.writer.capture(G::snapshot(state).clone(), at_ms) {
+            self.poll_capture();
+            if !self.capture_failed {
+                eprintln!("could not queue timeline checkpoint: {err}");
+                self.capture_failed = true;
             }
         }
     }
@@ -817,27 +721,8 @@ impl<G: TimelineGame> LiveSession<G> for TimelineSession<G::Snapshot> {
     }
 }
 
-fn update_game<G: GameApp>(
-    game: &mut G,
-    state: &mut G::State,
-    input: &InputFrame,
-    dt: Duration,
-    ctx: &mut AppContext,
-) -> Vec<G::Effect> {
-    let view = game.build_view(state, ctx);
-    let actions = hit_test_actions(
-        &view,
-        UiInput {
-            mouse_pos: input.mouse_pos,
-            mouse_down: input.mouse_down,
-            mouse_up: input.mouse_up,
-        },
-    );
-    game.update_state(state, input.clone(), dt, &actions, ctx)
-}
-
-fn exit_for_command<G: GameApp>(
-    session: &mut impl LiveSession<G>,
+fn exit_for_command<G: TimelineGame>(
+    session: &mut TimelineSession<G>,
     state: &G::State,
     command: ProcessCommand,
 ) -> Option<i32> {
@@ -858,12 +743,13 @@ fn exit_for_command<G: GameApp>(
 
 fn run_embedded<G: TimelineGame>(
     mut game: G,
-    mut session: TimelineSession<G::Snapshot>,
+    mut session: TimelineSession<G>,
     editor: GameLink,
     preview: PreviewWorker<G::PreviewSnapshot, G::PreviewFeedback>,
 ) -> Result<(), Box<dyn Error>> {
-    let size = SurfaceSize::new(PREVIEW_WIDTH, PREVIEW_HEIGHT);
-    let mut ctx = AppContext { surface_size: size };
+    let mut ctx = AppContext {
+        surface_size: DEFAULT_PREVIEW_SIZE,
+    };
     let mut state = session.start(&mut game, &mut ctx)?;
     game.on_run_mode(RunMode::Timeline, &mut state, &mut ctx);
     let mut input = InputFrame::default();
@@ -871,25 +757,13 @@ fn run_embedded<G: TimelineGame>(
     let mut deadline = last_frame;
     let interval = Duration::from_secs_f64(1.0 / 60.0);
     let exit_code = 'game: loop {
-        if let Some(command) =
-            <TimelineSession<G::Snapshot> as LiveSession<G>>::process_command(&mut session)
-        {
+        if let Some(command) = session.process_command() {
             if let Some(status) = exit_for_command::<G>(&mut session, &state, command) {
                 break status;
             }
         }
         if game.exit_requested() {
             break exit_for_command::<G>(&mut session, &state, ProcessCommand::Stop).unwrap_or(0);
-        }
-
-        match preview.take_feedback() {
-            Ok(Some(feedback)) => game.apply_preview_feedback(&state, feedback),
-            Ok(None) => {}
-            Err(err) => {
-                eprintln!("could not draw the editor GPU preview: {err}");
-                exit_for_command::<G>(&mut session, &state, ProcessCommand::Stop);
-                break GPU_PREVIEW_EXIT_CODE;
-            }
         }
 
         let now = Instant::now();
@@ -905,38 +779,45 @@ fn run_embedded<G: TimelineGame>(
                         .unwrap_or(0);
                 }
             };
-            if let EditorEvent::Timeline(command) = event {
-                if matches!(command, TimelineCommand::Seek(_))
-                    && matches!(commands.last(), Some(TimelineCommand::Seek(_)))
-                {
-                    commands.pop();
+            match event {
+                EditorEvent::Timeline(command) => {
+                    if matches!(command, TimelineCommand::Seek(_))
+                        && matches!(commands.last(), Some(TimelineCommand::Seek(_)))
+                    {
+                        commands.pop();
+                    }
+                    commands.push(command);
                 }
-                commands.push(command);
-            } else {
-                input.apply_editor_event(event);
+                EditorEvent::Resize(size) if valid_preview_size(size) => ctx.surface_size = size,
+                _ => input.apply_editor_event(event),
             }
         }
-        let effects = if commands.is_empty() {
+        match preview.take_feedback() {
+            Ok(Some((size, feedback))) if size == ctx.surface_size => {
+                game.apply_preview_feedback(&state, feedback);
+            }
+            Ok(_) => {}
+            Err(err) => {
+                eprintln!("could not draw the editor GPU preview: {err}");
+                exit_for_command::<G>(&mut session, &state, ProcessCommand::Stop);
+                break GPU_PREVIEW_EXIT_CODE;
+            }
+        }
+        if commands.is_empty() {
             if session.should_update(&mut game, &mut state, &input, None) {
-                let effects = update_game(&mut game, &mut state, &input, dt, &mut ctx);
-                LiveSession::<G>::after_update(&mut session, &state, now);
-                Some(effects)
+                game.update_state(&mut state, &input, dt, &mut ctx);
+                session.after_update(&state);
             } else {
                 last_frame = Instant::now();
-                None
             }
         } else {
             for command in commands {
                 session.should_update(&mut game, &mut state, &input, Some(command));
             }
             last_frame = Instant::now();
-            None
-        };
-        let status = LiveSession::<G>::timeline_status(&session).unwrap_or_default();
-        preview.publish(status, game.preview_snapshot(&state));
-        if let Some(effects) = effects {
-            game.handle_effects(effects, &mut ctx);
         }
+        let status = session.status();
+        preview.publish(ctx.surface_size, status, game.preview_snapshot(&state));
         input.clear_frame_transients();
         // Keep oversleep from accumulating across frames, and skip missed deadlines.
         let finished = Instant::now();
@@ -950,15 +831,15 @@ fn run_embedded<G: TimelineGame>(
     Ok(())
 }
 
-fn run_live<G, S>(config: AppConfig, mut game: G, mut session: S) -> Result<(), Box<dyn Error>>
-where
-    G: GameApp + 'static,
-    S: LiveSession<G> + 'static,
-{
+fn run_windowed_timeline<G: TimelineGame + 'static>(
+    config: AppConfig,
+    mut game: G,
+    mut session: TimelineSession<G>,
+) -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new();
     let mut ctx = create_app_context(&config, &event_loop)?;
     let mut state = session.start(&mut game, &mut ctx.app)?;
-    game.on_run_mode(S::MODE, &mut state, &mut ctx.app);
+    game.on_run_mode(RunMode::Timeline, &mut state, &mut ctx.app);
     let mut input = InputFrame::default();
     let mut last_frame = Instant::now();
     let mut exiting = false;
@@ -1020,27 +901,20 @@ where
                 let now = Instant::now();
                 let dt = now.saturating_duration_since(last_frame);
                 last_frame = now;
-                let effects = if session.should_update(&mut game, &mut state, &input, None) {
-                    let effects = update_game(&mut game, &mut state, &input, dt, &mut ctx.app);
-                    session.after_update(&state, now);
-                    Some(effects)
+                if session.should_update(&mut game, &mut state, &input, None) {
+                    game.update_state(&mut state, &input, dt, &mut ctx.app);
+                    session.after_update(&state);
                 } else {
                     last_frame = Instant::now();
-                    None
-                };
-                let current_status = session.timeline_status();
-                if current_status != previous_status
-                    && let Some(status) = current_status
-                {
+                }
+                let status = session.status();
+                if previous_status != Some(status) {
                     if status.paused || previous_status.is_none_or(|previous| previous.paused) {
                         update_timeline_title(&ctx.window, &config.title, status);
                     }
-                    previous_status = current_status;
+                    previous_status = Some(status);
                 }
                 draw_game(&mut game, &state, &mut ctx);
-                if let Some(effects) = effects {
-                    game.handle_effects(effects, &mut ctx.app);
-                }
                 input.clear_frame_transients();
             }
             Event::MainEventsCleared => ctx.window.request_redraw(),
@@ -1050,11 +924,7 @@ where
 }
 
 fn draw_game<G: GameApp>(game: &mut G, state: &G::State, ctx: &mut WindowContext) {
-    let view = game.build_view(state, &ctx.app);
-    if let Err(err) = ctx
-        .renderer
-        .draw_frame(|gfx| game.render(state, &view, gfx))
-    {
+    if let Err(err) = ctx.renderer.draw_frame(|gfx| game.render(state, gfx)) {
         eprintln!("draw failed: {err}");
     }
     if let Err(err) = ctx.renderer.present() {
@@ -1107,26 +977,12 @@ where
 
                 let frame_start = Instant::now();
                 let update_start = Instant::now();
-                let frame_input = input.clone();
-                let view_for_input = game.build_view(&state, &ctx.app);
-                let actions = hit_test_actions(
-                    &view_for_input,
-                    UiInput {
-                        mouse_pos: frame_input.mouse_pos,
-                        mouse_down: frame_input.mouse_down,
-                        mouse_up: frame_input.mouse_up,
-                    },
-                );
-                let effects =
-                    game.update_state(&mut state, frame_input, dt, &actions, &mut ctx.app);
+                game.update_state(&mut state, &input, dt, &mut ctx.app);
                 let update_dt = update_start.elapsed();
                 trace.record("engine.update", update_start, update_dt);
 
                 let draw_start = Instant::now();
-                let view_for_render = game.build_view(&state, &ctx.app);
-                let draw_res = ctx.renderer.draw_frame(|gfx| {
-                    game.render(&state, &view_for_render, gfx);
-                });
+                let draw_res = ctx.renderer.draw_frame(|gfx| game.render(&state, gfx));
                 let draw_dt = draw_start.elapsed();
                 trace.record("render.draw", draw_start, draw_dt);
                 if let Err(err) = draw_res {
@@ -1144,7 +1000,6 @@ where
                 trace.record("frame.total", frame_start, frame_total_dt);
                 trace.record_frame_samples(update_dt, draw_dt, present_dt, frame_total_dt);
 
-                game.handle_effects(effects, &mut ctx.app);
                 input.clear_frame_transients();
 
                 if trace.captured_frames >= trace.target_frames {
@@ -1345,20 +1200,18 @@ mod tests {
     }
 
     #[test]
-    fn mouse_left_transitions_set_legacy_click_flags() {
+    fn mouse_button_edges_reset_between_ticks() {
         let mut input = InputFrame::default();
 
         input.apply_mouse_button_state(MouseButton::Left, ElementState::Pressed);
-        assert!(input.mouse_down);
         assert!(input.mouse_buttons_down.contains(&MouseButton::Left));
         assert!(input.mouse_buttons_pressed.contains(&MouseButton::Left));
 
         input.clear_frame_transients();
-        assert!(!input.mouse_down);
         assert!(input.mouse_buttons_down.contains(&MouseButton::Left));
+        assert!(input.mouse_buttons_pressed.is_empty());
 
         input.apply_mouse_button_state(MouseButton::Left, ElementState::Released);
-        assert!(input.mouse_up);
         assert!(!input.mouse_buttons_down.contains(&MouseButton::Left));
         assert!(input.mouse_buttons_released.contains(&MouseButton::Left));
     }
@@ -1390,7 +1243,5 @@ mod tests {
         assert!(!input.window_focused);
         assert!(input.keys_down.is_empty());
         assert!(input.mouse_buttons_down.is_empty());
-        assert!(!input.mouse_down);
-        assert!(!input.mouse_up);
     }
 }

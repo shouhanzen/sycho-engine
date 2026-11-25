@@ -22,6 +22,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     GameLogic, HeadlessRunner,
     recording::{Mp4Config, Mp4Recorder},
+    surface::SurfaceSize,
     timeline::{StateSchema, Timeline, TimelineReader, session_directory},
 };
 
@@ -43,12 +44,6 @@ pub struct VideoCaptureConfig {
     pub mp4: Mp4Config,
     /// How many identical video frames to emit per engine frame/state.
     pub hold_frames: usize,
-}
-
-impl VideoCaptureConfig {
-    pub fn rgba_frame_len(&self) -> usize {
-        self.mp4.rgba_frame_len()
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -315,115 +310,6 @@ fn write_ppm_rgb_diff(
     Ok(())
 }
 
-fn render_frame_hashes<State, Render>(
-    states: &[State],
-    width: u32,
-    height: u32,
-    render: &mut Render,
-) -> Vec<String>
-where
-    Render: FnMut(&State, &mut [u8], u32, u32),
-{
-    let expected = (width as usize)
-        .saturating_mul(height as usize)
-        .saturating_mul(4);
-    let mut buf = vec![0u8; expected];
-    states
-        .iter()
-        .map(|state| {
-            render(state, &mut buf, width, height);
-            rgba_sha256_hex(&buf)
-        })
-        .collect()
-}
-
-fn first_hash_mismatch(a: &[String], b: &[String]) -> Option<usize> {
-    let n = a.len().min(b.len());
-    for i in 0..n {
-        if a[i] != b[i] {
-            return Some(i);
-        }
-    }
-    if a.len() != b.len() {
-        return Some(n);
-    }
-    None
-}
-
-fn compare_render_hashes_and_maybe_dump<State, Render>(
-    name: &str,
-    out_dir: &Path,
-    width: u32,
-    height: u32,
-    live: &[State],
-    replay: &[State],
-    live_hashes: &[String],
-    replay_hashes: &[String],
-    render: &mut Render,
-) -> io::Result<()>
-where
-    Render: FnMut(&State, &mut [u8], u32, u32),
-{
-    let Some(i) = first_hash_mismatch(live_hashes, replay_hashes) else {
-        return Ok(());
-    };
-
-    let mut msg = String::new();
-    if live_hashes.len() != replay_hashes.len() {
-        msg.push_str(&format!(
-            "render-hash frame count mismatch: live={} replay={}",
-            live_hashes.len(),
-            replay_hashes.len()
-        ));
-        msg.push('\n');
-    }
-
-    let live_h = live_hashes.get(i).map(String::as_str).unwrap_or("<none>");
-    let replay_h = replay_hashes.get(i).map(String::as_str).unwrap_or("<none>");
-    msg.push_str(&format!(
-        "render-hash mismatch at frame {i} (scenario {name}):\n  live:   {live_h}\n  replay: {replay_h}\n"
-    ));
-
-    if dump_ppm_on_mismatch_enabled()
-        && i < live.len()
-        && i < replay.len()
-        && width > 0
-        && height > 0
-    {
-        let base = sanitize_filename(name);
-        let live_ppm = out_dir.join(format!("{base}__mismatch_{i}__live.ppm"));
-        let replay_ppm = out_dir.join(format!("{base}__mismatch_{i}__replay.ppm"));
-        let diff_ppm = out_dir.join(format!("{base}__mismatch_{i}__diff.ppm"));
-
-        let expected_len = (width as usize)
-            .saturating_mul(height as usize)
-            .saturating_mul(4);
-        let mut a = vec![0u8; expected_len];
-        let mut b = vec![0u8; expected_len];
-
-        let a_state = &live[i];
-        let b_state = &replay[i];
-        render(a_state, &mut a, width, height);
-        render(b_state, &mut b, width, height);
-
-        // Best-effort dumps; failures should not hide the underlying mismatch.
-        let _ = write_ppm_rgb(&live_ppm, width, height, &a);
-        let _ = write_ppm_rgb(&replay_ppm, width, height, &b);
-        let _ = write_ppm_rgb_diff(&diff_ppm, width, height, &a, &b);
-
-        msg.push_str(&format!(
-            "ppm dumps:\n  live:   {}\n  replay: {}\n  diff:   {}\n",
-            live_ppm.display(),
-            replay_ppm.display(),
-            diff_ppm.display()
-        ));
-    } else if dump_ppm_on_mismatch_enabled() {
-        msg.push_str("ppm dumps: skipped (out of bounds or invalid size)\n");
-    }
-
-    Err(io::Error::new(io::ErrorKind::Other, msg))
-}
-
 pub fn video_framemd5s(path: impl AsRef<Path>) -> io::Result<Vec<String>> {
     let path = path.as_ref();
     let output = Command::new(ffmpeg_bin())
@@ -510,12 +396,7 @@ pub fn assert_mp4_videos_match_ffmpeg(
     Ok(())
 }
 
-/// Engine-level regression helper:
-/// - run a scenario live, capturing MP4 frames and saving a timeline
-/// - load the timeline, replay frame-by-frame, capture a second MP4
-/// - decode both MP4s and assert every frame matches (via ffmpeg `framemd5`)
-///
-/// The caller provides a `render` function that fills an RGBA frame for a given state.
+/// Records the live scenario and verifies the video rendered from the saved timeline.
 pub fn record_state_and_video_then_replay_and_compare<G, Render>(
     name: &str,
     out_dir: impl AsRef<Path>,
@@ -530,98 +411,51 @@ where
     Render: FnMut(&G::State, &mut [u8], u32, u32),
 {
     let out_dir = out_dir.as_ref();
-    fs::create_dir_all(out_dir)?;
-
     let base = sanitize_filename(name);
-    let timeline = out_dir.join(format!("{base}.timeline"));
     let live_mp4 = out_dir.join(format!("{base}__live.mp4"));
     let replay_mp4 = out_dir.join(format!("{base}__replay.mp4"));
-
+    let size = SurfaceSize::new(video.mp4.width, video.mp4.height);
     let hold_frames = video.hold_frames.max(1);
-    let mut live_hashes: Vec<String> = Vec::new();
-    let mut replay_hashes: Vec<String> = Vec::new();
-
-    // Live record.
-    let mut live_runner = HeadlessRunner::new(game);
-    let mut live_rec = Mp4Recorder::start(&live_mp4, video.mp4)?;
-    {
-        let mut buf = vec![0u8; video.rgba_frame_len()];
-        let mut capture =
-            |rec: &mut Mp4Recorder, state: &G::State, hashes: &mut Vec<String>| -> io::Result<()> {
-                render(state, &mut buf, video.mp4.width, video.mp4.height);
-                hashes.push(rgba_sha256_hex(&buf));
-                for _ in 0..hold_frames {
-                    rec.push_rgba_frame(&buf)?;
-                }
-                Ok(())
-            };
-
-        capture(&mut live_rec, live_runner.state(), &mut live_hashes)?;
-        for input in inputs {
-            live_runner.step(input);
-            capture(&mut live_rec, live_runner.state(), &mut live_hashes)?;
+    let spacing_ms = (hold_frames as u64).saturating_mul(1_000) / u64::from(video.mp4.fps.max(1));
+    let capture = |recorder: &mut Mp4Recorder, pixels: &[u8]| -> io::Result<()> {
+        for _ in 0..hold_frames {
+            recorder.push_rgba_frame(pixels)?;
         }
-    }
+        Ok(())
+    };
+
+    let mut live_rec = Mp4Recorder::start(&live_mp4, video.mp4)?;
+    let live = record_frames(
+        out_dir.join(format!("{base}.timeline")),
+        game,
+        inputs,
+        size,
+        spacing_ms.max(1),
+        &mut render,
+        |pixels| capture(&mut live_rec, pixels),
+    )?;
     live_rec.finish()?;
 
-    let spacing_ms = u64::try_from(hold_frames)
-        .unwrap_or(u64::MAX)
-        .saturating_mul(1_000)
-        / u64::from(video.mp4.fps.max(1));
-    let (timeline, replay) = roundtrip_history(timeline, live_runner.history(), spacing_ms.max(1))?;
-
     let mut replay_rec = Mp4Recorder::start(&replay_mp4, video.mp4)?;
-    {
-        let mut buf = vec![0u8; video.rgba_frame_len()];
-        let mut capture =
-            |rec: &mut Mp4Recorder, state: &G::State, hashes: &mut Vec<String>| -> io::Result<()> {
-                render(state, &mut buf, video.mp4.width, video.mp4.height);
-                hashes.push(rgba_sha256_hex(&buf));
-                for _ in 0..hold_frames {
-                    rec.push_rgba_frame(&buf)?;
-                }
-                Ok(())
-            };
-
-        for state in &replay {
-            capture(&mut replay_rec, state, &mut replay_hashes)?;
-        }
-    }
+    replay_frames::<G::State>(name, &live, size, &mut render, |pixels| {
+        capture(&mut replay_rec, pixels)
+    })?;
     replay_rec.finish()?;
-
-    compare_render_hashes_and_maybe_dump(
-        name,
-        out_dir,
-        video.mp4.width,
-        video.mp4.height,
-        live_runner.history(),
-        &replay,
-        &live_hashes,
-        &replay_hashes,
-        &mut render,
-    )?;
-
     assert_mp4_videos_match_ffmpeg(&live_mp4, &replay_mp4)?;
 
     Ok(RecordReplayArtifacts {
-        timeline,
+        timeline: live.timeline,
         live_mp4,
         replay_mp4,
     })
 }
 
-/// Engine-level regression helper (hash-only, no ffmpeg dependency):
-/// - run a scenario live, saving a timeline
-/// - load the timeline, replay it, and compute render hashes for every state
-/// - assert the live and replay render hashes match
-///
-/// The caller provides a `scenario` closure that mutates the runner (e.g. steps inputs)
-/// and a `render` function that fills an RGBA frame for a given state.
-pub fn record_state_then_replay_and_compare_render_hashes_with<G, Scenario, Render>(
+/// Verifies the rendered frames against snapshots loaded from a committed timeline.
+pub fn record_state_then_replay_and_compare_render_hashes<G, Render>(
     name: &str,
     out_dir: impl AsRef<Path>,
     game: G,
-    scenario: Scenario,
+    inputs: impl IntoIterator<Item = G::Input>,
     width: u32,
     height: u32,
     mut render: Render,
@@ -629,60 +463,126 @@ pub fn record_state_then_replay_and_compare_render_hashes_with<G, Scenario, Rend
 where
     G: GameLogic,
     G::State: Serialize + DeserializeOwned,
-    Scenario: FnOnce(&mut HeadlessRunner<G>),
     Render: FnMut(&G::State, &mut [u8], u32, u32),
 {
-    let out_dir = out_dir.as_ref();
-    fs::create_dir_all(out_dir)?;
-
     let base = sanitize_filename(name);
-    let timeline = out_dir.join(format!("{base}.timeline"));
-
-    // Live record.
-    let mut live_runner = HeadlessRunner::new(game);
-    scenario(&mut live_runner);
-    let (timeline, replay) = roundtrip_history(timeline, live_runner.history(), 200)?;
-    let live_hashes = render_frame_hashes(live_runner.history(), width, height, &mut render);
-    let replay_hashes = render_frame_hashes(&replay, width, height, &mut render);
-
-    compare_render_hashes_and_maybe_dump(
-        name,
-        out_dir,
-        width,
-        height,
-        live_runner.history(),
-        &replay,
-        &live_hashes,
-        &replay_hashes,
+    let size = SurfaceSize::new(width, height);
+    let live = record_frames(
+        out_dir.as_ref().join(format!("{base}.timeline")),
+        game,
+        inputs,
+        size,
+        200,
         &mut render,
+        |_| Ok(()),
     )?;
+    let replay_hashes = replay_frames::<G::State>(name, &live, size, &mut render, |_| Ok(()))?;
 
     Ok(RecordReplayHashArtifacts {
-        timeline,
-        live_hashes,
+        timeline: live.timeline,
+        live_hashes: live.hashes,
         replay_hashes,
     })
 }
 
-fn roundtrip_history<S: Serialize + DeserializeOwned>(
+const FIXTURE_SCHEMA: StateSchema = StateSchema {
+    game: "test-fixture",
+    version: 1,
+};
+
+struct RecordedFrames {
+    timeline: PathBuf,
+    hashes: Vec<String>,
+    pixels: Option<Vec<Vec<u8>>>,
+}
+
+fn record_frames<G: GameLogic>(
     path: PathBuf,
-    states: &[S],
+    game: G,
+    inputs: impl IntoIterator<Item = G::Input>,
+    size: SurfaceSize,
     spacing_ms: u64,
-) -> io::Result<(PathBuf, Vec<S>)> {
-    const SCHEMA: StateSchema = StateSchema {
-        game: "test-fixture",
-        version: 1,
+    render: &mut impl FnMut(&G::State, &mut [u8], u32, u32),
+    mut capture: impl FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<RecordedFrames>
+where
+    G::State: Serialize + DeserializeOwned,
+{
+    let timeline = session_directory(path, None, true)?;
+    let (mut writer, _) = Timeline::open::<G::State>(&timeline, FIXTURE_SCHEMA)?;
+    let mut live = RecordedFrames {
+        timeline,
+        hashes: Vec::new(),
+        pixels: (dump_ppm_on_mismatch_enabled() && size.width > 0 && size.height > 0)
+            .then(Vec::new),
     };
-    let path = session_directory(path, None, true)?;
-    let (mut timeline, _) = Timeline::open::<S>(&path, SCHEMA)?;
-    for (i, state) in states.iter().enumerate() {
-        timeline.capture_at(state, (i as u64).saturating_mul(spacing_ms))?;
+    let mut runner = HeadlessRunner::new(game);
+    let mut pixels = vec![0; size.rgba_len()];
+
+    for input in std::iter::once(None).chain(inputs.into_iter().map(Some)) {
+        if let Some(input) = input {
+            runner.step(input);
+        }
+        let state = runner.state();
+        writer.capture_at(state, (runner.frame() as u64).saturating_mul(spacing_ms))?;
+        render(state, &mut pixels, size.width, size.height);
+        live.hashes.push(rgba_sha256_hex(&pixels));
+        if let Some(frames) = &mut live.pixels {
+            frames.push(pixels.clone());
+        }
+        capture(&pixels)?;
     }
-    drop(timeline);
-    let reader = TimelineReader::open(&path, SCHEMA)?;
-    let history = reader
-        .snapshots::<S>()
-        .map(|snapshot| snapshot.map(|snapshot| snapshot.state))
-        .collect::<io::Result<_>>()?;
-    Ok((path, history))
+    Ok(live)
+}
+
+fn replay_frames<S: DeserializeOwned>(
+    name: &str,
+    live: &RecordedFrames,
+    size: SurfaceSize,
+    render: &mut impl FnMut(&S, &mut [u8], u32, u32),
+    mut capture: impl FnMut(&[u8]) -> io::Result<()>,
+) -> io::Result<Vec<String>> {
+    let reader = TimelineReader::open(&live.timeline, FIXTURE_SCHEMA)?;
+    let count = reader.frames().len();
+    if live.hashes.len() != count {
+        return Err(io::Error::other(format!(
+            "render-hash frame count mismatch: live={} replay={count}",
+            live.hashes.len()
+        )));
+    }
+
+    let mut hashes = Vec::with_capacity(count);
+    let mut pixels = vec![0; size.rgba_len()];
+    for (i, snapshot) in reader.snapshots::<S>().enumerate() {
+        render(&snapshot?.state, &mut pixels, size.width, size.height);
+        let replay_hash = rgba_sha256_hex(&pixels);
+        let live_hash = &live.hashes[i];
+        if *live_hash != replay_hash {
+            let mut message = format!(
+                "render-hash mismatch at frame {i} (scenario {name}):\n  live:   {live_hash}\n  replay: {replay_hash}\n"
+            );
+            if let Some(frames) = &live.pixels {
+                let out_dir = live.timeline.parent().unwrap_or_else(|| Path::new("."));
+                let base = sanitize_filename(name);
+                let live_ppm = out_dir.join(format!("{base}__mismatch_{i}__live.ppm"));
+                let replay_ppm = out_dir.join(format!("{base}__mismatch_{i}__replay.ppm"));
+                let diff_ppm = out_dir.join(format!("{base}__mismatch_{i}__diff.ppm"));
+                let (width, height) = (size.width, size.height);
+                // Best-effort dumps; failures should not hide the mismatch.
+                let _ = write_ppm_rgb(&live_ppm, width, height, &frames[i]);
+                let _ = write_ppm_rgb(&replay_ppm, width, height, &pixels);
+                let _ = write_ppm_rgb_diff(&diff_ppm, width, height, &frames[i], &pixels);
+                message.push_str(&format!(
+                    "ppm dumps:\n  live:   {}\n  replay: {}\n  diff:   {}\n",
+                    live_ppm.display(),
+                    replay_ppm.display(),
+                    diff_ppm.display()
+                ));
+            }
+            return Err(io::Error::other(message));
+        }
+        capture(&pixels)?;
+        hashes.push(replay_hash);
+    }
+    Ok(hashes)
 }

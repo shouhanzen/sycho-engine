@@ -8,25 +8,20 @@ GAME_LOG_FILE="${ROLLOUT_GO_GAME_LOG_FILE:-$ROOT_DIR/.go.log}"
 
 usage() {
   cat <<'EOF'
-go.sh - rollout_engine control surface
+go.sh - Sycho launcher
 
 Usage:
   ./go.sh --editor [--timeline DIR] [--fresh] [--detach] [--release]
-  ./go.sh --start [--headful|--headless] [--watch] [--timeline DIR] [--fresh|--playback] [--detach] [--release]
+  ./go.sh --start [--watch] [--timeline DIR] [--fresh|--playback] [--detach] [--release]
   ./go.sh --stop
-  ./go.sh --restart [--headful|--headless] [--watch|--editor] [--timeline DIR] [--fresh|--playback] [--detach] [--release]
+  ./go.sh --restart [--watch|--editor] [--timeline DIR] [--fresh|--playback] [--detach] [--release]
   ./go.sh --status
   ./go.sh --test [--release]
-  ./go.sh --test-fast [--release]
   ./go.sh --test-light [--release]
   ./go.sh --e2e [--video] [--ffmpeg /path/to/ffmpeg] [--release]
   ./go.sh --export-video PATH [--timeline DIR] [--ffmpeg PATH] [--release]
   ./go.sh --profile [--release]
   ./go.sh --help
-
-Modes:
-  --headful      Run the windowed game (default). Uses: cargo run -p game --bin headful
-  --headless     Run headless playtests (non-interactive). Uses: cargo test -p game --test e2e_playtest_tests
 
 Live timeline (windowed game):
   --watch         Rebuild on source edits and relaunch at the last live checkpoint.
@@ -39,7 +34,6 @@ Live timeline (windowed game):
   Option+Right (F7) Step forward one snapshot.
   Option+Space (F8) Play / pause the recorded timeline. Playback stops at the end.
   Use Alt in place of Option on other keyboards.
-  SYCHO_CHECKPOINT_MS sets the checkpoint interval (default: 200 ms).
 
   --export-video PATH  Render a closed timeline to MP4 without a game window.
 
@@ -54,7 +48,7 @@ Build cache (multi-worktree):
                   Override with: CARGO_TARGET_DIR=/path/to/target
 
 Lifecycle:
-  --start        Starts the game in the selected mode. Default is foreground (attached to the terminal).
+  --start        Starts the windowed game. Default is foreground (attached to the terminal).
   --detach       Run in background (writes pid/log files).
                 If a background process exits immediately, go.sh will print recent logs to the terminal.
   --foreground   (default) Runs attached to the current terminal (no pid/log management).
@@ -64,8 +58,7 @@ Lifecycle:
 
 Testing:
   --test         cargo test (engine and game workspace)
-  --test-fast    cargo test -p engine -p game (fast default local loop)
-  --test-light   same as --test-fast but reduced local CPU pressure
+  --test-light   workspace tests with reduced local CPU pressure
                 Env knobs:
                   ROLLOUT_TEST_LIGHT_BUILD_JOBS=4
                   ROLLOUT_TEST_LIGHT_THREADS=1
@@ -210,82 +203,10 @@ to_native_path() {
   fi
 }
 
-is_windows() {
-  if is_wsl; then
-    return 1
-  fi
-  case "$(uname -s 2>/dev/null || echo "")" in
-    MINGW*|MSYS*|CYGWIN*) return 0 ;;
-  esac
-  [[ "${OS:-}" == "Windows_NT" ]]
-}
-
-is_wsl() {
-  if [[ -n "${WSL_INTEROP:-}" ]] || [[ -n "${WSL_DISTRO_NAME:-}" ]]; then
-    return 0
-  fi
-
-  local kernel_release
-  kernel_release="$(uname -r 2>/dev/null || echo "")"
-  kernel_release="$(printf "%s" "$kernel_release" | tr '[:upper:]' '[:lower:]')"
-  case "$kernel_release" in
-    *microsoft*|*wsl*) return 0 ;;
-  esac
-
-  return 1
-}
-
-resolve_powershell() {
-  if command -v pwsh >/dev/null 2>&1; then
-    echo "pwsh"
-    return 0
-  fi
-  if command -v powershell.exe >/dev/null 2>&1; then
-    echo "powershell.exe"
-    return 0
-  fi
-  if command -v powershell >/dev/null 2>&1; then
-    echo "powershell"
-    return 0
-  fi
-  return 1
-}
-
 start_detached() {
   local log_file="$1"
   shift
-  local exe="$1"
-  shift
-  local args=("$@")
-
-  if is_windows; then
-    local ps_bin
-    ps_bin="$(resolve_powershell 2>/dev/null || true)"
-    if [[ -n "$ps_bin" ]]; then
-      local log_native
-      log_native="$(to_native_path "$log_file")"
-
-      local ps_args=""
-      for arg in "${args[@]}"; do
-        local escaped="${arg//\'/\'\'}"
-        if [[ -n "$ps_args" ]]; then
-          ps_args+=", "
-        fi
-        ps_args+="'$escaped'"
-      done
-
-      local ps_cmd
-      ps_cmd="\$p = Start-Process -FilePath '$exe' -ArgumentList $ps_args -RedirectStandardOutput '$log_native' -RedirectStandardError '$log_native' -PassThru; Write-Output \$p.Id"
-      local pid
-      pid="$("$ps_bin" -NoProfile -Command "$ps_cmd" 2>/dev/null | tr -d '\r' | awk 'NF{last=$0} END{print last}')"
-      if [[ -n "$pid" ]]; then
-        echo "$pid"
-        return 0
-      fi
-    fi
-  fi
-
-  nohup "$exe" "${args[@]}" >"$log_file" 2>&1 &
+  nohup "$@" >"$log_file" 2>&1 &
   echo $!
 }
 
@@ -342,7 +263,6 @@ setup_build_cache() {
   fi
 }
 
-MODE="headful"
 FOREGROUND="true"
 ACTION=""
 VIDEO="false"
@@ -356,16 +276,8 @@ FFMPEG_BIN=""
 RELEASE="false"
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --start|--stop|--restart|--status|--test|--test-fast|--test-light|--e2e|--profile)
+    --start|--stop|--restart|--status|--test|--test-light|--e2e|--profile)
       ACTION="$1"
-      shift
-      ;;
-    --headful)
-      MODE="headful"
-      shift
-      ;;
-    --headless)
-      MODE="headless"
       shift
       ;;
     --foreground)
@@ -442,7 +354,7 @@ if [[ "$EDITOR" == "true" ]]; then
   if [[ -z "$ACTION" ]]; then
     ACTION="--start"
   fi
-  if [[ "$MODE" != "headful" || ( "$ACTION" != "--start" && "$ACTION" != "--restart" ) ]]; then
+  if [[ "$ACTION" != "--start" && "$ACTION" != "--restart" ]]; then
     echo "--editor requires a windowed launch" >&2
     exit 2
   fi
@@ -458,7 +370,7 @@ cd "$ROOT_DIR"
 setup_build_cache
 
 if [[ "$WATCH" == "true" || "$FRESH" == "true" || "$PLAYBACK" == "true" ]]; then
-  if [[ "$MODE" != "headful" || ( "$ACTION" != "--start" && "$ACTION" != "--restart" ) ]]; then
+  if [[ "$ACTION" != "--start" && "$ACTION" != "--restart" ]]; then
     echo "--watch, --fresh, and --playback require a windowed --start or --restart" >&2
     exit 2
   fi
@@ -469,24 +381,9 @@ if [[ "$WATCH" == "true" || "$FRESH" == "true" || "$PLAYBACK" == "true" ]]; then
 fi
 
 if [[ -n "$TIMELINE_PATH" && "$ACTION" != "--export-video" ]]; then
-  if [[ "$MODE" != "headful" || ( "$ACTION" != "--start" && "$ACTION" != "--restart" ) ]]; then
+  if [[ "$ACTION" != "--start" && "$ACTION" != "--restart" ]]; then
     echo "--timeline requires a windowed launch or --export-video" >&2
     exit 2
-  fi
-fi
-
-# Auto-detect ffmpeg for `--video` runs (useful on Windows Git Bash where PATH may not include Scoop shims).
-if [[ "$VIDEO" == "true" ]] && [[ -z "$FFMPEG_BIN" ]]; then
-  if command -v ffmpeg >/dev/null 2>&1; then
-    FFMPEG_BIN=""
-  else
-    # Scoop default install location (per-user)
-    if [[ -f "$HOME/scoop/shims/ffmpeg.exe" ]]; then
-      FFMPEG_BIN="$(cygpath -w "$HOME/scoop/shims/ffmpeg.exe")"
-    # Chocolatey shim location (machine-wide; may require admin to install)
-    elif [[ -f "/c/ProgramData/chocolatey/bin/ffmpeg.exe" ]]; then
-      FFMPEG_BIN="$(cygpath -w "/c/ProgramData/chocolatey/bin/ffmpeg.exe")"
-    fi
   fi
 fi
 
@@ -518,34 +415,6 @@ case "$ACTION" in
   --start)
     if is_running_pidfile "$GAME_PID_FILE"; then
       echo "already running (pid $(cat "$GAME_PID_FILE"))"
-      exit 0
-    fi
-
-    if [[ "$MODE" == "headless" ]]; then
-      if [[ "$FOREGROUND" == "true" ]]; then
-        if [[ "$VIDEO" == "true" ]]; then
-          if [[ -n "$FFMPEG_BIN" ]]; then
-            exec env ROLLOUT_E2E_RECORD_MP4=1 ROLLOUT_FFMPEG_BIN="$FFMPEG_BIN" cargo test -p game --test e2e_playtest_tests ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- --nocapture
-          fi
-          exec env ROLLOUT_E2E_RECORD_MP4=1 cargo test -p game --test e2e_playtest_tests ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- --nocapture
-        fi
-        exec cargo test -p game --test e2e_playtest_tests ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- --nocapture
-      fi
-
-      # Background headless run (still useful for CI-ish usage).
-      if [[ "$VIDEO" == "true" ]]; then
-        if [[ -n "$FFMPEG_BIN" ]]; then
-          nohup env ROLLOUT_E2E_RECORD_MP4=1 ROLLOUT_FFMPEG_BIN="$FFMPEG_BIN" cargo test -p game --test e2e_playtest_tests ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- --nocapture >"$GAME_LOG_FILE" 2>&1 &
-        else
-          nohup env ROLLOUT_E2E_RECORD_MP4=1 cargo test -p game --test e2e_playtest_tests ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- --nocapture >"$GAME_LOG_FILE" 2>&1 &
-        fi
-      else
-        nohup cargo test -p game --test e2e_playtest_tests ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- --nocapture >"$GAME_LOG_FILE" 2>&1 &
-      fi
-      echo $! >"$GAME_PID_FILE"
-      ensure_pid_alive_or_dump_logs "$GAME_PID_FILE" "$GAME_LOG_FILE" "headless tests"
-      echo "started headless tests (pid $(cat "$GAME_PID_FILE"))"
-      echo "logs: $GAME_LOG_FILE"
       exit 0
     fi
 
@@ -598,10 +467,6 @@ case "$ACTION" in
     exec cargo test --workspace ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"}
     ;;
 
-  --test-fast)
-    exec cargo test -p engine -p game ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"}
-    ;;
-
   --test-light)
     TEST_LIGHT_BUILD_JOBS="${ROLLOUT_TEST_LIGHT_BUILD_JOBS:-4}"
     TEST_LIGHT_THREADS="${ROLLOUT_TEST_LIGHT_THREADS:-1}"
@@ -616,15 +481,15 @@ case "$ACTION" in
     exec env \
       CARGO_BUILD_JOBS="$TEST_LIGHT_BUILD_JOBS" \
       RUST_TEST_THREADS="$TEST_LIGHT_THREADS" \
-      cargo test -p engine -p game ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"}
+      cargo test --workspace ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"}
     ;;
 
   --e2e)
     if [[ "$VIDEO" == "true" ]]; then
+      export ROLLOUT_E2E_RECORD_MP4=1
       if [[ -n "$FFMPEG_BIN" ]]; then
-        exec env ROLLOUT_E2E_RECORD_MP4=1 ROLLOUT_FFMPEG_BIN="$FFMPEG_BIN" cargo test -p game --test e2e_playtest_tests ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- --nocapture
+        export ROLLOUT_FFMPEG_BIN="$FFMPEG_BIN"
       fi
-      exec env ROLLOUT_E2E_RECORD_MP4=1 cargo test -p game --test e2e_playtest_tests ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- --nocapture
     fi
     exec cargo test -p game --test e2e_playtest_tests ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- --nocapture
     ;;

@@ -97,7 +97,11 @@ fn timeline_chords_use_either_option_key_and_keep_function_key_bindings() {
         );
         for option in [LAlt, RAlt] {
             assert_eq!(
-                app.timeline_command(&input_frame_for_keys(&[alternate], &[option, alternate], &[])),
+                app.timeline_command(&input_frame_for_keys(
+                    &[alternate],
+                    &[option, alternate],
+                    &[]
+                )),
                 Some(command)
             );
         }
@@ -255,7 +259,7 @@ fn skilltree_drag_frame_polling_respects_threshold_then_pans() {
     let (mut app, mut runner) = make_test_headful(GameView::SkillTree);
     runner.state_mut().skilltree.def.nodes.clear();
 
-    app.last_skilltree = SkillTreeLayout {
+    app.skilltree_layout = SkillTreeLayout {
         grid_cell: 20,
         grid_cols: 12,
         grid_rows: 8,
@@ -397,7 +401,9 @@ fn grounded_move_stalls_even_when_gravity_tick_is_due_same_frame() {
                 state.tetris.set_cell(x, y, 0);
             }
         }
-        state.tetris.set_current_piece_for_test(Piece::O, Vec2i::new(4, 1), 0);
+        state
+            .tetris
+            .set_current_piece_for_test(Piece::O, Vec2i::new(4, 1), 0);
     }
 
     runner.step_profiled(InputAction::MoveRight, &mut app.debug_hud);
@@ -486,7 +492,6 @@ fn timeline_restore_keeps_the_board_score_and_timers_then_advances_live() {
     app.update_round_timer_and_game_over(&mut restored, Duration::from_millis(100));
     assert!(restored.state().tetris.score() > board_before.score);
     assert_ne!(serde_json::to_value(restored.state()).unwrap(), expected);
-    assert_eq!(restored.history().len(), 1);
 }
 
 #[test]
@@ -532,4 +537,42 @@ fn line_clear_delay_progresses_with_frame_dt_instead_of_waiting_for_gravity_inte
     app.apply_gravity_steps(&mut runner, Duration::from_millis(80));
     assert!(!runner.state().tetris.is_line_clear_active());
     assert_eq!(runner.state().tetris.lines_cleared(), 1);
+}
+
+#[test]
+fn one_tick_menu_click_uses_the_current_layout_and_records_both_edges() {
+    use engine::surface::SurfaceSize;
+
+    let (mut app, mut game) = make_test_headful(GameView::MainMenu);
+    let size = SurfaceSize::new(1000, 680);
+    let mut ctx = AppContext { surface_size: size };
+    let layout = GameUiLayout::compute(game.state(), size, false);
+    let point = (0..size.height)
+        .find_map(|y| {
+            let pointer = (size.width / 2, y);
+            (layout.action_at(game.state(), pointer) == Some(GameUiAction::StartGame))
+                .then_some(pointer)
+        })
+        .unwrap();
+    let input = InputFrame {
+        mouse_pos: Some(point),
+        mouse_buttons_pressed: [MouseButton::Left].into(),
+        mouse_buttons_released: [MouseButton::Left].into(),
+        ..InputFrame::default()
+    };
+    app.update_state(&mut game, &input, Duration::from_millis(16), &mut ctx);
+
+    let state = game.state();
+    assert!(state.view.is_tetris_playing());
+    let saved = serde_json::to_vec(state).unwrap();
+    let restored: GameState = serde_json::from_slice(&saved).unwrap();
+    let tap = restored.input.unwrap();
+    assert!(tap.buttons_down.is_empty());
+    assert_eq!(tap.buttons_pressed, [MouseButton::Left]);
+    assert_eq!(tap.buttons_released, [MouseButton::Left]);
+    assert_eq!(tap.pointer_at(size), Some(point));
+    assert_eq!(
+        tap.pointer_at(SurfaceSize::new(500, 340)),
+        Some((point.0 / 2, point.1 / 2))
+    );
 }

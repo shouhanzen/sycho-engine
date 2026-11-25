@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use engine::HeadlessRunner;
 use engine::graphics::CpuRenderer;
-use engine::profiling::{Profiler, StepTimings};
+use engine::profiling::Profiler;
 use engine::surface::{RgbaBufferSurface, Surface, SurfaceSize};
 
 use game::perf_budget::{
@@ -175,30 +175,24 @@ fn percentile_sorted(xs: &[f64], p: f64) -> f64 {
 #[derive(Debug)]
 struct StepCollector {
     warmup_frames: usize,
-    step: Samples,
-    record: Samples,
-    total: Samples,
+    engine: Samples,
 }
 
 impl StepCollector {
     fn new(warmup_frames: usize, frames: usize) -> Self {
         Self {
             warmup_frames,
-            step: Samples::with_capacity(frames),
-            record: Samples::with_capacity(frames),
-            total: Samples::with_capacity(frames),
+            engine: Samples::with_capacity(frames),
         }
     }
 }
 
 impl Profiler for StepCollector {
-    fn on_step(&mut self, frame: usize, timings: StepTimings) {
+    fn on_step(&mut self, frame: usize, elapsed: Duration) {
         if frame <= self.warmup_frames {
             return;
         }
-        self.step.push(timings.step);
-        self.record.push(timings.record);
-        self.total.push(timings.total);
+        self.engine.push(elapsed);
     }
 }
 
@@ -311,8 +305,8 @@ fn main() {
                 budget_config.frame_total,
             );
             let engine_status = engine_budget.observe(
-                steps.total.last(),
-                steps.total.avg(),
+                steps.engine.last(),
+                steps.engine.avg(),
                 budget_config.engine_total,
             );
             let draw_status = draw_budget.observe(draw.last(), draw.avg(), budget_config.draw);
@@ -329,15 +323,11 @@ fn main() {
 
     std::hint::black_box(sink);
 
-    let step_stats = steps.step.stats();
-    let record_stats = steps.record.stats();
-    let engine_stats = steps.total.stats();
+    let engine_stats = steps.engine.stats();
     let draw_stats = draw.stats();
     let frame_stats = frame_total.stats();
 
     println!("(ms) lower is better");
-    print_stats("step", step_stats);
-    print_stats("record", record_stats);
     print_stats("engine", engine_stats);
     print_stats("draw", draw_stats);
     print_stats("frame", frame_stats);

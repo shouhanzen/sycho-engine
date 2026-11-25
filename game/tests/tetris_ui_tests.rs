@@ -1,22 +1,26 @@
+use engine::app::InputFrame;
 use engine::graphics::CpuRenderer;
-use engine::render::{CELL_SIZE, color_for_cell};
 use engine::surface::SurfaceSize;
 use engine::ui;
-use engine::ui_tree::{UiInput, UiTree};
+use game::board_render::{CELL_SIZE, color_for_cell};
 
+use game::debug::DebugHud;
+use game::game_ui::{GameUiAction, GameUiLayout};
+use game::headful::render_pipeline::{RenderInputs, render_frame};
 use game::skilltree::{
     SkillEffect, SkillNodeDef, SkillTreeDef, SkillTreeProgress, SkillTreeRuntime,
 };
+use game::state::{GameState, RecordedInput};
 use game::tetris_core::{
     BOARD_HEIGHT, BOARD_WIDTH, CELL_GARBAGE, DEFAULT_BOTTOMWELL_ROWS, DepthWallDef, Piece,
     TetrisCore, Vec2i,
 };
 use game::tetris_ui::{
-    MAIN_MENU_TITLE, SkillTreeLayout, draw_game_over_menu, draw_main_menu, draw_main_menu_with_ui,
-    draw_pause_menu, draw_skilltree, draw_skilltree_runtime_with_ui, draw_tetris,
-    draw_tetris_hud_with_ui, draw_tetris_world, draw_tetris_world_with_camera_offset,
+    MAIN_MENU_TITLE, SkillTreeLayout, draw_game_over_menu, draw_main_menu, draw_pause_menu,
+    draw_skilltree, draw_skilltree_runtime, draw_tetris, draw_tetris_world,
+    draw_tetris_world_with_camera_offset,
 };
-use game::ui_ids::{UI_CANVAS, UI_TETRIS_PAUSE};
+use game::view::GameView;
 
 fn pixel_at(frame: &[u8], width: u32, x: u32, y: u32) -> [u8; 4] {
     let idx = ((y * width + x) * 4) as usize;
@@ -523,7 +527,6 @@ fn draw_tetris_world_grassline_stays_behind_bottomwell_cells() {
     };
     if env_truthy("ROLLOUT_DISABLE_TILE_BG")
         || env_truthy("ROLLOUT_DISABLE_LAYER_NEAR")
-        || env_truthy("ROLLOUT_BG_FORCE_LEGACY_UNDERGROUND_START")
         || std::env::var("ROLLOUT_FORCE_BIOME").is_ok()
     {
         return;
@@ -547,7 +550,9 @@ fn draw_tetris_world_grassline_stays_behind_bottomwell_cells() {
 
     let sample_x = layout.board.x + 1;
     let board_h = core.board().len() as u32;
-    let inverted_y = board_h.saturating_sub(1).saturating_sub(surface_boundary_y as u32);
+    let inverted_y = board_h
+        .saturating_sub(1)
+        .saturating_sub(surface_boundary_y as u32);
     let sample_y = layout.board.y + inverted_y * CELL_SIZE + CELL_SIZE / 2;
     let sample = pixel_at(&frame, width, sample_x, sample_y);
 
@@ -668,48 +673,13 @@ fn world_camera_offset_keeps_hud_layout_and_pause_hit_target_stable() {
     let pause_x = layout_base.pause_button.x + layout_base.pause_button.w / 2;
     let pause_y = layout_base.pause_button.y + layout_base.pause_button.h / 2;
 
-    let mut ui_base = UiTree::new();
-    ui_base.ensure_canvas(UI_CANVAS, ui::Rect::from_size(width, height));
-    ui_base.add_root(UI_CANVAS);
-    let mut gfx_base = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
-    draw_tetris_hud_with_ui(
-        &mut gfx_base,
-        width,
-        height,
-        &core,
-        layout_base,
-        &mut ui_base,
-    );
-    let _ = ui_base.process_input(UiInput {
-        mouse_pos: Some((pause_x, pause_y)),
-        mouse_down: false,
-        mouse_up: false,
-    });
-    assert!(
-        ui_base.is_hovered(UI_TETRIS_PAUSE),
-        "pause hit target should remain at the same screen-space position"
-    );
-
-    let mut ui_shifted = UiTree::new();
-    ui_shifted.ensure_canvas(UI_CANVAS, ui::Rect::from_size(width, height));
-    ui_shifted.add_root(UI_CANVAS);
-    let mut gfx_shifted = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
-    draw_tetris_hud_with_ui(
-        &mut gfx_shifted,
-        width,
-        height,
-        &core,
-        layout_shifted,
-        &mut ui_shifted,
-    );
-    let _ = ui_shifted.process_input(UiInput {
-        mouse_pos: Some((pause_x, pause_y)),
-        mouse_down: false,
-        mouse_up: false,
-    });
-    assert!(
-        ui_shifted.is_hovered(UI_TETRIS_PAUSE),
-        "pause hit target hover should match even when world layer is offset"
+    let mut state = GameState::new(core);
+    state.view = GameView::Tetris { paused: false };
+    let layout = GameUiLayout::compute(&state, SurfaceSize::new(width, height), false);
+    assert_eq!(layout.tetris, Some(layout_shifted));
+    assert_eq!(
+        layout.action_at(&state, (pause_x, pause_y)),
+        Some(GameUiAction::PauseToggle),
     );
 }
 
@@ -934,19 +904,26 @@ fn draw_main_menu_brightens_start_button_on_hover() {
         px.copy_from_slice(&bg);
     }
     let mut gfx_hover = CpuRenderer::new(&mut frame_hover, SurfaceSize::new(width, height));
-    let mut ui_tree = UiTree::new();
-    ui_tree.ensure_canvas(UI_CANVAS, ui::Rect::from_size(width, height));
-    ui_tree.add_root(UI_CANVAS);
-    let _ = draw_main_menu_with_ui(&mut gfx_hover, width, height, &mut ui_tree);
-    let _ = ui_tree.process_input(UiInput {
-        mouse_pos: Some((hover_x, hover_y)),
-        mouse_down: false,
-        mouse_up: false,
-    });
-    ui_tree.begin_frame();
-    ui_tree.ensure_canvas(UI_CANVAS, ui::Rect::from_size(width, height));
-    ui_tree.add_root(UI_CANVAS);
-    let _layout_hover = draw_main_menu_with_ui(&mut gfx_hover, width, height, &mut ui_tree);
+    let mut state = GameState::new(TetrisCore::new(19));
+    state.view = GameView::MainMenu;
+    state.input = Some(RecordedInput::from_frame(
+        &InputFrame {
+            mouse_pos: Some((hover_x, hover_y)),
+            ..InputFrame::default()
+        },
+        SurfaceSize::new(width, height),
+    ));
+    render_frame(
+        &mut gfx_hover,
+        &DebugHud::new(),
+        &state,
+        RenderInputs {
+            world_offset_y_px: 0,
+            frame_dt: std::time::Duration::ZERO,
+            show_round_timer: false,
+            historical: false,
+        },
+    );
     let mut hover_px = [0u8; 4];
     hover_px.copy_from_slice(&frame_hover[idx..idx + 4]);
 
@@ -1091,10 +1068,7 @@ fn draw_skilltree_editor_hides_start_new_game_button() {
     runtime.editor.enabled = true;
 
     let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
-    let mut ui_tree = UiTree::new();
-    ui_tree.ensure_canvas(UI_CANVAS, ui::Rect::from_size(width, height));
-    ui_tree.add_root(UI_CANVAS);
-    let layout = draw_skilltree_runtime_with_ui(&mut gfx, width, height, &mut ui_tree, &runtime);
+    let layout = draw_skilltree_runtime(&mut gfx, width, height, &runtime);
     assert!(layout.panel.w > 0 && layout.panel.h > 0);
     assert_eq!(layout.start_new_game_button.w, 0);
     assert_eq!(layout.start_new_game_button.h, 0);
@@ -1107,11 +1081,8 @@ fn draw_skilltree_draws_dependency_arrows() {
     let mut frame = vec![0u8; (width * height * 4) as usize];
 
     let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
-    let mut ui_tree = UiTree::new();
-    ui_tree.ensure_canvas(UI_CANVAS, ui::Rect::from_size(width, height));
-    ui_tree.add_root(UI_CANVAS);
     let runtime = direct_attachment_fixture_runtime();
-    draw_skilltree_runtime_with_ui(&mut gfx, width, height, &mut ui_tree, &runtime);
+    draw_skilltree_runtime(&mut gfx, width, height, &runtime);
 
     let link_color = [110u8, 110, 150, 255];
     let found = frame.chunks_exact(4).any(|px| px == link_color);
@@ -1126,10 +1097,7 @@ fn draw_skilltree_routes_links_with_orthogonal_segments_around_blockers() {
 
     let runtime = orthogonal_routing_fixture_runtime();
     let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
-    let mut ui_tree = UiTree::new();
-    ui_tree.ensure_canvas(UI_CANVAS, ui::Rect::from_size(width, height));
-    ui_tree.add_root(UI_CANVAS);
-    let layout = draw_skilltree_runtime_with_ui(&mut gfx, width, height, &mut ui_tree, &runtime);
+    let layout = draw_skilltree_runtime(&mut gfx, width, height, &runtime);
 
     let link_color = [110u8, 110, 150, 255];
     let mut lane_pixels = Vec::new();
@@ -1163,10 +1131,7 @@ fn draw_skilltree_routed_links_render_under_non_default_camera_pan_and_zoom() {
     runtime.camera.target_pan = runtime.camera.pan;
 
     let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
-    let mut ui_tree = UiTree::new();
-    ui_tree.ensure_canvas(UI_CANVAS, ui::Rect::from_size(width, height));
-    ui_tree.add_root(UI_CANVAS);
-    let layout = draw_skilltree_runtime_with_ui(&mut gfx, width, height, &mut ui_tree, &runtime);
+    let layout = draw_skilltree_runtime(&mut gfx, width, height, &runtime);
 
     let link_color = [110u8, 110, 150, 255];
     let found = frame.chunks_exact(4).any(|px| px == link_color);
@@ -1200,10 +1165,7 @@ fn draw_skilltree_links_attach_directly_to_node_edges() {
 
     let runtime = direct_attachment_fixture_runtime();
     let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
-    let mut ui_tree = UiTree::new();
-    ui_tree.ensure_canvas(UI_CANVAS, ui::Rect::from_size(width, height));
-    ui_tree.add_root(UI_CANVAS);
-    let layout = draw_skilltree_runtime_with_ui(&mut gfx, width, height, &mut ui_tree, &runtime);
+    let layout = draw_skilltree_runtime(&mut gfx, width, height, &runtime);
 
     let link_color = [110u8, 110, 150, 255];
 
@@ -1246,10 +1208,7 @@ fn draw_skilltree_editor_draws_keyboard_cursor_indicator() {
     runtime.editor.cursor_world = Vec2i::new(0, 0);
 
     let mut gfx = CpuRenderer::new(&mut frame, SurfaceSize::new(width, height));
-    let mut ui_tree = UiTree::new();
-    ui_tree.ensure_canvas(UI_CANVAS, ui::Rect::from_size(width, height));
-    ui_tree.add_root(UI_CANVAS);
-    draw_skilltree_runtime_with_ui(&mut gfx, width, height, &mut ui_tree, &runtime);
+    draw_skilltree_runtime(&mut gfx, width, height, &runtime);
 
     let cursor_color = [255u8, 220, 120, 255];
     let found = frame.chunks_exact(4).any(|px| px == cursor_color);
@@ -1269,30 +1228,12 @@ fn draw_skilltree_editor_help_toggle_changes_rendered_overlay() {
 
     let mut frame_compact = vec![0u8; (width * height * 4) as usize];
     let mut gfx_compact = CpuRenderer::new(&mut frame_compact, SurfaceSize::new(width, height));
-    let mut ui_tree_compact = UiTree::new();
-    ui_tree_compact.ensure_canvas(UI_CANVAS, ui::Rect::from_size(width, height));
-    ui_tree_compact.add_root(UI_CANVAS);
-    draw_skilltree_runtime_with_ui(
-        &mut gfx_compact,
-        width,
-        height,
-        &mut ui_tree_compact,
-        &runtime,
-    );
+    draw_skilltree_runtime(&mut gfx_compact, width, height, &runtime);
 
     runtime.editor.help_expanded = true;
     let mut frame_expanded = vec![0u8; (width * height * 4) as usize];
     let mut gfx_expanded = CpuRenderer::new(&mut frame_expanded, SurfaceSize::new(width, height));
-    let mut ui_tree_expanded = UiTree::new();
-    ui_tree_expanded.ensure_canvas(UI_CANVAS, ui::Rect::from_size(width, height));
-    ui_tree_expanded.add_root(UI_CANVAS);
-    draw_skilltree_runtime_with_ui(
-        &mut gfx_expanded,
-        width,
-        height,
-        &mut ui_tree_expanded,
-        &runtime,
-    );
+    draw_skilltree_runtime(&mut gfx_expanded, width, height, &runtime);
 
     assert_ne!(
         frame_compact, frame_expanded,
