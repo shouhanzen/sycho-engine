@@ -27,16 +27,17 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DEBOUNCE: Duration = Duration::from_millis(300);
 
 const USAGE: &str = "Usage: overseer --package NAME --bin NAME --watch PATH [--watch PATH ...]
-                [--timeline DIR] [--fresh] [--editor] [--release]
+                [--no-recording | --timeline DIR] [--fresh] [--editor] [--release]
 
 Watches the given files or source directories and runs a Sycho game.
 The timeline defaults to target/timelines/<bin>. --fresh creates a separate timeline.
---editor embeds the game in an editor with timeline controls.";
+--no-recording restarts the standalone game from defaults on rebuild.
+--editor embeds the game and always enables timeline recording.";
 
 struct Options {
     package: String,
     binary: String,
-    timeline: PathBuf,
+    timeline: Option<PathBuf>,
     watch: Vec<PathBuf>,
     release: bool,
     editor: bool,
@@ -48,6 +49,7 @@ impl Options {
         let mut package = None;
         let mut binary = None;
         let mut timeline = None;
+        let mut no_recording = false;
         let mut watch = Vec::new();
         let mut fresh = false;
         let mut release = false;
@@ -75,6 +77,7 @@ impl Options {
                     )
                 }
                 "--timeline" => timeline = Some(PathBuf::from(value()?)),
+                "--no-recording" => no_recording = true,
                 "--watch" => watch.push(PathBuf::from(value()?)),
                 "--fresh" => fresh = true,
                 "--release" => release = true,
@@ -91,8 +94,17 @@ impl Options {
         if watch.is_empty() {
             return Err(invalid("at least one --watch path is required"));
         }
-        let default = PathBuf::from("target/timelines").join(&binary);
-        let timeline = session_directory(default, timeline, fresh)?;
+        let timeline = if no_recording {
+            if editor || timeline.is_some() || fresh {
+                return Err(invalid(
+                    "--no-recording requires standalone play without timeline options",
+                ));
+            }
+            None
+        } else {
+            let default = PathBuf::from("target/timelines").join(&binary);
+            Some(session_directory(default, timeline, fresh)?)
+        };
         Ok(Some(Self {
             package,
             binary,
@@ -194,7 +206,11 @@ fn supervise(options: &Options, editor: Option<&Bridge>, stop: &AtomicBool) -> i
                     if let Some(running) = &mut game {
                         match running.handoff(stop) {
                             Ok(Handoff::Ready) => {
-                                println!("checkpoint committed, starting the new build")
+                                if options.timeline.is_some() {
+                                    println!("checkpoint committed, starting the new build");
+                                } else {
+                                    println!("starting the new build without a checkpoint");
+                                }
                             }
                             Ok(Handoff::Rejected) => {
                                 if let Some(editor) = editor {
@@ -224,7 +240,7 @@ fn supervise(options: &Options, editor: Option<&Bridge>, stop: &AtomicBool) -> i
                     let address = editor
                         .map(|bridge| bridge.endpoint(generation))
                         .transpose()?;
-                    match RunningGame::launch(candidate, &options.timeline, address) {
+                    match RunningGame::launch(candidate, options.timeline.as_deref(), address) {
                         Ok(child) => game = Some(child),
                         Err(err) => {
                             if let Some(editor) = editor {
@@ -433,14 +449,16 @@ enum Handoff {
 impl RunningGame {
     fn launch(
         executable: StagedGame,
-        timeline: &Path,
+        timeline: Option<&Path>,
         address: Option<(SocketAddr, Option<String>)>,
     ) -> io::Result<Self> {
         let mut command = Command::new(&executable.0);
-        command
-            .arg("--timeline")
-            .arg(timeline)
-            .env(MANAGED_ENV, "1");
+        if let Some(timeline) = timeline {
+            command.arg("--timeline").arg(timeline);
+        } else {
+            command.arg("--no-recording");
+        }
+        command.env(MANAGED_ENV, "1");
         command.env_remove(SURFACE_ENV);
         if let Some((address, surface)) = address {
             command.env(ADDRESS_ENV, address.to_string());

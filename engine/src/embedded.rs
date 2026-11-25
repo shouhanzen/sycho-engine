@@ -11,6 +11,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use winit::event::{ElementState, MouseButton, VirtualKeyCode};
 
+use crate::profiling::PreviewProfile;
 #[cfg(target_os = "macos")]
 use crate::shared_surface::{Surface, SurfaceInbox, SurfaceLeases, SurfaceSender};
 use crate::surface::SurfaceSize;
@@ -36,6 +37,12 @@ pub enum EditorEvent {
     Focus(bool),
     ReleaseInput,
     Resize(SurfaceSize),
+    Profile(bool),
+    MasterVolume {
+        percent: u8,
+        request: u64,
+        commit: bool,
+    },
     ReleaseSurface(u32),
     UseRgba,
     Timeline(TimelineCommand),
@@ -49,9 +56,25 @@ pub struct TimelineStatus {
     pub playing: bool,
 }
 
+/// The live mixer level and the last editor change applied to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MasterVolume {
+    pub percent: u8,
+    pub request: Option<u64>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub(crate) struct PreviewMetadata {
+    pub status: TimelineStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_volume: Option<MasterVolume>,
+}
+
 pub struct PreviewFrame {
     pub size: SurfaceSize,
     pub status: TimelineStatus,
+    pub master_volume: Option<MasterVolume>,
+    pub profile: Option<PreviewProfile>,
     pub pixels: Vec<u8>,
     #[cfg(target_os = "macos")]
     pub surface: Option<PreviewSurface>,
@@ -81,7 +104,10 @@ impl Drop for PreviewSurface {
 #[derive(Serialize, Deserialize)]
 struct FrameHeader {
     size: SurfaceSize,
-    status: TimelineStatus,
+    #[serde(flatten)]
+    metadata: PreviewMetadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile: Option<PreviewProfile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     shared: Option<u32>,
 }
@@ -129,7 +155,9 @@ impl PreviewFrame {
         };
         Ok(Some(Self {
             size: header.size,
-            status: header.status,
+            status: header.metadata.status,
+            master_volume: header.metadata.master_volume,
+            profile: header.profile,
             pixels: Vec::new(),
             surface: Some(PreviewSurface {
                 id,
@@ -150,7 +178,9 @@ impl PreviewFrame {
         stream.read_exact(&mut pixels)?;
         Ok(Self {
             size: header.size,
-            status: header.status,
+            status: header.metadata.status,
+            master_volume: header.metadata.master_volume,
+            profile: header.profile,
             pixels,
             #[cfg(target_os = "macos")]
             surface: None,
@@ -162,7 +192,11 @@ impl PreviewFrame {
             stream,
             &FrameHeader {
                 size: self.size,
-                status: self.status,
+                metadata: PreviewMetadata {
+                    status: self.status,
+                    master_volume: self.master_volume,
+                },
+                profile: self.profile,
                 shared: None,
             },
         )?;
@@ -378,10 +412,14 @@ impl FramePublisher {
     pub fn publish(
         &mut self,
         size: SurfaceSize,
-        status: TimelineStatus,
+        metadata: PreviewMetadata,
+        mut profile: Option<PreviewProfile>,
         rgba: &[u8],
         stride: usize,
     ) {
+        if let Some(profile) = &mut profile {
+            profile.published_us = crate::profiling::wall_micros();
+        }
         self.pixels.resize(size.rgba_len(), 0);
         let row_bytes = size.width as usize * 4;
         if stride == row_bytes {
@@ -397,7 +435,9 @@ impl FramePublisher {
         }
         let frame = PreviewFrame {
             size,
-            status,
+            status: metadata.status,
+            master_volume: metadata.master_volume,
+            profile,
             pixels: std::mem::take(&mut self.pixels),
             #[cfg(target_os = "macos")]
             surface: None,
@@ -420,13 +460,18 @@ impl FramePublisher {
     pub fn publish_surface(
         &mut self,
         size: SurfaceSize,
-        status: TimelineStatus,
+        metadata: PreviewMetadata,
+        mut profile: Option<PreviewProfile>,
         lease: SurfaceLease,
     ) {
+        if let Some(profile) = &mut profile {
+            profile.published_us = crate::profiling::wall_micros();
+        }
         self.send(OutgoingFrame::Surface(
             FrameHeader {
                 size,
-                status,
+                metadata,
+                profile,
                 shared: Some(lease.id),
             },
             lease,
@@ -465,9 +510,20 @@ mod tests {
         };
         let size = SurfaceSize::new(257, 185);
         let rgba = vec![0xA7; size.rgba_len()];
+        let profile = Some(PreviewProfile {
+            frame: 38,
+            draw_us: 550,
+            ..PreviewProfile::default()
+        });
+        let master_volume = Some(MasterVolume {
+            percent: 42,
+            request: Some(9),
+        });
         PreviewFrame {
             size,
             status,
+            master_volume,
+            profile,
             pixels: rgba.clone(),
             #[cfg(target_os = "macos")]
             surface: None,
@@ -483,6 +539,8 @@ mod tests {
         let frame = PreviewFrame::read(&mut stream).unwrap();
         assert_eq!(frame.size, size);
         assert_eq!(frame.status, status);
+        assert_eq!(frame.master_volume, master_volume);
+        assert_eq!(frame.profile, profile);
         assert_eq!(frame.pixels, rgba);
         assert!(matches!(
             read_message(&mut stream).unwrap(),

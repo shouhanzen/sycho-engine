@@ -85,7 +85,6 @@ pub struct PerfBudgetConfig {
     pub frame_total: PerfBudgetThreshold,
     pub engine_total: PerfBudgetThreshold,
     pub draw: PerfBudgetThreshold,
-    pub overlay: PerfBudgetThreshold,
 }
 
 impl Default for PerfBudgetConfig {
@@ -94,7 +93,6 @@ impl Default for PerfBudgetConfig {
             frame_total: PerfBudgetThreshold::new(16.67, 22.0),
             engine_total: PerfBudgetThreshold::new(6.0, 10.0),
             draw: PerfBudgetThreshold::new(6.0, 10.0),
-            overlay: PerfBudgetThreshold::new(1.5, 3.0),
         }
     }
 }
@@ -127,12 +125,6 @@ impl PerfBudgetConfig {
                 "ROLLOUT_BUDGET_DRAW_WARN_MS",
                 "ROLLOUT_BUDGET_DRAW_CRIT_MS",
                 defaults.draw,
-            ),
-            overlay: threshold_from_lookup(
-                &mut lookup,
-                "ROLLOUT_BUDGET_OVERLAY_WARN_MS",
-                "ROLLOUT_BUDGET_OVERLAY_CRIT_MS",
-                defaults.overlay,
             ),
         }
     }

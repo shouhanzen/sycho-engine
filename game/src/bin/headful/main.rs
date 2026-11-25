@@ -1,6 +1,5 @@
 use std::{
     cell::Cell,
-    io,
     io::Cursor,
     path::PathBuf,
     time::{Duration, Instant},
@@ -8,12 +7,12 @@ use std::{
 
 use engine::HeadlessRunner;
 use engine::app::{
-    AppConfig, AppContext, GameApp, InputFrame, ProfileConfig, RunMode, TimelineCli,
-    TimelineConfig, TimelineGame, parse_timeline_cli, run_game_with_profile,
-    run_game_with_timeline,
+    AppConfig, AppContext, GameApp, InputFrame, RunConfig, TimelineGame, parse_timeline_cli,
+    run_game,
 };
 use engine::audio::{MusicRuntime, Quantize, Scene, StepPattern, Track, Waveform};
-use engine::timeline::{StateSchema, TimelineCommand, session_directory};
+use engine::profiling::{FrameTimings, ProfileConfig};
+use engine::timeline::{StateSchema, TimelineCommand};
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
 use winit::event::VirtualKeyCode;
 use winit::{
@@ -24,10 +23,10 @@ use winit::{
 
 use game::debug::DebugHud;
 use game::game_ui::{GameUiAction, GameUiLayout};
-use game::headful::dig_camera as headful_dig_camera;
+use game::headful::dig_camera::DigCameraController;
 use game::headful::input_adapter as headful_input;
 use game::headful::render_pipeline::{
-    DrawTimings, RenderInputs, export_video, render_frame as render_headful_frame,
+    FrameOverlays, export_video, render_frame as render_headful_frame,
 };
 use game::headful::skilltree_camera as headful_camera;
 use game::headful::view_transitions as headful_view;
@@ -48,35 +47,31 @@ use game::view::GameView;
 
 struct HeadfulApp {
     profile_mode: bool,
-    timeline_mode: bool,
     base_logic: TetrisLogic,
     base_round_limit: Duration,
     base_gravity_interval: Duration,
     sfx: Option<Sfx>,
     debug_hud: DebugHud,
-    historical: bool,
+    show_playback_cursor: bool,
     skilltree_layout: SkillTreeLayout,
     mouse_x: u32,
     mouse_y: u32,
     skilltree_cam_input: SkillTreeCameraInput,
     horizontal_repeat: HorizontalRepeat,
-    dig_camera: DigCameraController,
     frame_interval: Duration,
     next_redraw: Instant,
-    last_frame_dt: Duration,
     exit_requested: bool,
     mouse_release_was_drag: bool,
     consume_next_mouse_up: bool,
     settings_store: SettingsStore,
     player_settings: PlayerSettings,
-    settings_open: bool,
     active_settings_slider: Option<ActiveSettingsSlider>,
     settings_dirty: bool,
 }
 
 struct PreviewSnapshot {
     state: GameState,
-    inputs: RenderInputs,
+    show_playback_cursor: bool,
     debug_hud: DebugHud,
 }
 
@@ -89,40 +84,26 @@ enum ActiveSettingsSlider {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let TimelineCli {
-        help,
-        timeline_path,
-        fresh,
-        playback,
-        export_video: output,
-    } = parse_timeline_cli()?;
-    if help {
+    let cli = parse_timeline_cli()?;
+    if cli.help {
         print_headful_help();
         return Ok(());
     }
 
     let default_directory =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/timelines/headful");
-    if let Some(output) = output {
-        let directory = timeline_path.unwrap_or(default_directory);
-        export_video(&directory, &output)?;
+    if let Some(output) = cli.export_video.as_ref() {
+        let directory = cli.timeline_path.as_ref().unwrap_or(&default_directory);
+        export_video(directory, output)?;
         println!("exported {}", output.display());
         return Ok(());
     }
 
-    let profile_frames = env_usize("ROLLOUT_HEADFUL_PROFILE_FRAMES").unwrap_or(0);
-    if (timeline_path.is_some() || fresh || playback) && profile_frames > 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "cannot combine --timeline, --fresh, or --playback with profiling mode",
+    let desired = if cli.profile {
+        PhysicalSize::new(
+            env_u32("ROLLOUT_PROFILE_WIDTH").unwrap_or(1920).max(1),
+            env_u32("ROLLOUT_PROFILE_HEIGHT").unwrap_or(1080).max(1),
         )
-        .into());
-    }
-    let desired = if let (Some(w), Some(h)) = (
-        env_u32("ROLLOUT_HEADFUL_PROFILE_WIDTH"),
-        env_u32("ROLLOUT_HEADFUL_PROFILE_HEIGHT"),
-    ) {
-        PhysicalSize::new(w.max(1), h.max(1))
     } else {
         PhysicalSize::new(1920u32, 1080u32)
     };
@@ -151,27 +132,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let multi_bonus_percent = env_u32("ROLLOUT_DEPTH_WALL_MULTI_BONUS_PERCENT")
         .unwrap_or(DEFAULT_DEPTH_WALL_MULTI_CLEAR_BONUS_PERCENT);
     base_logic = base_logic.with_depth_wall_damage_tuning(per_line_damage, multi_bonus_percent);
-    let app = HeadfulApp::new(base_logic, DEFAULT_ROUND_LIMIT, DEFAULT_GRAVITY_INTERVAL);
+    let mut app = HeadfulApp::new(base_logic, DEFAULT_ROUND_LIMIT, DEFAULT_GRAVITY_INTERVAL);
+    app.profile_mode = cli.profile;
 
-    if profile_frames > 0 {
-        run_game_with_profile(
-            config,
-            app,
-            ProfileConfig {
-                target_frames: profile_frames,
-            },
-        )
+    let run = if cli.profile {
+        RunConfig::Profile(ProfileConfig {
+            target_frames: env_usize("ROLLOUT_PROFILE_FRAMES").unwrap_or(600),
+            warmup_frames: env_usize("ROLLOUT_PROFILE_WARMUP").unwrap_or(200),
+        })
     } else {
-        let directory = session_directory(default_directory, timeline_path, fresh)?;
-        run_game_with_timeline(
-            config,
-            app,
-            TimelineConfig {
-                directory,
-                playback,
-            },
-        )
-    }
+        RunConfig::Live {
+            timeline: cli.recording(default_directory)?,
+        }
+    };
+    run_game(config, app, run)
 }
 
 impl HeadfulApp {
@@ -201,28 +175,24 @@ impl HeadfulApp {
         }
         let app = Self {
             profile_mode: false,
-            timeline_mode: false,
             base_logic,
             base_round_limit,
             base_gravity_interval,
             sfx,
             debug_hud,
-            historical: false,
+            show_playback_cursor: false,
             skilltree_layout: SkillTreeLayout::default(),
             mouse_x: 0,
             mouse_y: 0,
             skilltree_cam_input: SkillTreeCameraInput::default(),
             horizontal_repeat: HorizontalRepeat::default(),
-            dig_camera: DigCameraController::from_env(),
             frame_interval,
             next_redraw: Instant::now(),
-            last_frame_dt: Duration::ZERO,
             exit_requested: false,
             mouse_release_was_drag: false,
             consume_next_mouse_up: false,
             settings_store,
             player_settings,
-            settings_open: false,
             active_settings_slider: None,
             settings_dirty: false,
         };
@@ -230,19 +200,17 @@ impl HeadfulApp {
         app
     }
 
-    fn render_inputs(&self) -> RenderInputs {
-        let camera_offset = if self.player_settings.accessibility.reduce_motion {
-            0.0
+    fn update_display_preferences(&self, state: &mut GameState) {
+        let settings = state
+            .settings_overlay
+            .as_ref()
+            .unwrap_or(&self.player_settings);
+        state.display.screen_shake_percent = if settings.accessibility.reduce_motion {
+            0
         } else {
-            self.dig_camera.offset_y_px()
-                * (self.player_settings.video.clamped_screen_shake() as f32 / 100.0)
+            settings.video.clamped_screen_shake()
         };
-        RenderInputs {
-            world_offset_y_px: camera_offset.round() as i32,
-            frame_dt: self.last_frame_dt,
-            historical: self.historical,
-            show_round_timer: self.player_settings.gameplay.show_round_timer,
-        }
+        state.display.show_round_timer = settings.gameplay.show_round_timer;
     }
 
     fn play_click_sfx(&self) {
@@ -277,21 +245,6 @@ impl HeadfulApp {
         }
     }
 
-    fn open_settings_from_view(&mut self, view: GameView) -> bool {
-        if !matches!(view, GameView::MainMenu | GameView::Tetris { paused: true }) {
-            return false;
-        }
-        self.settings_open = true;
-        self.active_settings_slider = None;
-        true
-    }
-
-    fn close_settings(&mut self) {
-        self.settings_open = false;
-        self.active_settings_slider = None;
-        self.save_settings_if_dirty();
-    }
-
     fn toggle_music_enabled(&mut self) {
         self.player_settings.audio.music_enabled = !self.player_settings.audio.music_enabled;
         self.apply_audio_settings();
@@ -318,6 +271,7 @@ impl HeadfulApp {
 
     fn apply_settings_slider_x(
         &mut self,
+        settings: &mut PlayerSettings,
         layout: SettingsMenuLayout,
         slider: ActiveSettingsSlider,
         x: u32,
@@ -329,11 +283,11 @@ impl HeadfulApp {
                     layout.master_track,
                     0.0,
                     1.0,
-                    self.player_settings.audio.master_volume,
+                    settings.audio.master_volume,
                 );
                 let next = slider.value_from_x(x);
-                if (next - self.player_settings.audio.master_volume).abs() > 1e-4 {
-                    self.player_settings.audio.master_volume = next;
+                if (next - settings.audio.master_volume).abs() > 1e-4 {
+                    settings.audio.master_volume = next;
                     changed = true;
                 }
             }
@@ -342,11 +296,11 @@ impl HeadfulApp {
                     layout.music_track,
                     0.0,
                     1.0,
-                    self.player_settings.audio.music_volume,
+                    settings.audio.music_volume,
                 );
                 let next = slider.value_from_x(x);
-                if (next - self.player_settings.audio.music_volume).abs() > 1e-4 {
-                    self.player_settings.audio.music_volume = next;
+                if (next - settings.audio.music_volume).abs() > 1e-4 {
+                    settings.audio.music_volume = next;
                     changed = true;
                 }
             }
@@ -355,11 +309,11 @@ impl HeadfulApp {
                     layout.sfx_track,
                     0.0,
                     1.0,
-                    self.player_settings.audio.sfx_volume,
+                    settings.audio.sfx_volume,
                 );
                 let next = slider.value_from_x(x);
-                if (next - self.player_settings.audio.sfx_volume).abs() > 1e-4 {
-                    self.player_settings.audio.sfx_volume = next;
+                if (next - settings.audio.sfx_volume).abs() > 1e-4 {
+                    settings.audio.sfx_volume = next;
                     changed = true;
                 }
             }
@@ -368,16 +322,17 @@ impl HeadfulApp {
                     layout.shake_track,
                     0.0,
                     100.0,
-                    self.player_settings.video.screen_shake_percent as f32,
+                    settings.video.screen_shake_percent as f32,
                 );
                 let next = slider.value_from_x(x).round().clamp(0.0, 100.0) as u8;
-                if next != self.player_settings.video.screen_shake_percent {
-                    self.player_settings.video.screen_shake_percent = next;
+                if next != settings.video.screen_shake_percent {
+                    settings.video.screen_shake_percent = next;
                     changed = true;
                 }
             }
         }
         if changed {
+            self.player_settings = settings.clone();
             self.apply_audio_settings();
             self.mark_settings_dirty();
         }
@@ -390,10 +345,7 @@ impl HeadfulApp {
             self.base_round_limit,
             self.base_gravity_interval,
             &mut self.horizontal_repeat,
-            self.timeline_mode,
         );
-        self.dig_camera
-            .reset(state.state().tetris.background_depth_rows());
     }
 
     fn apply_input_commands(
@@ -409,14 +361,11 @@ impl HeadfulApp {
                 headful_input::HeadfulInputCommand::ToggleMusic => {
                     self.toggle_music_enabled();
                 }
-                headful_input::HeadfulInputCommand::ExitRequested => {
-                    self.exit_requested = true;
+                headful_input::HeadfulInputCommand::Ui(action) => {
+                    self.handle_ui_action(runner, action);
                 }
                 headful_input::HeadfulInputCommand::PlayClick => {
                     self.play_click_sfx();
-                }
-                headful_input::HeadfulInputCommand::ResetRun => {
-                    self.reset_active_run(runner);
                 }
                 headful_input::HeadfulInputCommand::ApplyAction(action) => {
                     apply_action(
@@ -436,141 +385,99 @@ impl HeadfulApp {
         state: &mut HeadlessRunner<TetrisLogic>,
         action: GameUiAction,
     ) -> bool {
+        let view = state.state().view;
         match action {
-            GameUiAction::StartGame => {
-                let view = state.state().view;
-                if matches!(view, GameView::MainMenu)
-                    || (view == GameView::SkillTree && !state.state().skilltree.editor.enabled)
-                {
-                    let transition = headful_view::start_game(view);
-                    state.state_mut().view = transition.next_view;
-                    if transition.reset_tetris {
-                        self.reset_active_run(state);
-                    }
-                    self.play_click_sfx();
-                    return true;
+            GameUiAction::StartGame
+                if matches!(view, GameView::MainMenu | GameView::GameOver)
+                    || (view == GameView::SkillTree && !state.state().skilltree.editor.enabled) =>
+            {
+                let transition = headful_view::start_game(view);
+                state.state_mut().view = transition.next_view;
+                if transition.reset_tetris {
+                    self.reset_active_run(state);
                 }
             }
-            GameUiAction::OpenSkillTreeEditor => {
-                let view = state.state().view;
-                if matches!(view, GameView::MainMenu) {
-                    let transition = headful_view::open_skilltree_editor(view);
-                    state.state_mut().view = transition.next_view;
-                    self.horizontal_repeat.clear();
-                    let skilltree = &mut state.state_mut().skilltree;
-                    if !skilltree.editor.enabled {
-                        skilltree.editor_toggle();
-                    }
-                    self.play_click_sfx();
-                    return true;
-                }
-            }
-            GameUiAction::Quit => {
-                let view = state.state().view;
-                if matches!(view, GameView::MainMenu | GameView::GameOver) {
-                    self.exit_requested = true;
-                    return true;
-                }
-            }
-            GameUiAction::PauseToggle => {
-                let view = state.state().view;
-                if view.is_tetris() {
-                    let transition = headful_view::toggle_pause(view);
-                    let state = state.state_mut();
-                    state.view = transition.next_view;
-                    state.gravity_elapsed = Duration::ZERO;
-                    self.play_click_sfx();
-                    return true;
-                }
-            }
-            GameUiAction::Resume => {
-                let view = state.state().view;
-                if matches!(view, GameView::Tetris { paused: true }) {
-                    let transition = headful_view::toggle_pause(view);
-                    let state = state.state_mut();
-                    state.view = transition.next_view;
-                    state.gravity_elapsed = Duration::ZERO;
-                    self.play_click_sfx();
-                    return true;
-                }
-            }
-            GameUiAction::EndRun => {
-                let view = state.state().view;
-                if matches!(view, GameView::Tetris { paused: true }) {
-                    let earned = money_earned_from_run(state.state());
-                    if earned > 0 {
-                        state.state_mut().skilltree.add_money(earned);
-                    }
-                    let transition = headful_view::game_over(view);
-                    state.state_mut().view = transition.next_view;
-                    self.horizontal_repeat.clear();
-                    self.play_click_sfx();
-                    return true;
-                }
-            }
-            GameUiAction::HoldPiece => {
-                let view = state.state().view;
-                if matches!(view, GameView::Tetris { paused: false }) {
-                    apply_action(
-                        state,
-                        self.sfx.as_ref(),
-                        self.player_settings.audio,
-                        &mut self.debug_hud,
-                        InputAction::Hold,
-                    );
-                    return true;
-                }
-            }
-            GameUiAction::Restart => {
-                let view = state.state().view;
-                if matches!(view, GameView::GameOver) {
-                    let transition = headful_view::start_game(view);
-                    state.state_mut().view = transition.next_view;
-                    if transition.reset_tetris {
-                        self.reset_active_run(state);
-                    }
-                    self.play_click_sfx();
-                    return true;
-                }
-            }
-            GameUiAction::OpenSkillTree => {
-                let view = state.state().view;
-                if matches!(view, GameView::GameOver) {
-                    let transition = headful_view::open_skilltree(view);
-                    state.state_mut().view = transition.next_view;
-                    self.horizontal_repeat.clear();
-                    self.play_click_sfx();
-                    return true;
-                }
-            }
-            GameUiAction::SkillTreeTool(tool) => {
-                let view = state.state().view;
+            GameUiAction::OpenSkillTreeEditor if view == GameView::MainMenu => {
+                state.state_mut().view = headful_view::open_skilltree_editor(view).next_view;
+                self.horizontal_repeat.clear();
                 let skilltree = &mut state.state_mut().skilltree;
-                if view == GameView::SkillTree && skilltree.editor.enabled {
-                    skilltree.editor_set_tool(tool);
-                    self.play_click_sfx();
-                    return true;
+                if !skilltree.editor.enabled {
+                    skilltree.editor_toggle();
                 }
             }
-            GameUiAction::OpenSettings => {
-                if self.open_settings_from_view(state.state().view) {
-                    self.play_click_sfx();
-                    return true;
-                }
+            GameUiAction::OpenSkillTree if view == GameView::GameOver => {
+                state.state_mut().view = headful_view::open_skilltree(view).next_view;
+                self.horizontal_repeat.clear();
             }
-            GameUiAction::CloseSettings => {
-                self.close_settings();
-                self.play_click_sfx();
+            GameUiAction::Back if matches!(view, GameView::SkillTree | GameView::GameOver) => {
+                let state = state.state_mut();
+                if view == GameView::SkillTree && state.skilltree.editor.enabled {
+                    if state.skilltree.editor.search_open {
+                        state.skilltree.editor_close_search();
+                        self.play_click_sfx();
+                        return true;
+                    }
+                    state.skilltree.editor_toggle();
+                }
+                state.view = headful_view::back(view).next_view;
+                self.horizontal_repeat.clear();
+            }
+            GameUiAction::Quit if matches!(view, GameView::MainMenu | GameView::GameOver) => {
+                self.exit_requested = true;
                 return true;
             }
-            settings_action => return self.apply_settings_action(settings_action),
+            GameUiAction::PauseToggle if view.is_tetris() => {
+                let state = state.state_mut();
+                state.view = headful_view::toggle_pause(view).next_view;
+                state.gravity_elapsed = Duration::ZERO;
+                self.horizontal_repeat.clear();
+            }
+            GameUiAction::EndRun if view.is_tetris_paused() => {
+                let earned = money_earned_from_run(state.state());
+                if earned > 0 {
+                    state.state_mut().skilltree.add_money(earned);
+                }
+                state.state_mut().view = headful_view::game_over(view).next_view;
+                self.horizontal_repeat.clear();
+            }
+            GameUiAction::HoldPiece if view.is_tetris_playing() => {
+                apply_action(
+                    state,
+                    self.sfx.as_ref(),
+                    self.player_settings.audio,
+                    &mut self.debug_hud,
+                    InputAction::Hold,
+                );
+                return true;
+            }
+            GameUiAction::SkillTreeTool(tool)
+                if view == GameView::SkillTree && state.state().skilltree.editor.enabled =>
+            {
+                state.state_mut().skilltree.editor_set_tool(tool);
+            }
+            GameUiAction::OpenSettings
+                if view.can_open_settings() && state.state().settings_overlay.is_none() =>
+            {
+                state.state_mut().settings_overlay = Some(self.player_settings.clone());
+                self.active_settings_slider = None;
+            }
+            GameUiAction::CloseSettings if state.state().settings_overlay.is_some() => {
+                state.state_mut().settings_overlay = None;
+                self.active_settings_slider = None;
+                self.save_settings_if_dirty();
+            }
+            settings_action => {
+                return self.apply_settings_action(state.state_mut(), settings_action);
+            }
         }
-
-        false
+        self.play_click_sfx();
+        true
     }
 
-    fn apply_settings_action(&mut self, action: GameUiAction) -> bool {
-        let settings = &mut self.player_settings;
+    fn apply_settings_action(&mut self, state: &mut GameState, action: GameUiAction) -> bool {
+        let Some(settings) = state.settings_overlay.as_mut() else {
+            return false;
+        };
         match action {
             GameUiAction::ResetSettings => *settings = PlayerSettings::default(),
             GameUiAction::ToggleMute => settings.audio.mute_all = !settings.audio.mute_all,
@@ -592,10 +499,9 @@ impl HeadfulApp {
             }
             _ => return false,
         }
-        if matches!(
-            action,
-            GameUiAction::ResetSettings | GameUiAction::ToggleMute | GameUiAction::ToggleMusic
-        ) {
+        let audio_changed = settings.audio != self.player_settings.audio;
+        self.player_settings = settings.clone();
+        if audio_changed {
             self.apply_audio_settings();
         }
         self.mark_settings_dirty();
@@ -609,33 +515,20 @@ impl HeadfulApp {
         state: &mut HeadlessRunner<TetrisLogic>,
         dt: Duration,
     ) {
-        if self.profile_mode {
+        let state = state.state_mut();
+        if self.profile_mode || state.round_timer_disabled || !state.view.is_tetris_playing() {
             return;
         }
 
-        let mut trigger_game_over = false;
-        {
-            let state = state.state_mut();
-            if !self.debug_hud.round_timer_disabled() {
-                state
-                    .round_timer
-                    .tick_if_running(dt, state.view.is_tetris_playing());
+        state.round_timer.tick_if_running(dt, true);
+        if state.round_timer.is_up() {
+            let earned = money_earned_from_run(state);
+            if earned > 0 {
+                state.skilltree.add_money(earned);
             }
-            if !self.debug_hud.round_timer_disabled()
-                && state.view.is_tetris_playing()
-                && state.round_timer.is_up()
-            {
-                let earned = money_earned_from_run(state);
-                if earned > 0 {
-                    state.skilltree.add_money(earned);
-                }
-                let transition = headful_view::game_over(state.view);
-                state.view = transition.next_view;
-                state.gravity_elapsed = Duration::ZERO;
-                trigger_game_over = true;
-            }
-        }
-        if trigger_game_over {
+            let transition = headful_view::game_over(state.view);
+            state.view = transition.next_view;
+            state.gravity_elapsed = Duration::ZERO;
             self.horizontal_repeat.clear();
         }
     }
@@ -665,25 +558,15 @@ impl HeadfulApp {
             }
         }
         if line_clear_dt_ms > 0 {
-            let gravity_start = Instant::now();
-            state.step_profiled(
-                InputAction::GravityTick {
-                    dt_ms: line_clear_dt_ms,
-                },
-                &mut self.debug_hud,
-            );
-            self.debug_hud.record_gravity(gravity_start.elapsed());
+            state.step(InputAction::GravityTick {
+                dt_ms: line_clear_dt_ms,
+            });
             return;
         }
         for _ in 0..gravity_steps {
-            let gravity_start = Instant::now();
-            state.step_profiled(
-                InputAction::GravityTick {
-                    dt_ms: gravity_step_ms,
-                },
-                &mut self.debug_hud,
-            );
-            self.debug_hud.record_gravity(gravity_start.elapsed());
+            state.step(InputAction::GravityTick {
+                dt_ms: gravity_step_ms,
+            });
         }
     }
 
@@ -724,8 +607,6 @@ impl HeadfulApp {
             now,
             &mut self.horizontal_repeat,
             self.skilltree_layout,
-            self.mouse_x,
-            self.mouse_y,
         );
         self.apply_input_commands(runner, commands);
     }
@@ -746,19 +627,12 @@ impl HeadfulApp {
             in_skilltree_view,
         );
     }
-
-    fn update_dig_camera_state(&mut self, runner: &HeadlessRunner<TetrisLogic>, dt: Duration) {
-        let view = runner.state().view;
-        let paused = matches!(view, GameView::Tetris { paused: true });
-        let depth_rows = runner.state().tetris.background_depth_rows();
-        self.dig_camera.update(depth_rows, dt, paused);
-    }
 }
 
 impl GameApp for HeadfulApp {
     type State = HeadlessRunner<TetrisLogic>;
 
-    fn init_state(&mut self, _ctx: &mut AppContext) -> Self::State {
+    fn init_state(&mut self, ctx: &mut AppContext) -> Self::State {
         let mut runner = HeadlessRunner::new(self.base_logic.clone());
         let state = runner.state_mut();
         state.view = if self.profile_mode {
@@ -774,19 +648,15 @@ impl GameApp for HeadfulApp {
         state.round_timer = RoundTimer::new(self.base_round_limit);
         state.gravity_interval = self.base_gravity_interval;
         state.gravity_elapsed = Duration::ZERO;
-        self.dig_camera.reset(state.tetris.background_depth_rows());
+        state.display.viewport = ctx.surface_size;
+        state.display.dig_camera = DigCameraController::from_env();
+        state
+            .display
+            .dig_camera
+            .reset(state.tetris.background_depth_rows());
+        state.round_timer_disabled = self.debug_hud.round_timer_disabled();
+        self.update_display_preferences(state);
         runner
-    }
-
-    fn on_run_mode(&mut self, mode: RunMode, state: &mut Self::State, _ctx: &mut AppContext) {
-        self.profile_mode = matches!(mode, RunMode::Profile);
-        self.timeline_mode = matches!(mode, RunMode::Timeline);
-        if self.timeline_mode {
-            state.state_mut().use_timeline_progress();
-        }
-        if self.profile_mode {
-            state.state_mut().view = GameView::Tetris { paused: false };
-        }
     }
 
     fn update_state(
@@ -796,7 +666,9 @@ impl GameApp for HeadfulApp {
         dt: Duration,
         ctx: &mut AppContext,
     ) {
-        self.last_frame_dt = dt;
+        if let Some(settings) = state.state_mut().settings_overlay.as_mut() {
+            settings.audio.master_volume = self.player_settings.audio.master_volume;
+        }
         let now = Instant::now();
 
         if let Some((mx, my)) = input.mouse_pos {
@@ -820,28 +692,13 @@ impl GameApp for HeadfulApp {
         let left_mouse_pressed = input.mouse_buttons_pressed.contains(&MouseButton::Left);
         let left_mouse_released = input.mouse_buttons_released.contains(&MouseButton::Left);
         let left_mouse_down = input.mouse_buttons_down.contains(&MouseButton::Left);
-        let pressed = |key| input.keys_pressed.contains(&key);
-
-        let settings_were_open = self.settings_open;
-        if settings_were_open {
-            if pressed(winit::event::VirtualKeyCode::Escape) {
-                self.close_settings();
-                self.play_click_sfx();
-            }
-        } else if pressed(winit::event::VirtualKeyCode::O) {
-            if self.open_settings_from_view(state.state().view) {
-                self.play_click_sfx();
-            }
-        }
 
         let size = ctx.surface_size;
-        if !self.settings_open && !settings_were_open {
-            if state.state().view == GameView::SkillTree {
-                self.skilltree_layout = GameUiLayout::compute(state.state(), size, false).skilltree;
-            }
-            self.process_keyboard_frame(state, input, now);
+        if state.state().view == GameView::SkillTree {
+            self.skilltree_layout = GameUiLayout::compute(state.state(), size).skilltree;
         }
-        let layout = GameUiLayout::compute(state.state(), size, self.settings_open);
+        self.process_keyboard_frame(state, input, now);
+        let layout = GameUiLayout::compute(state.state(), size);
         self.skilltree_layout = layout.skilltree;
 
         if left_mouse_pressed {
@@ -849,12 +706,15 @@ impl GameApp for HeadfulApp {
                 self.debug_hud
                     .handle_click(self.mouse_x, self.mouse_y, size.width, size.height);
             if debug_clicked {
+                state.state_mut().round_timer_disabled = self.debug_hud.round_timer_disabled();
                 self.consume_next_mouse_up = true;
             } else if let Some(settings) = layout.settings {
                 self.active_settings_slider =
                     Self::settings_slider_from_pointer(settings, self.mouse_x, self.mouse_y);
-                if let Some(slider) = self.active_settings_slider {
-                    self.apply_settings_slider_x(settings, slider, self.mouse_x);
+                if let Some(slider) = self.active_settings_slider
+                    && let Some(values) = state.state_mut().settings_overlay.as_mut()
+                {
+                    self.apply_settings_slider_x(values, settings, slider, self.mouse_x);
                 }
             } else if state.state().view == GameView::SkillTree {
                 self.skilltree_cam_input.left_down = true;
@@ -871,10 +731,11 @@ impl GameApp for HeadfulApp {
         }
 
         if let Some(settings) = layout.settings {
-            if left_mouse_down {
-                if let Some(active) = self.active_settings_slider {
-                    self.apply_settings_slider_x(settings, active, self.mouse_x);
-                }
+            if left_mouse_down
+                && let Some(slider) = self.active_settings_slider
+                && let Some(values) = state.state_mut().settings_overlay.as_mut()
+            {
+                self.apply_settings_slider_x(values, settings, slider, self.mouse_x);
             }
         } else {
             self.update_skilltree_drag_from_frame(state, left_mouse_down);
@@ -914,7 +775,7 @@ impl GameApp for HeadfulApp {
             let handled = layout
                 .action_at(state.state(), pointer)
                 .is_some_and(|action| self.handle_ui_action(state, action));
-            if !handled && !self.settings_open {
+            if !handled && state.state().settings_overlay.is_none() {
                 let commands = headful_input::handle_skilltree_world_click(
                     state,
                     self.skilltree_layout,
@@ -925,7 +786,7 @@ impl GameApp for HeadfulApp {
                 self.apply_input_commands(state, commands);
             }
         }
-        if left_mouse_released && self.settings_open {
+        if left_mouse_released && state.state().settings_overlay.is_some() {
             self.save_settings_if_dirty();
         }
 
@@ -957,20 +818,42 @@ impl GameApp for HeadfulApp {
             headful_camera::finalize_camera(skilltree, self.skilltree_layout);
         }
 
-        self.update_dig_camera_state(state, dt);
         let state = state.state_mut();
-        state.input = Some(RecordedInput::from_frame(input, size));
-        state.settings_overlay = self.settings_open.then(|| self.player_settings.clone());
+        update_dig_camera(state, dt);
+        state.display.viewport = size;
+        self.update_display_preferences(state);
+        state.input = Some(RecordedInput::from_frame(input));
     }
 
     fn render(&mut self, runner: &Self::State, renderer: &mut dyn engine::graphics::Renderer2d) {
         render_headful_frame(
             renderer,
-            &self.debug_hud,
             runner.state(),
-            self.render_inputs(),
-        )
-        .record(&mut self.debug_hud);
+            FrameOverlays {
+                debug_hud: Some(&self.debug_hud),
+                playback_cursor: self.show_playback_cursor,
+            },
+        );
+    }
+
+    fn on_frame_timings(&mut self, timings: FrameTimings) {
+        self.debug_hud.on_frame(timings);
+    }
+
+    fn master_volume(&self) -> Option<u8> {
+        Some((self.player_settings.audio.master_volume * 100.0).round() as u8)
+    }
+
+    fn set_master_volume(&mut self, percent: u8, commit: bool) {
+        let volume = f32::from(percent.min(100)) / 100.0;
+        if self.player_settings.audio.master_volume != volume {
+            self.player_settings.audio.master_volume = volume;
+            self.apply_audio_settings();
+            self.mark_settings_dirty();
+        }
+        if commit {
+            self.save_settings_if_dirty();
+        }
     }
 
     fn exit_requested(&self) -> bool {
@@ -1026,35 +909,29 @@ impl GameApp for HeadfulApp {
 impl TimelineGame for HeadfulApp {
     type Snapshot = GameState;
     type PreviewSnapshot = PreviewSnapshot;
-    type PreviewFeedback = DrawTimings;
     const SCHEMA: StateSchema = TIMELINE_SCHEMA;
 
     fn preview_snapshot(&self, runner: &Self::State) -> PreviewSnapshot {
         PreviewSnapshot {
             state: runner.state().clone(),
-            inputs: self.render_inputs(),
+            show_playback_cursor: self.show_playback_cursor,
             debug_hud: self.debug_hud.clone(),
         }
     }
 
-    fn draw_preview(
-        snapshot: PreviewSnapshot,
-        renderer: &mut dyn engine::graphics::Renderer2d,
-    ) -> DrawTimings {
+    fn draw_preview(snapshot: PreviewSnapshot, renderer: &mut dyn engine::graphics::Renderer2d) {
         render_headful_frame(
             renderer,
-            &snapshot.debug_hud,
             &snapshot.state,
-            snapshot.inputs,
-        )
+            FrameOverlays {
+                debug_hud: Some(&snapshot.debug_hud),
+                playback_cursor: snapshot.show_playback_cursor,
+            },
+        );
     }
 
-    fn apply_preview_feedback(&mut self, _runner: &Self::State, timings: DrawTimings) {
-        timings.record(&mut self.debug_hud);
-    }
-
-    fn set_history_view(&mut self, historical: bool) {
-        self.historical = historical;
+    fn set_timeline_paused(&mut self, paused: bool) {
+        self.show_playback_cursor = paused;
     }
 
     fn snapshot(state: &Self::State) -> &Self::Snapshot {
@@ -1062,19 +939,17 @@ impl TimelineGame for HeadfulApp {
     }
 
     fn restore_state(&mut self, mut snapshot: Self::Snapshot) -> Self::State {
-        snapshot.use_timeline_progress();
+        snapshot.skilltree.restore_definition_path();
         let logic = logic_for_run(&self.base_logic, snapshot.skilltree.run_mods());
-        self.settings_open = snapshot.settings_overlay.is_some();
+        self.debug_hud
+            .set_round_timer_disabled(snapshot.round_timer_disabled);
         let runner = HeadlessRunner::from_state(logic, snapshot);
         self.horizontal_repeat.clear();
-        self.dig_camera
-            .reset(runner.state().tetris.background_depth_rows());
         self.skilltree_cam_input = SkillTreeCameraInput::default();
         self.skilltree_layout = SkillTreeLayout::default();
         self.active_settings_slider = None;
         self.mouse_release_was_drag = false;
         self.consume_next_mouse_up = false;
-        self.last_frame_dt = Duration::ZERO;
         runner
     }
 
@@ -1095,6 +970,14 @@ impl TimelineGame for HeadfulApp {
             .then_some(command)
         })
     }
+}
+
+fn update_dig_camera(state: &mut GameState, dt: Duration) {
+    let paused = matches!(state.view, GameView::Tetris { paused: true });
+    state
+        .display
+        .dig_camera
+        .update(state.tetris.background_depth_rows(), dt, paused);
 }
 
 fn money_earned_from_run(state: &GameState) -> u32 {
@@ -1167,7 +1050,6 @@ fn reset_run(
     base_round_limit: Duration,
     base_gravity_interval: Duration,
     horizontal_repeat: &mut HorizontalRepeat,
-    timeline_mode: bool,
 ) {
     let skilltree = runner.state().skilltree.clone();
     let view = runner.state().view;
@@ -1176,16 +1058,19 @@ fn reset_run(
 
     let logic = logic_for_run(base_logic, mods);
     let mut next_runner = HeadlessRunner::new(logic);
-    if timeline_mode {
-        next_runner
-            .state_mut()
-            .tetris
-            .inherit_timeline_progress(&runner.state().tetris);
-    }
     {
         let state = next_runner.state_mut();
+        state
+            .tetris
+            .inherit_depth_wall_progress(&runner.state().tetris);
         state.skilltree = skilltree;
         state.view = view;
+        state.display = runner.state().display;
+        state
+            .display
+            .dig_camera
+            .reset(state.tetris.background_depth_rows());
+        state.round_timer_disabled = runner.state().round_timer_disabled;
         state.round_timer = RoundTimer::new(tuning.round_limit);
         state.gravity_interval = tuning.gravity_interval;
         state.gravity_elapsed = Duration::ZERO;
@@ -1240,12 +1125,16 @@ fn print_headful_help() {
 
 Usage:
   headful [--timeline DIR] [--fresh | --playback]
+  headful --no-recording
   headful --export-video PATH [--timeline DIR]
+  headful --profile
 
 Flags:
   --timeline DIR    Select a timeline (default: target/timelines/headful).
   --fresh           Start a separate timeline. With --timeline, DIR must be new.
   --playback        Open a saved timeline paused at its first snapshot.
+  --no-recording    Run standalone without opening a timeline.
+  --profile         Profile the standalone game and write a trace to target/perf_traces/.
   --export-video PATH
                     Render a saved timeline to MP4 without opening a window.
   Option+P (F5)     Pause live play or explicitly resume it from the cursor.
@@ -1533,9 +1422,6 @@ impl Sfx {
 #[cfg(test)]
 type HorizontalDir = headful_input::HorizontalDir;
 type HorizontalRepeat = headful_input::HorizontalRepeat;
-type DigCameraController = headful_dig_camera::DigCameraController;
-#[cfg(test)]
-type DigCameraConfig = headful_dig_camera::DigCameraConfig;
 
 #[cfg(test)]
 fn map_key_to_action(key: VirtualKeyCode) -> Option<InputAction> {
@@ -1553,10 +1439,9 @@ fn apply_action(
     debug_hud: &mut DebugHud,
     action: InputAction,
 ) {
-    let input_start = Instant::now();
     let before_glass_shatters = runner.state().tetris.glass_shatter_count();
 
-    runner.step_profiled(action, debug_hud);
+    runner.step(action);
 
     if let Some(sfx) = sfx {
         if should_play_action_sfx(action) {
@@ -1568,7 +1453,7 @@ fn apply_action(
         }
     }
 
-    debug_hud.record_input(input_start.elapsed());
+    debug_hud.mark_input();
 }
 
 #[cfg(test)]

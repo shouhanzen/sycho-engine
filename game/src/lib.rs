@@ -4,6 +4,7 @@ pub mod debug;
 pub mod game_ui;
 pub mod headful;
 pub mod perf_budget;
+mod persistence;
 pub mod playtest;
 pub mod round_timer;
 pub mod serde_duration;

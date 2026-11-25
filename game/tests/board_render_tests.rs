@@ -230,6 +230,35 @@ fn draw_board_cells_in_rect_clipped_keeps_content_inside_viewport() {
 }
 
 #[test]
+fn viewport_paints_partial_cells_and_centered_board_uses_whole_cells() {
+    let size = SurfaceSize::new(CELL_SIZE - 1, CELL_SIZE);
+    let board = [vec![1]];
+    let bounds = Rect::from_size(CELL_SIZE, CELL_SIZE);
+    let viewport = Rect::from_size(size.width, size.height);
+    let mut whole_pixels = vec![0; size.rgba_len()];
+    let mut partial_pixels = vec![0; size.rgba_len()];
+
+    draw_board_cells_in_rect(
+        &mut CpuRenderer::new(&mut whole_pixels, size),
+        &board,
+        bounds,
+    );
+    draw_board_cells_in_rect_clipped(
+        &mut CpuRenderer::new(&mut partial_pixels, size),
+        &board,
+        bounds,
+        viewport,
+    );
+
+    let (x, y) = (CELL_SIZE / 2, CELL_SIZE / 2);
+    assert_eq!(pixel_at(&whole_pixels, size.width, x, y), [0; 4]);
+    assert_eq!(
+        pixel_at(&partial_pixels, size.width, x, y),
+        color_for_cell(1)
+    );
+}
+
+#[test]
 fn draw_board_cells_in_rect_clipped_draws_only_exposed_edges_for_filled_cells() {
     let width = 8 * CELL_SIZE;
     let height = 6 * CELL_SIZE;

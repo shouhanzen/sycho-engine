@@ -8,7 +8,7 @@ use crate::perf_budget::{
     classify_budget, summarize_statuses,
 };
 use engine::graphics::Renderer2d;
-use engine::profiling::Profiler;
+use engine::profiling::{FrameOutput, FrameTimings};
 use engine::ui::Rect;
 
 const COLOR_TEXT: [u8; 4] = [235, 235, 245, 255];
@@ -90,25 +90,18 @@ pub struct DebugHud {
     minimized: bool,
     round_timer_disabled: bool,
 
-    pending_input: Duration,
-    pending_gravity: Duration,
     last_input_at: Option<Instant>,
 
     frame_dt: RollingMs,
     engine_dt: RollingMs,
-    input_dt: RollingMs,
-    gravity_dt: RollingMs,
-    board_dt: RollingMs,
     draw_dt: RollingMs,
-    overlay_dt: RollingMs,
-    present_dt: RollingMs,
+    output: FrameOutput,
     frame_total_dt: RollingMs,
 
     budget_config: PerfBudgetConfig,
     budget_frame_total: PerfBudgetSample,
     budget_engine_total: PerfBudgetSample,
     budget_draw: PerfBudgetSample,
-    budget_overlay: PerfBudgetSample,
     budget_health: PerfBudgetHealth,
     logs: VecDeque<HudLine>,
 }
@@ -120,23 +113,16 @@ impl DebugHud {
             enabled: true,
             minimized: false,
             round_timer_disabled: false,
-            pending_input: Duration::ZERO,
-            pending_gravity: Duration::ZERO,
             last_input_at: None,
             frame_dt: RollingMs::new(window),
             engine_dt: RollingMs::new(window),
-            input_dt: RollingMs::new(window),
-            gravity_dt: RollingMs::new(window),
-            board_dt: RollingMs::new(window),
             draw_dt: RollingMs::new(window),
-            overlay_dt: RollingMs::new(window),
-            present_dt: RollingMs::new(window),
+            output: FrameOutput::Present(Duration::ZERO),
             frame_total_dt: RollingMs::new(window),
             budget_config: PerfBudgetConfig::from_env(),
             budget_frame_total: PerfBudgetSample::default(),
             budget_engine_total: PerfBudgetSample::default(),
             budget_draw: PerfBudgetSample::default(),
-            budget_overlay: PerfBudgetSample::default(),
             budget_health: PerfBudgetHealth::default(),
             logs: VecDeque::new(),
         }
@@ -184,41 +170,19 @@ impl DebugHud {
         self.round_timer_disabled
     }
 
-    pub fn record_input(&mut self, dt: Duration) {
-        self.pending_input = self.pending_input.saturating_add(dt);
+    pub fn mark_input(&mut self) {
         self.last_input_at = Some(Instant::now());
     }
 
-    pub fn record_gravity(&mut self, dt: Duration) {
-        self.pending_gravity = self.pending_gravity.saturating_add(dt);
-    }
-
-    pub fn on_frame(
-        &mut self,
-        frame_dt: Duration,
-        board_dt: Duration,
-        draw_dt: Duration,
-        overlay_dt: Duration,
-        present_dt: Duration,
-        frame_total_dt: Duration,
-    ) {
+    pub fn on_frame(&mut self, timings: FrameTimings) {
         if !self.enabled {
-            self.pending_input = Duration::ZERO;
-            self.pending_gravity = Duration::ZERO;
             return;
         }
-
-        let input_dt = std::mem::take(&mut self.pending_input);
-        let gravity_dt = std::mem::take(&mut self.pending_gravity);
-
-        self.frame_dt.push(frame_dt);
-        self.input_dt.push(input_dt);
-        self.gravity_dt.push(gravity_dt);
-        self.board_dt.push(board_dt);
-        self.draw_dt.push(draw_dt);
-        self.overlay_dt.push(overlay_dt);
-        self.present_dt.push(present_dt);
-        self.frame_total_dt.push(frame_total_dt);
+        self.frame_dt.push(timings.interval);
+        self.engine_dt.push(timings.update);
+        self.draw_dt.push(timings.draw);
+        self.output = timings.output;
+        self.frame_total_dt.push(timings.cpu_work());
         self.update_budget_samples();
     }
 
@@ -240,9 +204,11 @@ impl DebugHud {
         let engine_status =
             classify_budget(&self.budget_engine_total, self.budget_config.engine_total);
         let draw_status = classify_budget(&self.budget_draw, self.budget_config.draw);
-        let overlay_status = classify_budget(&self.budget_overlay, self.budget_config.overlay);
-        let summary =
-            summarize_statuses([frame_status, engine_status, draw_status, overlay_status]);
+        let summary = summarize_statuses([frame_status, engine_status, draw_status]);
+        let output_label = match self.output {
+            FrameOutput::Submit(_) => "SUBMIT",
+            FrameOutput::Present(_) => "PRESENT",
+        };
 
         vec![
             HudLine::plain(format!(
@@ -251,31 +217,15 @@ impl DebugHud {
                 self.frame_dt.last(),
                 self.frame_dt.avg()
             )),
+            HudLine::plain(format!("INPUT AGE {:>5.1}MS", since_input_ms)),
             HudLine::plain(format!(
-                "INPUT {:>5.2}MS (AVG {:>5.2})  AGE {:>5.1}MS",
-                self.input_dt.last(),
-                self.input_dt.avg(),
-                since_input_ms
-            )),
-            HudLine::plain(format!(
-                "ENGINE STEP {:>5.2}MS (AVG {:>5.2})",
+                "UPDATE {:>5.2}MS  DRAW {:>5.2}MS",
                 self.engine_dt.last(),
-                self.engine_dt.avg()
+                self.draw_dt.last()
             )),
             HudLine::plain(format!(
-                "GRAV  {:>5.2}MS (AVG {:>5.2})",
-                self.gravity_dt.last(),
-                self.gravity_dt.avg()
-            )),
-            HudLine::plain(format!(
-                "BOARD {:>5.2}MS  DRAW {:>5.2}MS  DBG {:>5.2}MS",
-                self.board_dt.last(),
-                self.draw_dt.last(),
-                self.overlay_dt.last()
-            )),
-            HudLine::plain(format!(
-                "PRESENT {:>5.2}MS  TOTAL {:>5.2}MS",
-                self.present_dt.last(),
+                "{output_label} {:>5.2}MS  CPU WORK {:>5.2}MS",
+                duration_ms(self.output.elapsed()),
                 self.frame_total_dt.last()
             )),
             self.budget_metric_line(
@@ -295,12 +245,6 @@ impl DebugHud {
                 draw_status,
                 self.budget_config.draw,
                 &self.budget_draw,
-            ),
-            self.budget_metric_line(
-                "OVERLAY",
-                overlay_status,
-                self.budget_config.overlay,
-                &self.budget_overlay,
             ),
             HudLine {
                 text: format!(
@@ -487,16 +431,10 @@ impl DebugHud {
             self.draw_dt.avg(),
             self.budget_config.draw,
         );
-        let overlay_status = self.budget_overlay.observe(
-            self.overlay_dt.last(),
-            self.overlay_dt.avg(),
-            self.budget_config.overlay,
-        );
         self.budget_health.observe_summary(summarize_statuses([
             frame_status,
             engine_status,
             draw_status,
-            overlay_status,
         ]));
     }
 
@@ -528,14 +466,5 @@ impl DebugHud {
             PerfBudgetStatus::Warn => COLOR_TEXT_WARN,
             PerfBudgetStatus::Critical => COLOR_TEXT_CRITICAL,
         }
-    }
-}
-
-impl Profiler for DebugHud {
-    fn on_step(&mut self, _frame: usize, elapsed: Duration) {
-        if !self.enabled {
-            return;
-        }
-        self.engine_dt.push(elapsed);
     }
 }

@@ -5,7 +5,7 @@ use engine::app::InputFrame;
 use winit::event::VirtualKeyCode;
 
 use super::skilltree_camera as headful_camera;
-use super::view_transitions as headful_view;
+use crate::game_ui::GameUiAction;
 use crate::playtest::{InputAction, TetrisLogic};
 use crate::skilltree::{SkillTreeEditorTool, SkillTreeRuntime};
 use crate::tetris_core::Vec2i;
@@ -30,9 +30,8 @@ pub struct HorizontalRepeat {
 pub enum HeadfulInputCommand {
     ToggleDebugHud,
     ToggleMusic,
-    ExitRequested,
+    Ui(GameUiAction),
     PlayClick,
-    ResetRun,
     ApplyAction(InputAction),
 }
 
@@ -374,11 +373,21 @@ pub fn process_keyboard_frame(
     now: Instant,
     horizontal_repeat: &mut HorizontalRepeat,
     last_skilltree: SkillTreeLayout,
-    _mouse_x: u32,
-    _mouse_y: u32,
 ) -> Vec<HeadfulInputCommand> {
     let pressed = |key| input.keys_pressed.contains(&key);
     let mut commands = Vec::new();
+
+    if runner.state().settings_overlay.is_some() {
+        if pressed(VirtualKeyCode::Escape) {
+            commands.push(HeadfulInputCommand::Ui(GameUiAction::CloseSettings));
+        }
+        return commands;
+    }
+    let view = runner.state().view;
+    if pressed(VirtualKeyCode::O) && view.can_open_settings() {
+        commands.push(HeadfulInputCommand::Ui(GameUiAction::OpenSettings));
+        return commands;
+    }
 
     if pressed(VirtualKeyCode::F3) {
         commands.push(HeadfulInputCommand::ToggleDebugHud);
@@ -387,30 +396,18 @@ pub fn process_keyboard_frame(
         commands.push(HeadfulInputCommand::ToggleMusic);
     }
 
-    let mut view = runner.state().view;
     match view {
         GameView::MainMenu => {
-            if pressed(VirtualKeyCode::Return) || pressed(VirtualKeyCode::Space) {
-                let transition = headful_view::start_game(view);
-                view = transition.next_view;
-                runner.state_mut().view = view;
-                if transition.reset_tetris {
-                    commands.push(HeadfulInputCommand::ResetRun);
-                }
-                commands.push(HeadfulInputCommand::PlayClick);
+            let action = if pressed(VirtualKeyCode::Return) || pressed(VirtualKeyCode::Space) {
+                Some(GameUiAction::StartGame)
             } else if pressed(VirtualKeyCode::K) {
-                let transition = headful_view::open_skilltree_editor(view);
-                view = transition.next_view;
-                runner.state_mut().view = view;
-                horizontal_repeat.clear();
-                let skilltree = &mut runner.state_mut().skilltree;
-                if !skilltree.editor.enabled {
-                    skilltree.editor_toggle();
-                }
-                commands.push(HeadfulInputCommand::PlayClick);
+                Some(GameUiAction::OpenSkillTreeEditor)
             } else if pressed(VirtualKeyCode::Escape) {
-                commands.push(HeadfulInputCommand::ExitRequested);
-            }
+                Some(GameUiAction::Quit)
+            } else {
+                None
+            };
+            commands.extend(action.map(HeadfulInputCommand::Ui));
         }
         GameView::SkillTree => {
             if pressed(VirtualKeyCode::F4) {
@@ -423,20 +420,7 @@ pub fn process_keyboard_frame(
             let skilltree_editor_enabled = runner.state().skilltree.editor.enabled;
             if skilltree_editor_enabled {
                 if pressed(VirtualKeyCode::Escape) {
-                    {
-                        let skilltree = &mut runner.state_mut().skilltree;
-                        if skilltree.editor.search_open {
-                            skilltree.editor_close_search();
-                            commands.push(HeadfulInputCommand::PlayClick);
-                            return commands;
-                        }
-                        skilltree.editor_toggle();
-                    }
-                    let transition = headful_view::back(view);
-                    view = transition.next_view;
-                    runner.state_mut().view = view;
-                    horizontal_repeat.clear();
-                    commands.push(HeadfulInputCommand::PlayClick);
+                    commands.push(HeadfulInputCommand::Ui(GameUiAction::Back));
                     return commands;
                 }
 
@@ -643,55 +627,26 @@ pub fn process_keyboard_frame(
                     }
                 }
             } else if pressed(VirtualKeyCode::Escape) {
-                let transition = headful_view::back(view);
-                view = transition.next_view;
-                runner.state_mut().view = view;
-                horizontal_repeat.clear();
-                commands.push(HeadfulInputCommand::PlayClick);
+                commands.push(HeadfulInputCommand::Ui(GameUiAction::Back));
             } else if pressed(VirtualKeyCode::Return) || pressed(VirtualKeyCode::Space) {
-                let transition = headful_view::start_game(view);
-                view = transition.next_view;
-                runner.state_mut().view = view;
-                if transition.reset_tetris {
-                    commands.push(HeadfulInputCommand::ResetRun);
-                }
-                commands.push(HeadfulInputCommand::PlayClick);
+                commands.push(HeadfulInputCommand::Ui(GameUiAction::StartGame));
             }
         }
         GameView::GameOver => {
-            if pressed(VirtualKeyCode::Escape) {
-                let transition = headful_view::back(view);
-                view = transition.next_view;
-                runner.state_mut().view = view;
-                horizontal_repeat.clear();
-                commands.push(HeadfulInputCommand::PlayClick);
+            let action = if pressed(VirtualKeyCode::Escape) {
+                Some(GameUiAction::Back)
             } else if pressed(VirtualKeyCode::Return) || pressed(VirtualKeyCode::Space) {
-                let transition = headful_view::start_game(view);
-                view = transition.next_view;
-                runner.state_mut().view = view;
-                if transition.reset_tetris {
-                    commands.push(HeadfulInputCommand::ResetRun);
-                }
-                commands.push(HeadfulInputCommand::PlayClick);
+                Some(GameUiAction::StartGame)
             } else if pressed(VirtualKeyCode::K) {
-                let transition = headful_view::open_skilltree(view);
-                view = transition.next_view;
-                runner.state_mut().view = view;
-                horizontal_repeat.clear();
-                commands.push(HeadfulInputCommand::PlayClick);
-            }
+                Some(GameUiAction::OpenSkillTree)
+            } else {
+                None
+            };
+            commands.extend(action.map(HeadfulInputCommand::Ui));
         }
         GameView::Tetris { paused } => {
             if pressed(VirtualKeyCode::Escape) {
-                let transition = headful_view::toggle_pause(view);
-                view = transition.next_view;
-                {
-                    let state = runner.state_mut();
-                    state.view = view;
-                    state.gravity_elapsed = Duration::ZERO;
-                }
-                horizontal_repeat.clear();
-                commands.push(HeadfulInputCommand::PlayClick);
+                commands.push(HeadfulInputCommand::Ui(GameUiAction::PauseToggle));
                 return commands;
             }
 
@@ -765,10 +720,7 @@ pub fn handle_skilltree_world_click(
         })
     });
     if let Some(id) = hit_id {
-        let transition = headful_view::open_skilltree(runner.state().view);
-        let state = runner.state_mut();
-        state.view = transition.next_view;
-        state.skilltree.try_buy(&id);
+        runner.state_mut().skilltree.try_buy(&id);
         commands.push(HeadfulInputCommand::PlayClick);
     }
     commands
@@ -867,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_start_game_emits_reset_and_click_commands() {
+    fn keyboard_start_game_emits_shared_action() {
         let mut runner = make_runner(GameView::MainMenu);
         let mut repeat = HorizontalRepeat::default();
         let commands = process_keyboard_frame(
@@ -876,21 +828,13 @@ mod tests {
             Instant::now(),
             &mut repeat,
             SkillTreeLayout::default(),
-            0,
-            0,
         );
 
         assert_eq!(
             commands,
-            vec![
-                HeadfulInputCommand::ResetRun,
-                HeadfulInputCommand::PlayClick
-            ]
+            vec![HeadfulInputCommand::Ui(GameUiAction::StartGame)]
         );
-        assert!(matches!(
-            runner.state().view,
-            GameView::Tetris { paused: false }
-        ));
+        assert_eq!(runner.state().view, GameView::MainMenu);
     }
 
     #[test]
@@ -905,8 +849,6 @@ mod tests {
             now,
             &mut repeat,
             SkillTreeLayout::default(),
-            0,
-            0,
         );
         let held = process_keyboard_frame(
             &mut runner,
@@ -914,8 +856,6 @@ mod tests {
             now + Duration::from_millis(16),
             &mut repeat,
             SkillTreeLayout::default(),
-            0,
-            0,
         );
 
         assert_eq!(
@@ -935,7 +875,7 @@ mod tests {
         use crate::game_ui::{GameUiAction, GameUiLayout};
         use engine::surface::SurfaceSize;
         let size = SurfaceSize::new(1280, 720);
-        let layout = GameUiLayout::compute(runner.state(), size, false);
+        let layout = GameUiLayout::compute(runner.state(), size);
         let button = layout.skilltree.start_new_game_button;
         let pointer = (button.x + button.w / 2, button.y + button.h / 2);
         assert_eq!(
@@ -944,7 +884,7 @@ mod tests {
         );
 
         runner.state_mut().skilltree.editor.enabled = true;
-        let layout = GameUiLayout::compute(runner.state(), size, false);
+        let layout = GameUiLayout::compute(runner.state(), size);
         assert_eq!(layout.action_at(runner.state(), pointer), None);
     }
 
@@ -960,8 +900,6 @@ mod tests {
             Instant::now(),
             &mut repeat,
             editor_layout(),
-            0,
-            0,
         );
 
         assert_eq!(
@@ -994,8 +932,6 @@ mod tests {
             Instant::now(),
             &mut repeat,
             editor_layout(),
-            0,
-            0,
         );
         assert!(first.is_empty());
         assert!(runner.state().skilltree.node_index(&target_id).is_some());
@@ -1006,8 +942,6 @@ mod tests {
             Instant::now() + Duration::from_millis(1),
             &mut repeat,
             editor_layout(),
-            0,
-            0,
         );
         assert!(second.contains(&HeadfulInputCommand::PlayClick));
         assert!(runner.state().skilltree.node_index(&target_id).is_none());
@@ -1031,8 +965,6 @@ mod tests {
             Instant::now(),
             &mut repeat,
             editor_layout(),
-            0,
-            0,
         );
         assert!(commands.contains(&HeadfulInputCommand::PlayClick));
 

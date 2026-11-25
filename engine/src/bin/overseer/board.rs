@@ -16,8 +16,6 @@ const GRIP: f64 = 11.0;
 const DOCK_DISTANCE: f64 = 16.0;
 const MIN_TIMELINE_HEIGHT: f64 = 90.0;
 const DEFAULT_TIMELINE_HEIGHT: f64 = 96.0;
-const PREVIOUS_DEFAULT_TIMELINE_HEIGHT: f64 = 152.0;
-const BOARD_LAYOUT_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Point {
@@ -110,13 +108,25 @@ impl Bounds {
 pub enum Panel {
     Game,
     Timeline,
+    Profiler,
 }
 
 impl Panel {
+    pub const ALL: [Self; 3] = [Self::Game, Self::Timeline, Self::Profiler];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Game => "Game",
+            Self::Timeline => "Timeline",
+            Self::Profiler => "Profiler",
+        }
+    }
+
     fn minimum(self) -> Point {
         match self {
             Self::Game => Point::new(260.0, 200.0),
             Self::Timeline => Point::new(260.0, MIN_TIMELINE_HEIGHT),
+            Self::Profiler => Point::new(420.0, 330.0),
         }
     }
 }
@@ -125,21 +135,36 @@ impl Panel {
 pub struct Board {
     pub game: Bounds,
     pub timeline: Bounds,
-    pub front: Panel,
+    #[serde(default = "default_stack")]
+    pub(crate) stack: [Panel; 3],
     pub pan: Point,
     pub zoom: f64,
     #[serde(default = "default_game_zoom")]
     pub game_zoom: f64,
     #[serde(default)]
     pub timeline_docked: bool,
+    #[serde(default = "default_profiler_bounds")]
+    pub profiler: Bounds,
+    #[serde(default)]
+    pub show_profiler: bool,
+    #[serde(default)]
+    pub(crate) hide_game: bool,
+    #[serde(default)]
+    pub(crate) hide_timeline: bool,
 }
 
-#[derive(Serialize, Deserialize)]
-struct SavedBoard {
-    #[serde(default)]
-    layout_version: u32,
-    #[serde(flatten)]
-    board: Board,
+pub const PANEL_SHADOW: Point = Point::new(4.0, 5.0);
+
+pub fn viewport(size: SurfaceSize) -> Bounds {
+    Bounds::new(0.0, 0.0, f64::from(size.width), f64::from(size.height))
+}
+
+fn default_stack() -> [Panel; 3] {
+    [Panel::Profiler, Panel::Timeline, Panel::Game]
+}
+
+fn default_profiler_bounds() -> Bounds {
+    Bounds::new(1026.0, 36.0, 530.0, 400.0)
 }
 
 fn default_game_zoom() -> f64 {
@@ -153,11 +178,15 @@ impl Default for Board {
         Self {
             game: Bounds::new(40.0, 36.0, width, height),
             timeline: Bounds::new(40.0, 36.0 + height + 22.0, width, DEFAULT_TIMELINE_HEIGHT),
-            front: Panel::Game,
+            stack: default_stack(),
             pan: Point::default(),
             zoom: 1.0,
             game_zoom: default_game_zoom(),
             timeline_docked: false,
+            profiler: default_profiler_bounds(),
+            show_profiler: false,
+            hide_game: false,
+            hide_timeline: false,
         }
     }
 }
@@ -167,6 +196,7 @@ impl Board {
         match panel {
             Panel::Game => self.game,
             Panel::Timeline => self.timeline,
+            Panel::Profiler => self.profiler,
         }
     }
 
@@ -174,6 +204,7 @@ impl Board {
         match panel {
             Panel::Game => self.game = bounds,
             Panel::Timeline => self.timeline = bounds,
+            Panel::Profiler => self.profiler = bounds,
         }
         self.align_docked_timeline();
     }
@@ -193,7 +224,9 @@ impl Board {
         let gap = (self.timeline.y - self.game.bottom()).abs() * self.zoom;
         let overlap =
             self.game.right().min(self.timeline.right()) - self.game.x.max(self.timeline.x);
-        !self.timeline_docked
+        self.visible(Panel::Game)
+            && self.visible(Panel::Timeline)
+            && !self.timeline_docked
             && gap <= DOCK_DISTANCE
             && overlap >= self.game.w.min(self.timeline.w) / 3.0
     }
@@ -214,18 +247,101 @@ impl Board {
         })
     }
 
-    pub fn order(self) -> [Panel; 2] {
-        match self.front {
-            Panel::Game => [Panel::Timeline, Panel::Game],
-            Panel::Timeline => [Panel::Game, Panel::Timeline],
+    pub fn visible(self, panel: Panel) -> bool {
+        match panel {
+            Panel::Game => !self.hide_game,
+            Panel::Timeline => !self.hide_timeline,
+            Panel::Profiler => self.show_profiler,
         }
     }
 
-    pub fn panel_at(self, world: Point) -> Option<Panel> {
-        self.order()
+    pub fn toggle_panel(&mut self, panel: Panel, view: Bounds) {
+        let show = !self.visible(panel);
+        match panel {
+            Panel::Game => self.hide_game = !show,
+            Panel::Timeline => self.hide_timeline = !show,
+            Panel::Profiler => self.show_profiler = show,
+        }
+        if show {
+            self.raise(panel);
+            let mut panel_bounds = self.bounds(panel);
+            let title = self.project(Bounds::new(
+                panel_bounds.x,
+                panel_bounds.y,
+                panel_bounds.w,
+                TITLE_HEIGHT,
+            ));
+            if title
+                .intersect(view)
+                .is_none_or(|visible| visible.w < title.w.min(view.w - 56.0) || visible.h < 12.0)
+            {
+                let x = (view.right() - panel_bounds.w * self.zoom - 28.0).max(view.x + 28.0);
+                let origin = self.world_at(Point::new(x, view.y + 36.0));
+                panel_bounds.x = origin.x;
+                panel_bounds.y = origin.y;
+                self.set_bounds(panel, panel_bounds);
+            }
+        } else if panel != Panel::Profiler {
+            self.timeline_docked = false;
+        }
+    }
+
+    pub fn raise(&mut self, panel: Panel) {
+        let index = self
+            .stack
+            .iter()
+            .position(|&layer| layer == panel)
+            .expect("panel in stack");
+        self.stack[index..].rotate_left(1);
+    }
+
+    pub fn front(self) -> Option<Panel> {
+        self.order().next_back()
+    }
+
+    pub fn order(self) -> impl DoubleEndedIterator<Item = Panel> {
+        self.stack
             .into_iter()
-            .rev()
-            .find(|&panel| self.bounds(panel).contains(world))
+            .filter(move |&panel| self.visible(panel))
+    }
+
+    pub fn panel_shadow(self, panel: Panel) -> Option<Bounds> {
+        (!self.timeline_docked || panel == Panel::Profiler)
+            .then(|| self.bounds(panel).translated(PANEL_SHADOW))
+    }
+
+    pub fn panel_at(self, world: Point) -> Option<Panel> {
+        for panel in self.order().rev() {
+            if self.bounds(panel).contains(world) {
+                return Some(panel);
+            }
+            if self
+                .panel_shadow(panel)
+                .is_some_and(|shadow| shadow.contains(world))
+            {
+                break;
+            }
+        }
+        None
+    }
+
+    pub fn occluders(
+        self,
+        panel: Panel,
+        size: SurfaceSize,
+        menu_open: bool,
+    ) -> impl Iterator<Item = Bounds> {
+        self.order()
+            .skip_while(move |&layer| layer != panel)
+            .skip(1)
+            .flat_map(move |layer| [Some(self.bounds(layer)), self.panel_shadow(layer)])
+            .flatten()
+            .map(move |bounds| self.project(bounds))
+            .chain(PanelMenu::new(size).covers(menu_open))
+    }
+
+    pub fn game_grip(self) -> Option<Bounds> {
+        (self.visible(Panel::Game) && !self.timeline_docked).then(|| self.game.grip())
     }
 
     pub fn game_body(self) -> Bounds {
@@ -282,10 +398,19 @@ impl Board {
     }
 
     pub fn fit(&mut self, view: Bounds) {
-        let x = self.game.x.min(self.timeline.x);
-        let y = self.game.y.min(self.timeline.y);
-        let w = self.game.right().max(self.timeline.right()) - x;
-        let h = self.game.bottom().max(self.timeline.bottom()) - y;
+        let mut panels = self.order().map(|panel| self.bounds(panel));
+        let Some(first) = panels.next() else { return };
+        let bounds = panels.fold(first, |bounds, panel| {
+            let x = bounds.x.min(panel.x);
+            let y = bounds.y.min(panel.y);
+            Bounds::new(
+                x,
+                y,
+                bounds.right().max(panel.right()) - x,
+                bounds.bottom().max(panel.bottom()) - y,
+            )
+        });
+        let Bounds { x, y, w, h } = bounds;
         self.zoom = ((view.w - 48.0) / w)
             .min((view.h - 48.0) / h)
             .clamp(MIN_ZOOM, 1.0);
@@ -301,17 +426,37 @@ impl Board {
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err),
         };
-        let SavedBoard {
-            layout_version,
-            mut board,
-        } = serde_json::from_slice(&bytes)?;
-        if layout_version == 0 && board.timeline.h == PREVIOUS_DEFAULT_TIMELINE_HEIGHT {
-            board.timeline.h = DEFAULT_TIMELINE_HEIGHT;
+        #[derive(Deserialize)]
+        struct SavedBoard {
+            #[serde(flatten)]
+            board: Board,
+            front: Option<Panel>,
+        }
+        let SavedBoard { mut board, front } = serde_json::from_slice(&bytes)?;
+        if !Panel::ALL
+            .into_iter()
+            .all(|panel| board.stack.contains(&panel))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid editor panel stack",
+            ));
+        }
+        if let Some(front) = front {
+            // Older boards saved a single front panel and inferred the rest of the order.
+            board.stack = match front {
+                Panel::Game => default_stack(),
+                Panel::Timeline => [Panel::Profiler, Panel::Game, Panel::Timeline],
+                Panel::Profiler => Panel::ALL,
+            };
+        }
+        if !board.visible(Panel::Game) || !board.visible(Panel::Timeline) {
+            board.timeline_docked = false;
         }
         board.align_docked_timeline();
         if !(MIN_ZOOM..=MAX_ZOOM).contains(&board.zoom)
             || !(MIN_GAME_ZOOM..=MAX_GAME_ZOOM).contains(&board.game_zoom)
-            || board.order().into_iter().any(|panel| {
+            || Panel::ALL.into_iter().any(|panel| {
                 let bounds = board.bounds(panel);
                 let min = panel.minimum();
                 bounds.w < min.x
@@ -330,12 +475,47 @@ impl Board {
 
     pub fn save(self, path: &Path) -> io::Result<()> {
         let temp = path.with_extension(format!("{}.tmp", std::process::id()));
-        let saved = SavedBoard {
-            layout_version: BOARD_LAYOUT_VERSION,
-            board: self,
-        };
-        fs::write(&temp, serde_json::to_vec_pretty(&saved)?)?;
+        fs::write(&temp, serde_json::to_vec_pretty(&self)?)?;
         fs::rename(temp, path)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct PanelMenu {
+    pub button: Bounds,
+    pub popup: Bounds,
+}
+
+impl PanelMenu {
+    pub fn new(size: SurfaceSize) -> Self {
+        let button = Bounds::new(16.0, f64::from(size.height) - 52.0, 36.0, 36.0);
+        Self {
+            button,
+            popup: Bounds::new(button.x, button.y - 107.0, 168.0, 100.0),
+        }
+    }
+
+    pub fn covers(self, open: bool) -> impl Iterator<Item = Bounds> {
+        [Some(self.button), open.then_some(self.popup)]
+            .into_iter()
+            .flatten()
+    }
+
+    pub fn row(self, index: usize) -> Bounds {
+        Bounds::new(
+            self.popup.x + 4.0,
+            self.popup.y + 5.0 + index as f64 * 30.0,
+            self.popup.w - 8.0,
+            30.0,
+        )
+    }
+
+    pub fn panel_at(self, point: Point) -> Option<Panel> {
+        Panel::ALL
+            .into_iter()
+            .enumerate()
+            .find(|(index, _)| self.row(*index).contains(point))
+            .map(|(_, panel)| panel)
     }
 }
 
@@ -347,7 +527,10 @@ pub struct Edges {
 
 impl Edges {
     pub fn within(board: Board, panel: Panel, point: Point) -> Option<Self> {
-        let bounds = board.dock_bounds().unwrap_or_else(|| board.bounds(panel));
+        let bounds = match panel {
+            Panel::Profiler => board.profiler,
+            _ => board.dock_bounds().unwrap_or_else(|| board.bounds(panel)),
+        };
         if bounds.grip().contains(point) {
             return Some(Self {
                 horizontal: 1,
@@ -420,22 +603,56 @@ pub const TRANSPORT_CONTROLS: [Transport; 4] = [
 #[derive(Clone, Copy)]
 pub struct GameHeader {
     pub zoom_track: Bounds,
+    pub volume_track: Bounds,
     pub resolution: Bounds,
 }
 
 impl GameHeader {
     fn new(panel: Bounds) -> Self {
+        let resolution_width = (panel.w * 0.27).clamp(72.0, 104.0);
         let resolution = Bounds::new(
-            panel.right() - 110.0,
+            panel.right() - resolution_width - 6.0,
             panel.y + 2.0,
-            104.0,
+            resolution_width,
             TITLE_HEIGHT - 4.0,
         );
-        let width = (panel.w * 0.26).clamp(60.0, 116.0);
+        let zoom_width = (panel.w * 0.16).clamp(40.0, 116.0);
+        let zoom_track = Bounds::new(
+            resolution.x - zoom_width - 16.0,
+            panel.y + 14.0,
+            zoom_width,
+            3.0,
+        );
+        let volume_width = (panel.w * 0.11).clamp(28.0, 92.0);
+        let volume_track = Bounds::new(
+            zoom_track.x - volume_width - 20.0,
+            zoom_track.y,
+            volume_width,
+            zoom_track.h,
+        );
         Self {
-            zoom_track: Bounds::new(resolution.x - width - 18.0, panel.y + 14.0, width, 3.0),
+            zoom_track,
+            volume_track,
             resolution,
         }
+    }
+
+    pub fn hit_volume(self, point: Point) -> bool {
+        Bounds::new(
+            self.volume_track.x - 20.0,
+            self.volume_track.y - 7.0,
+            self.volume_track.w + 26.0,
+            self.volume_track.h + 14.0,
+        )
+        .contains(point)
+    }
+
+    pub fn volume_at(self, x: f64) -> u8 {
+        (((x - self.volume_track.x) / self.volume_track.w).clamp(0.0, 1.0) * 100.0).round() as u8
+    }
+
+    pub fn volume_thumb_x(self, percent: u8) -> f64 {
+        self.volume_track.x + f64::from(percent.min(100)) / 100.0 * self.volume_track.w
     }
 
     pub fn hit_zoom(self, point: Point) -> bool {
@@ -518,30 +735,86 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_default_timeline_compacts_but_saved_custom_heights_are_restored() {
+    fn saved_board_preserves_custom_docked_timeline_height() {
         let path =
             std::env::temp_dir().join(format!("sycho-timeline-layout-{}.json", std::process::id()));
-        let mut legacy = Board::default();
-        legacy.timeline.h = PREVIOUS_DEFAULT_TIMELINE_HEIGHT;
-        legacy.dock_timeline();
-        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
-        let upgraded = Board::load(&path).unwrap().unwrap();
+        let mut custom = Board::default();
+        custom.timeline.h = 152.0;
+        custom.dock_timeline();
+        custom.save(&path).unwrap();
 
-        let mut custom = legacy;
-        custom.timeline.h += 20.0;
-        fs::write(&path, serde_json::to_vec(&custom).unwrap()).unwrap();
-        let restored_custom = Board::load(&path).unwrap().unwrap();
-
-        legacy.save(&path).unwrap();
-        let restored_new = Board::load(&path).unwrap().unwrap();
+        let restored = Board::load(&path).unwrap().unwrap();
         fs::remove_file(path).unwrap();
 
-        assert_eq!(upgraded.game, legacy.game);
-        assert!(upgraded.timeline_docked);
-        assert_eq!(upgraded.timeline.y, legacy.game.bottom());
-        assert_eq!(upgraded.timeline.h, DEFAULT_TIMELINE_HEIGHT);
-        assert_eq!(restored_custom, custom);
-        assert_eq!(restored_new, legacy);
+        assert_eq!(restored, custom);
+        assert_eq!(restored.timeline.y, custom.game.bottom());
+    }
+
+    #[test]
+    fn raising_a_panel_preserves_the_order_beneath_it_and_on_disk() {
+        let path =
+            std::env::temp_dir().join(format!("sycho-panel-stack-{}.json", std::process::id()));
+        let mut board = Board {
+            show_profiler: true,
+            ..Board::default()
+        };
+        board.raise(Panel::Profiler);
+        let expected = [Panel::Timeline, Panel::Game, Panel::Profiler];
+        assert_eq!(board.order().collect::<Vec<_>>(), expected);
+        board.save(&path).unwrap();
+        assert_eq!(
+            Board::load(&path)
+                .unwrap()
+                .unwrap()
+                .order()
+                .collect::<Vec<_>>(),
+            expected
+        );
+
+        let mut legacy = serde_json::to_value(board).unwrap();
+        legacy.as_object_mut().unwrap().remove("stack");
+        legacy["front"] = serde_json::to_value(Panel::Timeline).unwrap();
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let restored = Board::load(&path).unwrap().unwrap();
+        fs::remove_file(path).unwrap();
+        assert_eq!(
+            restored.order().collect::<Vec<_>>(),
+            [Panel::Profiler, Panel::Game, Panel::Timeline]
+        );
+    }
+
+    #[test]
+    fn overlapping_panels_supply_the_same_occluders_used_for_hit_testing() {
+        let mut board = Board {
+            game: Bounds::new(0.0, 0.0, 700.0, 650.0),
+            profiler: Bounds::new(100.0, 100.0, 420.0, 330.0),
+            show_profiler: true,
+            hide_timeline: true,
+            ..Board::default()
+        };
+        board.raise(Panel::Profiler);
+        let size = SurfaceSize {
+            width: 700,
+            height: 650,
+        };
+        let drawn_at = |point, menu_open| {
+            !board
+                .occluders(Panel::Game, size, menu_open)
+                .any(|cover| cover.contains(point))
+        };
+        let profiler = Point::new(200.0, 200.0);
+        assert_eq!(board.panel_at(profiler), Some(Panel::Profiler));
+        assert!(!drawn_at(profiler, false));
+        let shadow = Point::new(board.profiler.right() + 2.0, 200.0);
+        assert_eq!(board.panel_at(shadow), None);
+        assert!(!drawn_at(shadow, false));
+        let uncovered = Point::new(board.profiler.right() + 6.0, 200.0);
+        assert_eq!(board.panel_at(uncovered), Some(Panel::Game));
+        assert!(drawn_at(uncovered, false));
+        let popup = PanelMenu::new(size).popup;
+        let popup_point = Point::new(popup.x + 1.0, popup.y + 1.0);
+        assert!(drawn_at(popup_point, false));
+        assert!(!drawn_at(popup_point, true));
     }
 
     #[test]

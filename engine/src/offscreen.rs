@@ -3,11 +3,14 @@ use std::io;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use pixels::wgpu;
 
-use crate::embedded::{DEFAULT_PREVIEW_SIZE, FramePublisher, TimelineStatus};
+use crate::embedded::{DEFAULT_PREVIEW_SIZE, FramePublisher, PreviewMetadata};
+use crate::gpu_timer::{GpuTimer, TimestampReadback};
 use crate::graphics::{GpuRenderer2d, Renderer2d};
+use crate::profiling::{FrameOutput, FrameTimings, PreviewProfile, Span, micros};
 use crate::surface::SurfaceSize;
 #[cfg(target_os = "macos")]
 use crate::{
@@ -61,32 +64,56 @@ struct CompletedFrame {
     storage: FrameStorage,
     submission: wgpu::SubmissionIndex,
     size: SurfaceSize,
-    status: TimelineStatus,
+    metadata: PreviewMetadata,
+    profile: Option<PreviewProfile>,
+    submitted_at: Instant,
+    timestamps: Option<TimestampReadback>,
 }
 
-pub(crate) struct PreviewWorker<S, F> {
+pub(crate) struct PreviewWorker<S> {
     work: Arc<(Mutex<PendingPreview<S>>, Condvar)>,
-    feedback: Receiver<(SurfaceSize, F)>,
+    feedback: Receiver<(SurfaceSize, FrameTimings)>,
 }
 
 struct PendingPreview<S> {
-    frame: Option<(SurfaceSize, TimelineStatus, S)>,
+    frame: Option<RenderRequest<S>>,
     closed: bool,
 }
 
-impl<S, F> PreviewWorker<S, F> {
-    pub fn publish(&self, size: SurfaceSize, status: TimelineStatus, snapshot: S) {
+struct RenderRequest<S> {
+    size: SurfaceSize,
+    metadata: PreviewMetadata,
+    snapshot: S,
+    update: Duration,
+    profile: Option<(PreviewProfile, Instant)>,
+}
+
+impl<S> PreviewWorker<S> {
+    pub fn publish(
+        &self,
+        size: SurfaceSize,
+        metadata: PreviewMetadata,
+        snapshot: S,
+        update: Duration,
+        profile: Option<PreviewProfile>,
+    ) {
         let (pending, changed) = &*self.work;
         let old = pending
             .lock()
             .expect("preview work")
             .frame
-            .replace((size, status, snapshot));
+            .replace(RenderRequest {
+                size,
+                metadata,
+                snapshot,
+                update,
+                profile: profile.map(|timing| (timing, Instant::now())),
+            });
         changed.notify_one();
         drop(old);
     }
 
-    pub fn take_feedback(&self) -> io::Result<Option<(SurfaceSize, F)>> {
+    pub fn take_feedback(&self) -> io::Result<Option<(SurfaceSize, FrameTimings)>> {
         let mut latest = None;
         loop {
             match self.feedback.try_recv() {
@@ -100,7 +127,7 @@ impl<S, F> PreviewWorker<S, F> {
     }
 }
 
-impl<S, F> Drop for PreviewWorker<S, F> {
+impl<S> Drop for PreviewWorker<S> {
     fn drop(&mut self) {
         let (pending, changed) = &*self.work;
         pending.lock().expect("preview work").closed = true;
@@ -112,9 +139,10 @@ pub(crate) struct GpuPreview {
     device: Arc<wgpu::Device>,
     queue: wgpu::Queue,
     renderer: GpuRenderer2d,
+    gpu_timer: Option<GpuTimer>,
     size: SurfaceSize,
     texture: wgpu::Texture,
-    view: wgpu::TextureView,
+    view: Arc<wgpu::TextureView>,
     ready: Receiver<wgpu::Buffer>,
     completed: Sender<CompletedFrame>,
     #[cfg(target_os = "macos")]
@@ -153,7 +181,7 @@ impl GpuPreview {
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("embedded preview device"),
-                features: wgpu::Features::empty(),
+                features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
                 limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
             },
             None,
@@ -183,7 +211,8 @@ impl GpuPreview {
         };
         let renderer = GpuRenderer2d::new(&device, format);
         let texture = target(&device, size);
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = Arc::new(texture.create_view(&wgpu::TextureViewDescriptor::default()));
+        let gpu_timer = GpuTimer::new(&device, &queue);
         let device = Arc::new(device);
         let (recycle, ready) = mpsc::channel();
         for _ in 0..2 {
@@ -203,6 +232,7 @@ impl GpuPreview {
             device,
             queue,
             renderer,
+            gpu_timer,
             size,
             texture,
             view,
@@ -213,10 +243,10 @@ impl GpuPreview {
         })
     }
 
-    pub fn spawn<S: Send + 'static, F: Send + 'static>(
+    pub fn spawn<S: Send + 'static>(
         mut self,
-        draw: fn(S, &mut dyn Renderer2d) -> F,
-    ) -> io::Result<PreviewWorker<S, F>> {
+        draw: fn(S, &mut dyn Renderer2d),
+    ) -> io::Result<PreviewWorker<S>> {
         let work = Arc::new((
             Mutex::new(PendingPreview {
                 frame: None,
@@ -230,8 +260,15 @@ impl GpuPreview {
             .name("preview draw".into())
             .spawn(move || {
                 let (pending, changed) = &*worker;
+                let mut last_frame = Instant::now();
                 loop {
-                    let (size, status, snapshot) = {
+                    let RenderRequest {
+                        size,
+                        metadata,
+                        snapshot,
+                        update,
+                        profile,
+                    } = {
                         let pending = pending.lock().expect("preview work");
                         let mut pending = changed
                             .wait_while(pending, |slot| slot.frame.is_none() && !slot.closed)
@@ -241,9 +278,18 @@ impl GpuPreview {
                         }
                         pending.frame.take().expect("pending preview frame")
                     };
-                    match self.draw(size, status, |renderer| draw(snapshot, renderer)) {
-                        Ok(Some(feedback)) => {
-                            if complete.send((size, feedback)).is_err() {
+                    let profile = profile.map(|(mut timing, queued)| {
+                        timing.queue_us = micros(queued.elapsed());
+                        timing
+                    });
+                    match self.draw(size, metadata, update, profile, |renderer| {
+                        draw(snapshot, renderer)
+                    }) {
+                        Ok(Some(mut timings)) => {
+                            let now = Instant::now();
+                            timings.interval = now.duration_since(last_frame);
+                            last_frame = now;
+                            if complete.send((size, timings)).is_err() {
                                 return;
                             }
                         }
@@ -258,42 +304,15 @@ impl GpuPreview {
         Ok(PreviewWorker { work, feedback })
     }
 
-    fn draw<F>(
+    fn acquire_target(
         &mut self,
         size: SurfaceSize,
-        status: TimelineStatus,
-        render: impl FnOnce(&mut dyn Renderer2d) -> F,
-    ) -> io::Result<Option<F>> {
-        if size.width.max(size.height) > self.device.limits().max_texture_dimension_2d {
-            return Err(io::Error::other(
-                "game viewport exceeds the GPU texture size limit",
-            ));
-        }
+    ) -> io::Result<Option<(Arc<wgpu::TextureView>, FrameStorage)>> {
         #[cfg(target_os = "macos")]
         if let Some(shared) = &mut self.shared {
             if shared.leases.enabled() {
                 match shared.acquire(&self.device, size) {
-                    Ok(Some((view, lease))) => {
-                        self.renderer.begin_frame(size);
-                        let feedback = render(&mut self.renderer);
-                        let mut encoder =
-                            self.device
-                                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                    label: Some("shared game preview"),
-                                });
-                        self.renderer
-                            .render(&mut encoder, view, &self.device, &self.queue);
-                        self.completed
-                            .send(CompletedFrame {
-                                storage: FrameStorage::Surface(lease),
-                                submission: self.queue.submit([encoder.finish()]),
-                                size,
-                                status,
-                            })
-                            .map_err(|_| stopped())?;
-                        return Ok(Some(feedback));
-                    }
-                    Ok(None) => return Ok(None),
+                    Ok(target) => return Ok(target),
                     Err(err) => {
                         eprintln!("could not resize shared preview surfaces, using RGBA: {err}")
                     }
@@ -311,46 +330,93 @@ impl GpuPreview {
         };
         if size != self.size {
             self.texture = target(&self.device, size);
-            self.view = self
-                .texture
-                .create_view(&wgpu::TextureViewDescriptor::default());
+            self.view = Arc::new(
+                self.texture
+                    .create_view(&wgpu::TextureViewDescriptor::default()),
+            );
             self.size = size;
         }
-        let stride = row_stride(size);
-        if buffer.size() != u64::from(stride) * u64::from(size.height) {
+        if buffer.size() != u64::from(row_stride(size)) * u64::from(size.height) {
             buffer = staging_buffer(&self.device, size);
         }
+        Ok(Some((self.view.clone(), FrameStorage::Pixels(buffer))))
+    }
+
+    fn draw(
+        &mut self,
+        size: SurfaceSize,
+        metadata: PreviewMetadata,
+        update: Duration,
+        mut profile: Option<PreviewProfile>,
+        render: impl FnOnce(&mut dyn Renderer2d),
+    ) -> io::Result<Option<FrameTimings>> {
+        if size.width.max(size.height) > self.device.limits().max_texture_dimension_2d {
+            return Err(io::Error::other(
+                "game viewport exceeds the GPU texture size limit",
+            ));
+        }
+        let Some((view, storage)) = self.acquire_target(size)? else {
+            return Ok(None);
+        };
         self.renderer.begin_frame(size);
-        let feedback = render(&mut self.renderer);
+        let (_, draw) = Span::measure(|| render(&mut self.renderer));
+        let encode_start = Instant::now();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("embedded preview"),
             });
+        let timestamps = profile
+            .as_ref()
+            .and(self.gpu_timer.as_ref())
+            .and_then(|timer| timer.begin(&mut encoder));
         self.renderer
-            .render(&mut encoder, &self.view, &self.device, &self.queue);
-        encoder.copy_texture_to_buffer(
-            self.texture.as_image_copy(),
-            wgpu::ImageCopyBuffer {
-                buffer: &buffer,
-                layout: wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(stride),
-                    rows_per_image: None,
+            .render(&mut encoder, &view, &self.device, &self.queue);
+        if let Some((timer, readback)) = self.gpu_timer.as_ref().zip(timestamps.as_ref()) {
+            timer.end(&mut encoder, readback);
+        }
+        match &storage {
+            FrameStorage::Pixels(buffer) => encoder.copy_texture_to_buffer(
+                self.texture.as_image_copy(),
+                wgpu::ImageCopyBuffer {
+                    buffer,
+                    layout: wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: Some(row_stride(size)),
+                        rows_per_image: None,
+                    },
                 },
-            },
-            extent(size),
-        );
+                extent(size),
+            ),
+            #[cfg(target_os = "macos")]
+            FrameStorage::Surface(_) => {}
+        }
         let submission = self.queue.submit([encoder.finish()]);
+        let submitted_at = Instant::now();
+        let submit = submitted_at.duration_since(encode_start);
+        let timings = FrameTimings {
+            interval: Duration::ZERO,
+            update,
+            draw: draw.elapsed,
+            output: FrameOutput::Submit(submit),
+        };
+        if let Some(profile) = &mut profile {
+            profile.update_us = micros(timings.update);
+            profile.draw_us = micros(timings.draw);
+            profile.submit_us = micros(timings.output.elapsed());
+        }
         self.completed
             .send(CompletedFrame {
-                storage: FrameStorage::Pixels(buffer),
+                storage,
                 submission,
                 size,
-                status,
+                metadata,
+                profile,
+                submitted_at,
+                timestamps,
             })
             .map_err(|_| stopped())?;
-        Ok(Some(feedback))
+        Ok(Some(timings))
     }
 }
 
@@ -359,7 +425,7 @@ struct SharedTarget {
     id: u32,
     surface: Arc<Surface>,
     _texture: wgpu::Texture,
-    view: wgpu::TextureView,
+    view: Arc<wgpu::TextureView>,
 }
 
 #[cfg(target_os = "macos")]
@@ -394,7 +460,7 @@ impl SharedTargets {
             .ok_or_else(|| io::Error::other("preview surface IDs exhausted"))?;
         let surface = Arc::new(Surface::new(self.size)?);
         let texture = surface.render_texture(device, self.size)?;
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = Arc::new(texture.create_view(&wgpu::TextureViewDescriptor::default()));
         self.slots.push(SharedTarget {
             id,
             surface,
@@ -408,7 +474,7 @@ impl SharedTargets {
         &mut self,
         device: &wgpu::Device,
         size: SurfaceSize,
-    ) -> io::Result<Option<(&wgpu::TextureView, SurfaceLease)>> {
+    ) -> io::Result<Option<(Arc<wgpu::TextureView>, FrameStorage)>> {
         if self.size != size {
             self.slots.clear();
             self.size = size;
@@ -430,13 +496,13 @@ impl SharedTargets {
             return Ok(None);
         };
         Ok(Some((
-            &slot.view,
-            SurfaceLease {
+            slot.view.clone(),
+            FrameStorage::Surface(SurfaceLease {
                 id: slot.id,
                 surface: slot.surface.clone(),
                 leases: self.leases.clone(),
                 sent: false,
-            },
+            }),
         )))
     }
 }
@@ -452,6 +518,20 @@ fn complete_frames(
     mut publisher: FramePublisher,
 ) -> Result<(), Box<dyn Error>> {
     for frame in requests {
+        let timestamp_result = frame.timestamps.map(|readback| {
+            let (sender, receiver) = mpsc::channel();
+            readback.map(move |elapsed| {
+                let _ = sender.send(elapsed);
+            });
+            receiver
+        });
+        let finish_profile = || {
+            frame.profile.map(|mut profile| {
+                profile.gpu_completion_us = micros(frame.submitted_at.elapsed());
+                profile.gpu_draw_us = timestamp_result.and_then(|rx| rx.try_recv().ok().flatten());
+                profile
+            })
+        };
         match frame.storage {
             FrameStorage::Pixels(buffer) => {
                 let slice = buffer.slice(..);
@@ -463,7 +543,8 @@ fn complete_frames(
                 mapped.recv()??;
                 publisher.publish(
                     frame.size,
-                    frame.status,
+                    frame.metadata,
+                    finish_profile(),
                     &slice.get_mapped_range(),
                     row_stride(frame.size) as usize,
                 );
@@ -475,7 +556,7 @@ fn complete_frames(
             #[cfg(target_os = "macos")]
             FrameStorage::Surface(lease) => {
                 device.poll(wgpu::Maintain::WaitForSubmissionIndex(frame.submission));
-                publisher.publish_surface(frame.size, frame.status, lease);
+                publisher.publish_surface(frame.size, frame.metadata, finish_profile(), lease);
             }
         }
     }

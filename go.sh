@@ -12,9 +12,9 @@ go.sh - Sycho launcher
 
 Usage:
   ./go.sh --editor [--timeline DIR] [--fresh] [--detach] [--release]
-  ./go.sh --start [--watch] [--timeline DIR] [--fresh|--playback] [--detach] [--release]
+  ./go.sh --start [--watch] [--no-recording | --timeline DIR] [--fresh|--playback] [--detach] [--release]
   ./go.sh --stop
-  ./go.sh --restart [--watch|--editor] [--timeline DIR] [--fresh|--playback] [--detach] [--release]
+  ./go.sh --restart [--watch|--editor] [--no-recording | --timeline DIR] [--fresh|--playback] [--detach] [--release]
   ./go.sh --status
   ./go.sh --test [--release]
   ./go.sh --test-light [--release]
@@ -25,7 +25,8 @@ Usage:
 
 Live timeline (windowed game):
   --watch         Rebuild on source edits and relaunch at the last live checkpoint.
-  --editor        Launch the game's timeline editor with live reload.
+  --editor        Launch the game's timeline editor with live reload and recording.
+  --no-recording  Run standalone without opening a timeline.
   --timeline DIR  Open or create a timeline (default: target/timelines/headful).
   --fresh         Start a separate timeline. If DIR is given, it must be new.
   --playback      Open a saved timeline paused at its first snapshot.
@@ -65,20 +66,12 @@ Testing:
   --e2e          cargo test -p game --test e2e_playtest_tests
   --video        (e2e) record an mp4 per test via ffmpeg (requires `ffmpeg` on PATH)
   --ffmpeg PATH  (e2e or export) path to ffmpeg binary (sets ROLLOUT_FFMPEG_BIN)
-  --profile      run the headless profiler (cargo run -p game --bin profile)
+  --profile      run the standalone game and write a trace to target/perf_traces/
                 Env knobs:
-                  ROLLOUT_PROFILE_FRAMES=10000
+                  ROLLOUT_PROFILE_FRAMES=600
                   ROLLOUT_PROFILE_WARMUP=200
-                  ROLLOUT_PROFILE_WIDTH=960
-                  ROLLOUT_PROFILE_HEIGHT=720
-                  ROLLOUT_BUDGET_FRAME_WARN_MS=16.67
-                  ROLLOUT_BUDGET_FRAME_CRIT_MS=22
-                  ROLLOUT_BUDGET_ENGINE_WARN_MS=6
-                  ROLLOUT_BUDGET_ENGINE_CRIT_MS=10
-                  ROLLOUT_BUDGET_DRAW_WARN_MS=6
-                  ROLLOUT_BUDGET_DRAW_CRIT_MS=10
-                  ROLLOUT_BUDGET_OVERLAY_WARN_MS=1.5
-                  ROLLOUT_BUDGET_OVERLAY_CRIT_MS=3
+                  ROLLOUT_PROFILE_WIDTH=1920
+                  ROLLOUT_PROFILE_HEIGHT=1080
 EOF
 }
 
@@ -271,6 +264,7 @@ EXPORT_PATH=""
 WATCH="false"
 EDITOR="false"
 TIMELINE_PATH=""
+NO_RECORDING="false"
 FRESH="false"
 FFMPEG_BIN=""
 RELEASE="false"
@@ -311,6 +305,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --editor)
       EDITOR="true"
+      shift
+      ;;
+    --no-recording)
+      NO_RECORDING="true"
       shift
       ;;
     --timeline)
@@ -387,6 +385,17 @@ if [[ -n "$TIMELINE_PATH" && "$ACTION" != "--export-video" ]]; then
   fi
 fi
 
+if [[ "$NO_RECORDING" == "true" ]]; then
+  if [[ "$EDITOR" == "true" || -n "$TIMELINE_PATH" || "$FRESH" == "true" || "$PLAYBACK" == "true" ]]; then
+    echo "--no-recording requires standalone play without timeline options" >&2
+    exit 2
+  fi
+  if [[ "$ACTION" != "--start" && "$ACTION" != "--restart" ]]; then
+    echo "--no-recording requires --start or --restart" >&2
+    exit 2
+  fi
+fi
+
 # Guard expansions of this array because Bash 3.2 treats an empty array as unset.
 CARGO_PROFILE_ARGS=()
 if [[ "$RELEASE" == "true" ]]; then
@@ -435,7 +444,9 @@ case "$ACTION" in
       LAUNCH=(cargo run -p game --bin headful ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"})
     fi
 
-    if [[ -n "$TIMELINE_PATH" ]]; then
+    if [[ "$NO_RECORDING" == "true" ]]; then
+      HEADFUL_ARGS+=(--no-recording)
+    elif [[ -n "$TIMELINE_PATH" ]]; then
       HEADFUL_ARGS+=(--timeline "$TIMELINE_PATH")
     fi
     if [[ "$FRESH" == "true" ]]; then
@@ -506,6 +517,6 @@ case "$ACTION" in
     ;;
 
   --profile)
-    exec cargo run -p game --bin profile ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"}
+    exec cargo run -p game --bin headful ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- --profile
     ;;
 esac

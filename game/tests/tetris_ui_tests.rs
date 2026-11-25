@@ -4,9 +4,8 @@ use engine::surface::SurfaceSize;
 use engine::ui;
 use game::board_render::{CELL_SIZE, color_for_cell};
 
-use game::debug::DebugHud;
 use game::game_ui::{GameUiAction, GameUiLayout};
-use game::headful::render_pipeline::{RenderInputs, render_frame};
+use game::headful::render_pipeline::{FrameOverlays, render_frame};
 use game::skilltree::{
     SkillEffect, SkillNodeDef, SkillTreeDef, SkillTreeProgress, SkillTreeRuntime,
 };
@@ -675,7 +674,7 @@ fn world_camera_offset_keeps_hud_layout_and_pause_hit_target_stable() {
 
     let mut state = GameState::new(core);
     state.view = GameView::Tetris { paused: false };
-    let layout = GameUiLayout::compute(&state, SurfaceSize::new(width, height), false);
+    let layout = GameUiLayout::compute(&state, SurfaceSize::new(width, height));
     assert_eq!(layout.tetris, Some(layout_shifted));
     assert_eq!(
         layout.action_at(&state, (pause_x, pause_y)),
@@ -906,30 +905,66 @@ fn draw_main_menu_brightens_start_button_on_hover() {
     let mut gfx_hover = CpuRenderer::new(&mut frame_hover, SurfaceSize::new(width, height));
     let mut state = GameState::new(TetrisCore::new(19));
     state.view = GameView::MainMenu;
-    state.input = Some(RecordedInput::from_frame(
-        &InputFrame {
-            mouse_pos: Some((hover_x, hover_y)),
-            ..InputFrame::default()
-        },
-        SurfaceSize::new(width, height),
-    ));
-    render_frame(
-        &mut gfx_hover,
-        &DebugHud::new(),
-        &state,
-        RenderInputs {
-            world_offset_y_px: 0,
-            frame_dt: std::time::Duration::ZERO,
-            show_round_timer: false,
-            historical: false,
-        },
-    );
+    state.display.viewport = SurfaceSize::new(width, height);
+    state.input = Some(RecordedInput::from_frame(&InputFrame {
+        mouse_pos: Some((hover_x, hover_y)),
+        ..InputFrame::default()
+    }));
+    render_frame(&mut gfx_hover, &state, FrameOverlays::default());
     let mut hover_px = [0u8; 4];
     hover_px.copy_from_slice(&frame_hover[idx..idx + 4]);
 
     assert!(
         hover_px[0] > normal_px[0] && hover_px[1] > normal_px[1] && hover_px[2] > normal_px[2],
         "expected hovered button fill to be brighter than normal"
+    );
+}
+
+#[test]
+fn saved_display_drives_camera_timer_and_viewport_when_rendered() {
+    use std::time::Duration;
+
+    let mut core = TetrisCore::new(19);
+    core.set_available_pieces(vec![Piece::T]);
+    core.initialize_game();
+    let mut state = GameState::new(core);
+    state.view = GameView::Tetris { paused: false };
+    let viewport = SurfaceSize::new(800, 600);
+    state.display.viewport = viewport;
+    let draw = |state: &GameState, size: SurfaceSize| {
+        let mut pixels = vec![0; size.rgba_len()];
+        render_frame(
+            &mut CpuRenderer::new(&mut pixels, size),
+            state,
+            FrameOverlays::default(),
+        );
+        pixels
+    };
+
+    let timer_visible = draw(&state, viewport);
+    state.display.show_round_timer = false;
+    let timer_hidden = draw(&state, viewport);
+    assert_ne!(timer_visible, timer_hidden);
+
+    state.display.dig_camera.update(2, Duration::ZERO, false);
+    let shifted = draw(&state, viewport);
+    assert_ne!(timer_hidden, shifted);
+
+    let saved = serde_json::to_vec(&state).unwrap();
+    let restored = serde_json::from_slice::<GameState>(&saved).unwrap();
+    assert_eq!(draw(&restored, viewport), shifted);
+
+    let output = SurfaceSize::new(1000, 600);
+    let fitted = draw(&restored, output);
+    assert_eq!(pixel_at(&fitted, output.width, 0, 300), [0, 0, 0, 255]);
+    let board = GameUiLayout::compute(&restored, viewport)
+        .tetris
+        .unwrap()
+        .board;
+    let (x, y) = (board.x + board.w / 2, board.y + board.h / 2);
+    assert_eq!(
+        pixel_at(&fitted, output.width, x + 100, y),
+        pixel_at(&shifted, viewport.width, x, y)
     );
 }
 

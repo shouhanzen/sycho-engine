@@ -554,17 +554,6 @@ impl GameOverMenuLayout {
 pub struct SettingsMenuView;
 
 impl SettingsMenuView {
-    pub fn render(
-        frame: &mut dyn Renderer2d,
-        width: u32,
-        height: u32,
-        settings: &PlayerSettings,
-    ) -> SettingsMenuLayout {
-        let layout = SettingsMenuLayout::compute(width, height);
-        Self::draw(frame, width, height, layout, settings, None);
-        layout
-    }
-
     pub(crate) fn draw(
         frame: &mut dyn Renderer2d,
         width: u32,
@@ -968,13 +957,4 @@ pub fn draw_game_over_menu(
     height: u32,
 ) -> GameOverMenuLayout {
     GameOverMenuView::render(frame, width, height)
-}
-
-pub fn draw_settings_menu(
-    frame: &mut dyn Renderer2d,
-    width: u32,
-    height: u32,
-    settings: &PlayerSettings,
-) -> SettingsMenuLayout {
-    SettingsMenuView::render(frame, width, height, settings)
 }

@@ -119,34 +119,14 @@ pub fn draw_board_cells_in_rect(gfx: &mut dyn Renderer2d, board: &[Vec<u8>], boa
         board_pixel_height,
     );
 
-    for (y, row) in board.iter().enumerate() {
-        for (x, &cell) in row.iter().enumerate() {
-            let pixel_x = offset_x + x as u32 * CELL_SIZE;
-            let inverted_y = board_height.saturating_sub(1).saturating_sub(y as u32);
-            let pixel_y = offset_y + inverted_y * CELL_SIZE;
-
-            if pixel_x.saturating_add(CELL_SIZE) > width
-                || pixel_y.saturating_add(CELL_SIZE) > height
-            {
-                continue;
-            }
-
-            if cell == 0 {
-                // A subtle dot in the center of each empty cell helps reveal the grid without
-                // distracting from the pieces.
-                let dot_size = 2u32;
-                let dot_x = pixel_x + (CELL_SIZE / 2).saturating_sub(dot_size / 2);
-                let dot_y = pixel_y + (CELL_SIZE / 2).saturating_sub(dot_size / 2);
-                gfx.fill_rect(Rect::new(dot_x, dot_y, dot_size, dot_size), COLOR_GRID_DOT);
-            } else {
-                let color = color_for_cell(cell);
-                gfx.fill_rect(Rect::new(pixel_x, pixel_y, CELL_SIZE, CELL_SIZE), color);
-                draw_exposed_cell_edges(gfx, board, None, x, y, pixel_x, pixel_y, screen_rect);
-            }
-        }
-    }
-
-    draw_inside_corner_bridges(gfx, board, offset_x, offset_y, screen_rect);
+    paint_board_cells(
+        gfx,
+        board,
+        None,
+        board_rect,
+        screen_rect,
+        CellClipping::Whole,
+    );
 }
 
 /// Draw board content translated to `board_rect`, clipped to `clip_rect`.
@@ -182,20 +162,54 @@ pub fn draw_board_cells_in_rect_clipped_with_owners(
     let board_width = board[0].len() as u32;
     let board_pixel_width = board_width.saturating_mul(CELL_SIZE);
     let board_pixel_height = board_height.saturating_mul(CELL_SIZE);
-    let offset_x = board_rect.x;
-    let offset_y = board_rect.y;
-
     let outline_w = clip_rect.w.min(board_pixel_width);
     let outline_h = clip_rect.h.min(board_pixel_height);
     if outline_w > 0 && outline_h > 0 {
         draw_board_outline(gfx, clip_rect.x, clip_rect.y, outline_w, outline_h);
     }
 
+    paint_board_cells(
+        gfx,
+        board,
+        board_owners,
+        board_rect,
+        clip_rect,
+        CellClipping::Partial,
+    );
+}
+
+enum CellClipping {
+    Whole,
+    Partial,
+}
+
+fn paint_board_cells(
+    gfx: &mut dyn Renderer2d,
+    board: &[Vec<u8>],
+    board_owners: Option<&[Vec<Option<u32>>]>,
+    board_rect: Rect,
+    clip_rect: Rect,
+    clipping: CellClipping,
+) {
+    let board_height = board.len() as u32;
+    let (offset_x, offset_y) = (board_rect.x, board_rect.y);
+    let clip_right = clip_rect.x.saturating_add(clip_rect.w);
+    let clip_bottom = clip_rect.y.saturating_add(clip_rect.h);
+
     for (y, row) in board.iter().enumerate() {
         for (x, &cell) in row.iter().enumerate() {
             let pixel_x = offset_x + x as u32 * CELL_SIZE;
             let inverted_y = board_height.saturating_sub(1).saturating_sub(y as u32);
             let pixel_y = offset_y + inverted_y * CELL_SIZE;
+
+            if matches!(clipping, CellClipping::Whole)
+                && (pixel_x < clip_rect.x
+                    || pixel_y < clip_rect.y
+                    || pixel_x.saturating_add(CELL_SIZE) > clip_right
+                    || pixel_y.saturating_add(CELL_SIZE) > clip_bottom)
+            {
+                continue;
+            }
 
             if cell == 0 {
                 // A subtle dot in the center of each empty cell helps reveal the grid without

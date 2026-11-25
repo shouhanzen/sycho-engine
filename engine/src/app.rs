@@ -1,11 +1,14 @@
+use crate::profiling::{
+    FrameOutput, FrameTimings, PreviewProfile, ProfileConfig, Span, TraceCapture, micros,
+};
 use std::collections::HashSet;
 use std::env;
 use std::error::Error;
-use std::fs;
+use std::ffi::OsString;
 use std::hash::Hash;
-use std::io::{self, Write};
+use std::io;
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::TryRecvError;
 use std::time::{Duration, Instant};
 
 use serde::{Serialize, de::DeserializeOwned};
@@ -19,15 +22,17 @@ use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{Window, WindowBuilder};
 
 use crate::embedded::{
-    DEFAULT_PREVIEW_SIZE, EditorEvent, GPU_PREVIEW_EXIT_CODE, GameLink, TimelineStatus,
-    valid_preview_size,
+    ADDRESS_ENV, DEFAULT_PREVIEW_SIZE, EditorEvent, GPU_PREVIEW_EXIT_CODE, GameLink, MasterVolume,
+    PreviewMetadata, TimelineStatus, valid_preview_size,
 };
 use crate::graphics::Renderer2d;
 use crate::offscreen::{GpuPreview, PreviewWorker};
 use crate::pixels_renderer::PixelsRenderer2d;
 use crate::reload::{self, ProcessCommand, RELOAD_EXIT_CODE};
 use crate::surface::SurfaceSize;
-use crate::timeline::{Frame, StateSchema, Timeline, TimelineCommand, TimelineWorker};
+use crate::timeline::{
+    Frame, StateSchema, Timeline, TimelineCommand, TimelineWorker, session_directory,
+};
 
 pub struct AppConfig {
     pub title: String,
@@ -43,34 +48,52 @@ pub struct TimelineConfig {
     pub playback: bool,
 }
 
-#[derive(Debug, Clone)]
-pub struct ProfileConfig {
-    pub target_frames: usize,
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct TimelineCli {
     pub help: bool,
+    pub profile: bool,
+    pub no_recording: bool,
     pub timeline_path: Option<PathBuf>,
     pub fresh: bool,
     pub playback: bool,
     pub export_video: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunMode {
-    Timeline,
-    Profile,
+/// Options supplied by the host when launching a game.
+pub enum RunConfig {
+    Live { timeline: Option<TimelineConfig> },
+    Profile(ProfileConfig),
+}
+
+impl TimelineCli {
+    pub fn recording(&self, default_directory: PathBuf) -> io::Result<Option<TimelineConfig>> {
+        if self.no_recording {
+            return Ok(None);
+        }
+        Ok(Some(TimelineConfig {
+            directory: session_directory(
+                default_directory,
+                self.timeline_path.clone(),
+                self.fresh,
+            )?,
+            playback: self.playback,
+        }))
+    }
 }
 
 pub fn parse_timeline_cli() -> io::Result<TimelineCli> {
+    parse_timeline_args(env::args_os().skip(1))
+}
+
+fn parse_timeline_args(mut args: impl Iterator<Item = OsString>) -> io::Result<TimelineCli> {
     let mut cli = TimelineCli::default();
-    let mut args = env::args_os().skip(1);
     while let Some(arg) = args.next() {
         let arg = arg.to_string_lossy();
         match arg.as_ref() {
             "-h" | "--help" => cli.help = true,
+            "--profile" => cli.profile = true,
             "--fresh" => cli.fresh = true,
+            "--no-recording" => cli.no_recording = true,
             "--playback" => cli.playback = true,
             "--timeline" | "--export-video" => {
                 let path = args
@@ -101,6 +124,20 @@ pub fn parse_timeline_cli() -> io::Result<TimelineCli> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "--fresh, --playback, and --export-video are mutually exclusive",
+        ));
+    }
+    let timeline_options =
+        cli.fresh || cli.playback || cli.timeline_path.is_some() || cli.export_video.is_some();
+    if cli.profile && timeline_options {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--profile cannot be combined with timeline options",
+        ));
+    }
+    if cli.no_recording && (timeline_options || cli.profile) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--no-recording cannot be combined with timeline options or --profile",
         ));
     }
     Ok(cli)
@@ -227,6 +264,8 @@ impl InputFrame {
                 self.mouse_pos = None;
             }
             EditorEvent::Resize(_)
+            | EditorEvent::Profile(_)
+            | EditorEvent::MasterVolume { .. }
             | EditorEvent::Timeline(_)
             | EditorEvent::ReleaseSurface(_)
             | EditorEvent::UseRgba => {}
@@ -317,7 +356,16 @@ pub trait GameApp {
 
     fn render(&mut self, state: &Self::State, renderer: &mut dyn Renderer2d);
 
-    fn on_run_mode(&mut self, _mode: RunMode, _state: &mut Self::State, _ctx: &mut AppContext) {}
+    /// Receives the engine's timings once the frame's CPU render work has completed.
+    fn on_frame_timings(&mut self, _timings: FrameTimings) {}
+
+    /// Live master volume advertised to the editor in percent.
+    fn master_volume(&self) -> Option<u8> {
+        None
+    }
+
+    /// Apply a master volume adjustment, saving it when the user releases the slider.
+    fn set_master_volume(&mut self, _percent: u8, _commit: bool) {}
 
     fn exit_requested(&self) -> bool {
         false
@@ -406,7 +454,6 @@ fn create_app_context(
 pub trait TimelineGame: GameApp {
     type Snapshot: Clone + Send + Serialize + DeserializeOwned + 'static;
     type PreviewSnapshot: Send + 'static;
-    type PreviewFeedback: Send + 'static;
     const SCHEMA: StateSchema;
 
     fn snapshot(state: &Self::State) -> &Self::Snapshot;
@@ -415,28 +462,33 @@ pub trait TimelineGame: GameApp {
     /// Capture the data that the editor preview can draw independently of gameplay.
     fn preview_snapshot(&self, state: &Self::State) -> Self::PreviewSnapshot;
 
-    fn draw_preview(
-        snapshot: Self::PreviewSnapshot,
-        renderer: &mut dyn Renderer2d,
-    ) -> Self::PreviewFeedback;
+    fn draw_preview(snapshot: Self::PreviewSnapshot, renderer: &mut dyn Renderer2d);
 
-    fn apply_preview_feedback(&mut self, _state: &Self::State, _feedback: Self::PreviewFeedback) {}
-
-    fn set_history_view(&mut self, _historical: bool) {}
+    fn set_timeline_paused(&mut self, _paused: bool) {}
 
     fn timeline_command(&self, _input: &InputFrame) -> Option<TimelineCommand> {
         None
     }
 }
 
-pub fn run_game_with_timeline<G>(
-    config: AppConfig,
-    game: G,
-    options: TimelineConfig,
-) -> Result<(), Box<dyn Error>>
+pub fn run_game<G>(config: AppConfig, game: G, run: RunConfig) -> Result<(), Box<dyn Error>>
 where
     G: TimelineGame + 'static,
 {
+    let (timeline, trace) = match run {
+        RunConfig::Live { timeline } => (timeline, None),
+        RunConfig::Profile(profile) => (None, Some(TraceCapture::new(profile))),
+    };
+    let Some(options) = timeline else {
+        if env::var_os(ADDRESS_ENV).is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the editor requires timeline recording",
+            )
+            .into());
+        }
+        return run_windowed(config, game, None, trace);
+    };
     let (mut timeline, mut snapshot) = Timeline::open(&options.directory, G::SCHEMA)?;
     if options.playback {
         snapshot = Some(timeline.pause_at_start()?);
@@ -469,12 +521,11 @@ where
         writer: TimelineWorker::start(timeline)?,
         snapshot,
         capture_failed: false,
-        overseer: reload::listen_for_overseer(),
     };
     if let Some((editor, preview)) = editor {
         run_embedded(game, session, editor, preview)
     } else {
-        run_windowed_timeline(config, game, session)
+        run_windowed(config, game, Some(session), None)
     }
 }
 
@@ -499,7 +550,6 @@ struct TimelineSession<G: TimelineGame> {
     clock_start: Instant,
     playback: Option<Playback>,
     snapshot: Option<G::Snapshot>,
-    overseer: Option<Receiver<ProcessCommand>>,
 }
 
 fn update_timeline_title(window: &Window, title: &str, status: TimelineStatus) {
@@ -555,7 +605,7 @@ impl<G: TimelineGame> TimelineSession<G> {
             self.tip = position;
             state
         };
-        game.set_history_view(self.paused);
+        game.set_timeline_paused(self.paused);
         self.clock_start = Instant::now();
         Ok(state)
     }
@@ -644,7 +694,7 @@ impl<G: TimelineGame> TimelineSession<G> {
             Ok((paused, cursor, tip, changed, next)) => {
                 self.poll_capture();
                 self.paused = paused;
-                game.set_history_view(paused);
+                game.set_timeline_paused(paused);
                 self.cursor = cursor;
                 match tip {
                     Ok(tip) => self.tip = tip,
@@ -709,10 +759,6 @@ impl<G: TimelineGame> TimelineSession<G> {
         }
     }
 
-    fn process_command(&mut self) -> Option<ProcessCommand> {
-        self.overseer.as_ref()?.try_recv().ok()
-    }
-
     fn save(&mut self, state: &G::State) -> io::Result<()> {
         let snapshot = G::snapshot(state).clone();
         let at_ms = self.live_time_ms();
@@ -722,11 +768,14 @@ impl<G: TimelineGame> TimelineSession<G> {
 }
 
 fn exit_for_command<G: TimelineGame>(
-    session: &mut TimelineSession<G>,
+    session: Option<&mut TimelineSession<G>>,
     state: &G::State,
     command: ProcessCommand,
 ) -> Option<i32> {
-    match (command, session.save(state)) {
+    match (
+        command,
+        session.map_or(Ok(()), |session| session.save(state)),
+    ) {
         (ProcessCommand::Reload, Ok(())) => Some(RELOAD_EXIT_CODE),
         (ProcessCommand::Reload, Err(err)) => {
             reload::reject_reload(&err);
@@ -745,38 +794,52 @@ fn run_embedded<G: TimelineGame>(
     mut game: G,
     mut session: TimelineSession<G>,
     editor: GameLink,
-    preview: PreviewWorker<G::PreviewSnapshot, G::PreviewFeedback>,
+    preview: PreviewWorker<G::PreviewSnapshot>,
 ) -> Result<(), Box<dyn Error>> {
     let mut ctx = AppContext {
         surface_size: DEFAULT_PREVIEW_SIZE,
     };
     let mut state = session.start(&mut game, &mut ctx)?;
-    game.on_run_mode(RunMode::Timeline, &mut state, &mut ctx);
+    let overseer = reload::listen_for_overseer();
     let mut input = InputFrame::default();
     let mut last_frame = Instant::now();
     let mut deadline = last_frame;
     let interval = Duration::from_secs_f64(1.0 / 60.0);
+    let mut profile_enabled = false;
+    let mut last_volume_request = None;
+    let mut frame = 0;
+    let mut tick = 0;
     let exit_code = 'game: loop {
-        if let Some(command) = session.process_command() {
-            if let Some(status) = exit_for_command::<G>(&mut session, &state, command) {
+        if let Some(command) = overseer
+            .as_ref()
+            .and_then(|commands| commands.try_recv().ok())
+        {
+            if let Some(status) = exit_for_command::<G>(Some(&mut session), &state, command) {
                 break status;
             }
         }
         if game.exit_requested() {
-            break exit_for_command::<G>(&mut session, &state, ProcessCommand::Stop).unwrap_or(0);
+            break exit_for_command::<G>(Some(&mut session), &state, ProcessCommand::Stop)
+                .unwrap_or(0);
         }
 
         let now = Instant::now();
         let dt = now.saturating_duration_since(last_frame);
         last_frame = now;
         let mut commands = Vec::new();
+        let mut volume_change = None;
+        let mut commit_volume = false;
         loop {
             let event = match editor.events.try_recv() {
                 Ok(event) => event,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    break 'game exit_for_command::<G>(&mut session, &state, ProcessCommand::Stop)
-                        .unwrap_or(0);
+                    break 'game exit_for_command::<G>(
+                        Some(&mut session),
+                        &state,
+                        ProcessCommand::Stop,
+                    )
+                    .unwrap_or(0);
                 }
             };
             match event {
@@ -789,24 +852,46 @@ fn run_embedded<G: TimelineGame>(
                     commands.push(command);
                 }
                 EditorEvent::Resize(size) if valid_preview_size(size) => ctx.surface_size = size,
+                EditorEvent::Profile(enabled) => profile_enabled = enabled,
+                EditorEvent::MasterVolume {
+                    percent,
+                    request,
+                    commit,
+                } => {
+                    volume_change = Some((percent.min(100), request));
+                    commit_volume |= commit;
+                }
                 _ => input.apply_editor_event(event),
             }
         }
+        if let Some((percent, request)) = volume_change {
+            game.set_master_volume(percent, commit_volume);
+            last_volume_request = Some(request);
+        }
         match preview.take_feedback() {
-            Ok(Some((size, feedback))) if size == ctx.surface_size => {
-                game.apply_preview_feedback(&state, feedback);
+            Ok(Some((size, timings))) if size == ctx.surface_size => {
+                game.on_frame_timings(timings);
             }
             Ok(_) => {}
             Err(err) => {
                 eprintln!("could not draw the editor GPU preview: {err}");
-                exit_for_command::<G>(&mut session, &state, ProcessCommand::Stop);
+                exit_for_command::<G>(Some(&mut session), &state, ProcessCommand::Stop);
                 break GPU_PREVIEW_EXIT_CODE;
             }
         }
+        let mut profile = profile_enabled.then(PreviewProfile::default);
+        let mut update = Duration::ZERO;
         if commands.is_empty() {
             if session.should_update(&mut game, &mut state, &input, None) {
-                game.update_state(&mut state, &input, dt, &mut ctx);
+                let (_, span) =
+                    Span::measure(|| game.update_state(&mut state, &input, dt, &mut ctx));
+                update = span.elapsed;
+                tick += 1;
+                let start = profile_enabled.then(Instant::now);
                 session.after_update(&state);
+                if let (Some(profile), Some(start)) = (&mut profile, start) {
+                    profile.timeline_us = micros(start.elapsed());
+                }
             } else {
                 last_frame = Instant::now();
             }
@@ -816,8 +901,22 @@ fn run_embedded<G: TimelineGame>(
             }
             last_frame = Instant::now();
         }
-        let status = session.status();
-        preview.publish(ctx.surface_size, status, game.preview_snapshot(&state));
+        let metadata = PreviewMetadata {
+            status: session.status(),
+            master_volume: game.master_volume().map(|percent| MasterVolume {
+                percent: percent.min(100),
+                request: last_volume_request,
+            }),
+        };
+        frame += 1;
+        let start = profile_enabled.then(Instant::now);
+        let snapshot = game.preview_snapshot(&state);
+        if let (Some(profile), Some(start)) = (&mut profile, start) {
+            profile.frame = frame;
+            profile.tick = tick;
+            profile.snapshot_us = micros(start.elapsed());
+        }
+        preview.publish(ctx.surface_size, metadata, snapshot, update, profile);
         input.clear_frame_transients();
         // Keep oversleep from accumulating across frames, and skip missed deadlines.
         let finished = Instant::now();
@@ -831,15 +930,19 @@ fn run_embedded<G: TimelineGame>(
     Ok(())
 }
 
-fn run_windowed_timeline<G: TimelineGame + 'static>(
+fn run_windowed<G: TimelineGame + 'static>(
     config: AppConfig,
     mut game: G,
-    mut session: TimelineSession<G>,
+    mut session: Option<TimelineSession<G>>,
+    mut trace: Option<TraceCapture>,
 ) -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new();
     let mut ctx = create_app_context(&config, &event_loop)?;
-    let mut state = session.start(&mut game, &mut ctx.app)?;
-    game.on_run_mode(RunMode::Timeline, &mut state, &mut ctx.app);
+    let mut state = match &mut session {
+        Some(session) => session.start(&mut game, &mut ctx.app)?,
+        None => game.init_state(&mut ctx.app),
+    };
+    let overseer = reload::listen_for_overseer();
     let mut input = InputFrame::default();
     let mut last_frame = Instant::now();
     let mut exiting = false;
@@ -857,8 +960,11 @@ fn run_windowed_timeline<G: TimelineGame + 'static>(
             apply_window_event_to_input(&mut input, event);
         }
 
-        if let Some(command) = session.process_command() {
-            if let Some(code) = exit_for_command::<G>(&mut session, &state, command) {
+        if let Some(command) = overseer
+            .as_ref()
+            .and_then(|commands| commands.try_recv().ok())
+        {
+            if let Some(code) = exit_for_command(session.as_mut(), &state, command) {
                 *control_flow = ControlFlow::ExitWithCode(code);
                 exiting = true;
             }
@@ -877,8 +983,13 @@ fn run_windowed_timeline<G: TimelineGame + 'static>(
                     }
                 ))
         {
-            if let Err(err) = session.save(&state) {
+            if let Some(session) = &mut session
+                && let Err(err) = session.save(&state)
+            {
                 eprintln!("could not save final state: {err}");
+            }
+            if let Some(trace) = trace.take() {
+                trace.finish(ctx.renderer.size());
             }
             exiting = true;
             if !matches!(control_flow, ControlFlow::ExitWithCode(_)) {
@@ -901,20 +1012,59 @@ fn run_windowed_timeline<G: TimelineGame + 'static>(
                 let now = Instant::now();
                 let dt = now.saturating_duration_since(last_frame);
                 last_frame = now;
-                if session.should_update(&mut game, &mut state, &input, None) {
-                    game.update_state(&mut state, &input, dt, &mut ctx.app);
-                    session.after_update(&state);
+                let update = if session.as_mut().is_none_or(|session| {
+                    session.should_update(&mut game, &mut state, &input, None)
+                }) {
+                    let (_, update) =
+                        Span::measure(|| game.update_state(&mut state, &input, dt, &mut ctx.app));
+                    if let Some(session) = &mut session {
+                        session.after_update(&state);
+                    }
+                    Some(update)
                 } else {
                     last_frame = Instant::now();
-                }
-                let status = session.status();
-                if previous_status != Some(status) {
-                    if status.paused || previous_status.is_none_or(|previous| previous.paused) {
-                        update_timeline_title(&ctx.window, &config.title, status);
+                    None
+                };
+                if let Some(session) = &session {
+                    let status = session.status();
+                    if previous_status != Some(status) {
+                        if status.paused || previous_status.is_none_or(|previous| previous.paused) {
+                            update_timeline_title(&ctx.window, &config.title, status);
+                        }
+                        previous_status = Some(status);
                     }
-                    previous_status = Some(status);
                 }
-                draw_game(&mut game, &state, &mut ctx);
+                let draw = match ctx
+                    .renderer
+                    .draw_frame(|gfx| Span::measure(|| game.render(&state, gfx)).1)
+                {
+                    Ok(draw) => Some(draw),
+                    Err(err) => {
+                        eprintln!("draw failed: {err}");
+                        None
+                    }
+                };
+                let (result, present) = Span::measure(|| ctx.renderer.present());
+                if let Err(err) = result {
+                    eprintln!("present failed: {err}");
+                }
+                let timings = FrameTimings {
+                    interval: dt,
+                    update: update.map_or(Duration::ZERO, |span| span.elapsed),
+                    draw: draw.map_or(Duration::ZERO, |span| span.elapsed),
+                    output: FrameOutput::Present(present.elapsed),
+                };
+                if let Some(capture) = &mut trace
+                    && capture.record_frame(now, update, draw, present, timings)
+                {
+                    let completed = trace
+                        .take()
+                        .expect("completed trace")
+                        .finish(ctx.renderer.size());
+                    *control_flow = ControlFlow::ExitWithCode(if completed { 0 } else { 1 });
+                    exiting = true;
+                }
+                game.on_frame_timings(timings);
                 input.clear_frame_transients();
             }
             Event::MainEventsCleared => ctx.window.request_redraw(),
@@ -923,263 +1073,39 @@ fn run_windowed_timeline<G: TimelineGame + 'static>(
     });
 }
 
-fn draw_game<G: GameApp>(game: &mut G, state: &G::State, ctx: &mut WindowContext) {
-    if let Err(err) = ctx.renderer.draw_frame(|gfx| game.render(state, gfx)) {
-        eprintln!("draw failed: {err}");
-    }
-    if let Err(err) = ctx.renderer.present() {
-        eprintln!("present failed: {err}");
-    }
-}
-
-pub fn run_game_with_profile<G>(
-    config: AppConfig,
-    mut game: G,
-    profile: ProfileConfig,
-) -> Result<(), Box<dyn Error>>
-where
-    G: GameApp + 'static,
-{
-    let event_loop = EventLoop::new();
-    let mut ctx = create_app_context(&config, &event_loop)?;
-    let mut state = game.init_state(&mut ctx.app);
-    game.on_run_mode(RunMode::Profile, &mut state, &mut ctx.app);
-    let mut input = InputFrame::default();
-    let mut last_frame = Instant::now();
-    let mut trace = TraceCapture::new(profile.target_frames);
-
-    event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Poll;
-
-        if let Event::WindowEvent { event, .. } = &event {
-            apply_window_event_to_input(&mut input, event);
-        }
-
-        if game.handle_event(&event, &mut state, &mut input, &mut ctx.app, control_flow) {
-            return;
-        }
-
-        match &event {
-            Event::WindowEvent { event, .. } => match event {
-                WindowEvent::CloseRequested => {
-                    *control_flow = ControlFlow::Exit;
-                    return;
-                }
-                WindowEvent::Resized(size) => {
-                    ctx.resize(*size);
-                }
-                _ => {}
-            },
-            Event::RedrawRequested(_) => {
-                let now = Instant::now();
-                let dt = now.saturating_duration_since(last_frame);
-                last_frame = now;
-
-                let frame_start = Instant::now();
-                let update_start = Instant::now();
-                game.update_state(&mut state, &input, dt, &mut ctx.app);
-                let update_dt = update_start.elapsed();
-                trace.record("engine.update", update_start, update_dt);
-
-                let draw_start = Instant::now();
-                let draw_res = ctx.renderer.draw_frame(|gfx| game.render(&state, gfx));
-                let draw_dt = draw_start.elapsed();
-                trace.record("render.draw", draw_start, draw_dt);
-                if let Err(err) = draw_res {
-                    eprintln!("draw failed: {err}");
-                }
-
-                let present_start = Instant::now();
-                if let Err(err) = ctx.renderer.present() {
-                    eprintln!("present failed: {err}");
-                }
-                let present_dt = present_start.elapsed();
-                trace.record("render.present", present_start, present_dt);
-
-                let frame_total_dt = frame_start.elapsed();
-                trace.record("frame.total", frame_start, frame_total_dt);
-                trace.record_frame_samples(update_dt, draw_dt, present_dt, frame_total_dt);
-
-                input.clear_frame_transients();
-
-                if trace.captured_frames >= trace.target_frames {
-                    let size = ctx.renderer.size();
-                    match trace.write(size) {
-                        Ok(path) => {
-                            println!("trace written: {}", path.display());
-                            trace.print_summary();
-                        }
-                        Err(err) => eprintln!("failed writing trace: {err}"),
-                    }
-                    *control_flow = ControlFlow::Exit;
-                }
-            }
-            Event::MainEventsCleared => {
-                ctx.window.request_redraw();
-            }
-            _ => {}
-        }
-    });
-
-    #[allow(unreachable_code)]
-    Ok(())
-}
-
-#[derive(Debug, Default, Clone)]
-struct DurationAgg {
-    n: usize,
-    sum: Duration,
-    max: Duration,
-}
-
-impl DurationAgg {
-    fn push(&mut self, d: Duration) {
-        self.n = self.n.saturating_add(1);
-        self.sum = self.sum.saturating_add(d);
-        if d > self.max {
-            self.max = d;
-        }
-    }
-
-    fn avg_ms(&self) -> f64 {
-        if self.n == 0 {
-            return 0.0;
-        }
-        (self.sum.as_secs_f64() * 1000.0) / (self.n as f64)
-    }
-
-    fn max_ms(&self) -> f64 {
-        self.max.as_secs_f64() * 1000.0
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct TraceEvent {
-    name: &'static str,
-    ts_us: u64,
-    dur_us: u64,
-}
-
-#[derive(Debug)]
-struct TraceCapture {
-    target_frames: usize,
-    captured_frames: usize,
-    start: Instant,
-    events: Vec<TraceEvent>,
-
-    update: DurationAgg,
-    draw: DurationAgg,
-    present: DurationAgg,
-    frame_total: DurationAgg,
-}
-
-impl TraceCapture {
-    fn new(target_frames: usize) -> Self {
-        let target_frames = target_frames.max(1);
-        Self {
-            target_frames,
-            captured_frames: 0,
-            start: Instant::now(),
-            events: Vec::with_capacity(target_frames.saturating_mul(6)),
-            update: DurationAgg::default(),
-            draw: DurationAgg::default(),
-            present: DurationAgg::default(),
-            frame_total: DurationAgg::default(),
-        }
-    }
-
-    fn ts_us(&self, t: Instant) -> u64 {
-        t.duration_since(self.start).as_micros() as u64
-    }
-
-    fn record(&mut self, name: &'static str, start: Instant, dur: Duration) {
-        self.events.push(TraceEvent {
-            name,
-            ts_us: self.ts_us(start),
-            dur_us: dur.as_micros() as u64,
-        });
-    }
-
-    fn record_frame_samples(
-        &mut self,
-        update: Duration,
-        draw: Duration,
-        present: Duration,
-        frame: Duration,
-    ) {
-        self.update.push(update);
-        self.draw.push(draw);
-        self.present.push(present);
-        self.frame_total.push(frame);
-        self.captured_frames = self.captured_frames.saturating_add(1);
-    }
-
-    fn default_trace_dir() -> PathBuf {
-        // `CARGO_MANIFEST_DIR` is `.../rollout_engine/engine`; the workspace `target/` lives at `..`.
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("target")
-            .join("perf_traces")
-    }
-
-    fn write(&self, size: SurfaceSize) -> io::Result<PathBuf> {
-        let dir = Self::default_trace_dir();
-        fs::create_dir_all(&dir)?;
-
-        let epoch_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let file_name = format!(
-            "perf_trace_{epoch_ms}_{}x{}_{}f.json",
-            size.width, size.height, self.captured_frames
-        );
-        let path = dir.join(file_name);
-
-        let mut f = fs::File::create(&path)?;
-        writeln!(f, "{{\"traceEvents\":[")?;
-        for (i, e) in self.events.iter().enumerate() {
-            if i > 0 {
-                writeln!(f, ",")?;
-            }
-            write!(
-                f,
-                "  {{\"name\":\"{}\",\"ph\":\"X\",\"ts\":{},\"dur\":{},\"pid\":1,\"tid\":1}}",
-                e.name, e.ts_us, e.dur_us
-            )?;
-        }
-        writeln!(f, "\n]}}")?;
-        Ok(path)
-    }
-
-    fn print_summary(&self) {
-        println!("profile summary (ms; lower is better)");
-        println!(
-            "update(avg/max)  {:>7.3} / {:>7.3}",
-            self.update.avg_ms(),
-            self.update.max_ms()
-        );
-        println!(
-            "draw  (avg/max)  {:>7.3} / {:>7.3}",
-            self.draw.avg_ms(),
-            self.draw.max_ms()
-        );
-        println!(
-            "present(avg/max) {:>7.3} / {:>7.3}",
-            self.present.avg_ms(),
-            self.present.max_ms()
-        );
-        println!(
-            "frame (avg/max)  {:>7.3} / {:>7.3}",
-            self.frame_total.avg_ms(),
-            self.frame_total.max_ms()
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recording_defaults_on_and_can_be_disabled_for_standalone_play() {
+        let default = PathBuf::from("target/timelines/example");
+        let cli = parse_timeline_args(std::iter::empty()).unwrap();
+        assert_eq!(
+            cli.recording(default.clone()).unwrap().unwrap().directory,
+            default
+        );
+
+        let cli = parse_timeline_args(["--no-recording"].into_iter().map(OsString::from)).unwrap();
+        assert!(cli.recording(default).unwrap().is_none());
+
+        for conflict in [
+            "--fresh",
+            "--playback",
+            "--timeline",
+            "--export-video",
+            "--profile",
+        ] {
+            let args = ["--no-recording", conflict]
+                .into_iter()
+                .chain(matches!(conflict, "--timeline" | "--export-video").then_some("example"))
+                .map(OsString::from);
+            assert_eq!(
+                parse_timeline_args(args).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
 
     #[test]
     fn key_transitions_are_frame_based() {

@@ -1,10 +1,8 @@
-use std::time::{Duration, Instant};
 use std::{io, path::Path};
 
 use engine::embedded::valid_preview_size;
 use engine::graphics::{FittedRenderer, Renderer2d};
 use engine::recording::{Mp4Config, export_timeline};
-use engine::surface::SurfaceSize;
 use engine::timeline::TimelineReader;
 
 use crate::debug::DebugHud;
@@ -16,37 +14,14 @@ use crate::tetris_ui::{
 };
 use crate::view::GameView;
 
-pub struct RenderInputs {
-    pub world_offset_y_px: i32,
-    pub frame_dt: Duration,
-    pub show_round_timer: bool,
-    pub historical: bool,
-}
-
-pub struct DrawTimings {
-    frame_dt: Duration,
-    board_dt: Duration,
-    draw_dt: Duration,
-    overlay_dt: Duration,
-    frame_total_dt: Duration,
-}
-
-impl DrawTimings {
-    pub fn record(self, debug_hud: &mut DebugHud) {
-        debug_hud.on_frame(
-            self.frame_dt,
-            self.board_dt,
-            self.draw_dt,
-            self.overlay_dt,
-            Duration::ZERO,
-            self.frame_total_dt,
-        );
-    }
+#[derive(Default)]
+pub struct FrameOverlays<'a> {
+    pub debug_hud: Option<&'a DebugHud>,
+    pub playback_cursor: bool,
 }
 
 pub fn export_video(directory: &Path, output: &Path) -> io::Result<()> {
     let timeline = TimelineReader::open(directory, TIMELINE_SCHEMA)?;
-    let mut debug_hud = DebugHud::new();
     let config = Mp4Config {
         width: 1280,
         height: 720,
@@ -55,63 +30,38 @@ pub fn export_video(directory: &Path, output: &Path) -> io::Result<()> {
     export_timeline(&timeline, output, config, |state, renderer| {
         render_frame(
             renderer,
-            &debug_hud,
             state,
-            RenderInputs {
-                world_offset_y_px: 0,
-                frame_dt: Duration::ZERO,
-                historical: true,
-                show_round_timer: true,
+            FrameOverlays {
+                playback_cursor: true,
+                ..FrameOverlays::default()
             },
-        )
-        .record(&mut debug_hud);
+        );
     })
 }
 
-pub fn render_frame(
-    renderer: &mut dyn Renderer2d,
-    debug_hud: &DebugHud,
-    state: &GameState,
-    inputs: RenderInputs,
-) -> DrawTimings {
-    if inputs.historical
-        && let Some(input) = &state.input
-    {
-        let viewport = SurfaceSize::new(input.viewport.0, input.viewport.1);
-        if viewport != renderer.size() && valid_preview_size(viewport) {
-            renderer.clear([0, 0, 0, 255]);
-            return draw_frame(
-                &mut FittedRenderer::new(renderer, viewport),
-                debug_hud,
-                state,
-                inputs,
-            );
-        }
+pub fn render_frame(renderer: &mut dyn Renderer2d, state: &GameState, overlays: FrameOverlays<'_>) {
+    let viewport = state.display.viewport;
+    if viewport != renderer.size() && valid_preview_size(viewport) {
+        renderer.clear([0, 0, 0, 255]);
+        draw_frame(
+            &mut FittedRenderer::new(renderer, viewport),
+            state,
+            overlays,
+        )
+    } else {
+        draw_frame(renderer, state, overlays)
     }
-    draw_frame(renderer, debug_hud, state, inputs)
 }
 
-fn draw_frame(
-    renderer: &mut dyn Renderer2d,
-    debug_hud: &DebugHud,
-    state: &GameState,
-    inputs: RenderInputs,
-) -> DrawTimings {
-    let frame_start = Instant::now();
-    let board_start = Instant::now();
+fn draw_frame(renderer: &mut dyn Renderer2d, state: &GameState, overlays: FrameOverlays<'_>) {
     let view = state.view;
-    let board_dt = board_start.elapsed();
 
     let size = renderer.size();
-    let pointer = state
-        .input
-        .as_ref()
-        .and_then(|input| input.pointer_at(size));
+    let pointer = state.pointer();
     let settings = state.settings_overlay.as_ref();
-    let layout = GameUiLayout::compute(state, size, settings.is_some());
+    let layout = GameUiLayout::compute(state, size);
     let game_pointer = if settings.is_some() { None } else { pointer };
 
-    let draw_start = Instant::now();
     if let Some(tetris) = layout.tetris {
         draw_tetris_world_in_layout(
             renderer,
@@ -119,7 +69,7 @@ fn draw_frame(
             size.height,
             state.tetris(),
             tetris,
-            inputs.world_offset_y_px,
+            state.display.world_offset_y_px(),
         );
         if view.is_tetris() {
             draw_tetris_hud_view(
@@ -135,11 +85,11 @@ fn draw_frame(
 
     if let Some(tetris) = layout
         .tetris
-        .filter(|_| view.is_tetris() && inputs.show_round_timer)
+        .filter(|_| view.is_tetris() && state.display.show_round_timer)
     {
         let hud_x = tetris.pause_button.x.saturating_sub(180);
         let hud_y = tetris.pause_button.y.saturating_add(34);
-        let timer_disabled = debug_hud.round_timer_disabled();
+        let timer_disabled = state.round_timer_disabled;
         let timer_text = if timer_disabled {
             "TIME OFF".to_string()
         } else {
@@ -154,9 +104,6 @@ fn draw_frame(
         renderer.draw_text(hud_x, hud_y, &timer_text, timer_color);
     }
 
-    let draw_dt = draw_start.elapsed();
-
-    let overlay_start = Instant::now();
     match layout.menu {
         Some(Menu::Main(menu)) => {
             MainMenuView::draw(renderer, size.width, size.height, menu, game_pointer)
@@ -180,18 +127,11 @@ fn draw_frame(
     if let Some((settings, menu)) = settings.zip(layout.settings) {
         SettingsMenuView::draw(renderer, size.width, size.height, menu, settings, pointer);
     }
-    debug_hud.draw_overlay(renderer, size.width, size.height);
-    if let Some((x, y)) = pointer.filter(|_| inputs.historical) {
-        draw_recorded_cursor(renderer, x, y);
+    if let Some(debug_hud) = overlays.debug_hud {
+        debug_hud.draw_overlay(renderer, size.width, size.height);
     }
-    let overlay_dt = overlay_start.elapsed();
-
-    DrawTimings {
-        frame_dt: inputs.frame_dt,
-        board_dt,
-        draw_dt,
-        overlay_dt,
-        frame_total_dt: frame_start.elapsed(),
+    if let Some((x, y)) = pointer.filter(|_| overlays.playback_cursor) {
+        draw_recorded_cursor(renderer, x, y);
     }
 }
 

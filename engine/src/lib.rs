@@ -1,6 +1,7 @@
 pub mod app;
 pub mod audio;
 pub mod embedded;
+pub mod gpu_timer;
 pub mod graphics;
 mod offscreen;
 pub mod pixels_renderer;
@@ -61,24 +62,11 @@ impl<G: GameLogic> HeadlessRunner<G> {
         self.frame = self.frame.saturating_add(1);
         self.frame
     }
-
-    pub fn step_profiled<P: profiling::Profiler>(
-        &mut self,
-        input: G::Input,
-        profiler: &mut P,
-    ) -> usize {
-        let start = std::time::Instant::now();
-        let frame = self.step(input);
-        profiler.on_step(frame, start.elapsed());
-        frame
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profiling::Profiler;
-    use std::time::Duration;
 
     struct Additive;
 
@@ -102,25 +90,5 @@ mod tests {
         assert_eq!(runner.step(2), 1);
         assert_eq!(runner.step(3), 2);
         assert_eq!(runner.state(), &10);
-    }
-
-    #[test]
-    fn runner_step_profiled_calls_profiler_hook() {
-        #[derive(Default)]
-        struct Capture(Vec<usize>);
-
-        impl Profiler for Capture {
-            fn on_step(&mut self, frame: usize, _elapsed: Duration) {
-                self.0.push(frame);
-            }
-        }
-
-        let mut runner = HeadlessRunner::new(Additive);
-        let mut capture = Capture::default();
-
-        assert_eq!(runner.step(1), 1);
-        assert_eq!(runner.step_profiled(2, &mut capture), 2);
-        assert_eq!(runner.state(), &3);
-        assert_eq!(capture.0, [2]);
     }
 }

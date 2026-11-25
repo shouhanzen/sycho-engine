@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use engine::surface::SurfaceSize;
+
 use game::state::GameState;
 use game::tetris_core::{Piece, TetrisCore};
 use game::view::GameView;
@@ -18,6 +20,10 @@ fn game_state_round_trip_preserves_state() {
     state.gravity_interval = Duration::from_millis(400);
     state.gravity_elapsed = Duration::from_millis(120);
     state.skilltree.progress.money = 25;
+    state.round_timer_disabled = true;
+    state.display.viewport = SurfaceSize::new(800, 600);
+    state.display.show_round_timer = false;
+    state.display.dig_camera.update(2, Duration::ZERO, false);
 
     let json = serde_json::to_string(&state).expect("serialize game state");
     let restored: GameState = serde_json::from_str(&json).expect("deserialize game state");
@@ -25,6 +31,9 @@ fn game_state_round_trip_preserves_state() {
     assert_eq!(restored.view, state.view);
     assert_eq!(restored.tetris.snapshot(), state.tetris.snapshot());
     assert_eq!(restored.round_timer, state.round_timer);
+    assert!(restored.round_timer_disabled);
+    assert_eq!(restored.display, state.display);
+    assert!(restored.display.world_offset_y_px() > 0);
     assert_eq!(restored.gravity_interval, state.gravity_interval);
     assert_eq!(restored.gravity_elapsed, state.gravity_elapsed);
     assert_eq!(

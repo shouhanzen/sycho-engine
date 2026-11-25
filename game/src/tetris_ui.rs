@@ -18,7 +18,7 @@ mod menus;
 pub use menus::{
     GameOverMenuLayout, GameOverMenuView, MainMenuLayout, MainMenuView, PauseMenuLayout,
     PauseMenuView, SettingsMenuLayout, SettingsMenuView, draw_game_over_menu, draw_main_menu,
-    draw_pause_menu, draw_settings_menu,
+    draw_pause_menu,
 };
 
 const COLOR_PANEL_BG: [u8; 4] = [16, 16, 22, 255];

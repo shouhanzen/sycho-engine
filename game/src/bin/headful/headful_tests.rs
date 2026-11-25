@@ -9,7 +9,6 @@ fn make_test_headful(view: GameView) -> (HeadfulApp, HeadlessRunner<TetrisLogic>
         DEFAULT_GRAVITY_INTERVAL,
     );
     app.sfx = None;
-    app.dig_camera = DigCameraController::new_with_config(true, DigCameraConfig::default());
 
     let mut runner = HeadlessRunner::new(base_logic);
     {
@@ -33,6 +32,7 @@ fn assert_approx_eq(actual: f32, expected: f32) {
 }
 
 fn force_depth_reveal(core: &mut TetrisCore) {
+    core.set_depth_wall_defs(Vec::new());
     let target_y = 0;
     let depth_before = core.background_depth_rows();
     for x in 0..BOARD_WIDTH {
@@ -78,6 +78,25 @@ fn input_frame_for_keys(
         input.keys_released.insert(key);
     }
     input
+}
+
+#[test]
+fn header_master_volume_applies_to_music_and_sound_effects() {
+    let (mut app, _) = make_test_headful(GameView::MainMenu);
+    app.player_settings.audio = AudioSettings::default();
+    app.player_settings.audio.music_volume = 0.5;
+    app.player_settings.audio.sfx_volume = 0.75;
+
+    app.set_master_volume(0, false);
+    assert_eq!(app.master_volume(), Some(0));
+    assert_eq!(app.player_settings.audio.effective_music_gain(), 0.0);
+    assert_eq!(app.player_settings.audio.effective_sfx_gain(), 0.0);
+
+    app.set_master_volume(40, false);
+    assert_eq!(app.master_volume(), Some(40));
+    assert_approx_eq(app.player_settings.audio.effective_music_gain(), 0.2);
+    assert_approx_eq(app.player_settings.audio.effective_sfx_gain(), 0.3);
+    assert!(app.settings_dirty);
 }
 
 #[test]
@@ -294,47 +313,50 @@ fn reset_path_zeroes_dig_camera_state() {
     let (mut app, mut runner) = make_test_headful(GameView::Tetris { paused: false });
 
     let initial_depth = runner.state().tetris.background_depth_rows();
-    app.dig_camera.reset(initial_depth);
+    runner.state_mut().display.dig_camera.reset(initial_depth);
     force_depth_reveal(&mut runner.state_mut().tetris);
-    app.update_dig_camera_state(&runner, Duration::from_millis(16));
+    update_dig_camera(runner.state_mut(), Duration::from_millis(16));
     assert!(
-        app.dig_camera.offset_y_px() > 0.0,
+        runner.state().display.dig_camera.offset_y_px() > 0.0,
         "expected depth gain to create camera impulse before reset"
     );
 
     app.reset_active_run(&mut runner);
 
-    assert_approx_eq(app.dig_camera.offset_y_px(), 0.0);
+    assert_approx_eq(runner.state().display.dig_camera.offset_y_px(), 0.0);
     assert_eq!(
-        app.dig_camera.last_depth_rows(),
+        runner.state().display.dig_camera.last_depth_rows(),
         runner.state().tetris.background_depth_rows()
     );
 }
 
 #[test]
 fn paused_state_holds_dig_camera_motion_and_depth_impulses() {
-    let (mut app, mut runner) = make_test_headful(GameView::Tetris { paused: false });
+    let (_, mut runner) = make_test_headful(GameView::Tetris { paused: false });
 
-    app.dig_camera
-        .reset(runner.state().tetris.background_depth_rows());
+    let initial_depth = runner.state().tetris.background_depth_rows();
+    runner.state_mut().display.dig_camera.reset(initial_depth);
     force_depth_reveal(&mut runner.state_mut().tetris);
-    app.update_dig_camera_state(&runner, Duration::from_millis(16));
-    let offset_before_pause = app.dig_camera.offset_y_px();
+    update_dig_camera(runner.state_mut(), Duration::from_millis(16));
+    let offset_before_pause = runner.state().display.dig_camera.offset_y_px();
     assert!(offset_before_pause > 0.0);
 
     runner.state_mut().view = GameView::Tetris { paused: true };
     force_depth_reveal(&mut runner.state_mut().tetris);
-    app.update_dig_camera_state(&runner, Duration::from_secs(1));
-    assert_approx_eq(app.dig_camera.offset_y_px(), offset_before_pause);
+    update_dig_camera(runner.state_mut(), Duration::from_secs(1));
+    assert_approx_eq(
+        runner.state().display.dig_camera.offset_y_px(),
+        offset_before_pause,
+    );
     assert_eq!(
-        app.dig_camera.last_depth_rows(),
+        runner.state().display.dig_camera.last_depth_rows(),
         runner.state().tetris.background_depth_rows()
     );
 
     runner.state_mut().view = GameView::Tetris { paused: false };
-    app.update_dig_camera_state(&runner, Duration::from_millis(300));
+    update_dig_camera(runner.state_mut(), Duration::from_millis(300));
     assert!(
-        app.dig_camera.offset_y_px() < offset_before_pause,
+        runner.state().display.dig_camera.offset_y_px() < offset_before_pause,
         "expected resume to settle camera toward zero"
     );
 }
@@ -406,7 +428,7 @@ fn grounded_move_stalls_even_when_gravity_tick_is_due_same_frame() {
             .set_current_piece_for_test(Piece::O, Vec2i::new(4, 1), 0);
     }
 
-    runner.step_profiled(InputAction::MoveRight, &mut app.debug_hud);
+    runner.step(InputAction::MoveRight);
     app.apply_gravity_steps(&mut runner, Duration::from_millis(1));
 
     assert_eq!(runner.state().tetris.current_piece_pos(), Vec2i::new(5, 1));
@@ -426,8 +448,22 @@ fn debug_hud_timer_toggle_disables_timer_tick_and_timeout() {
     let (mut app, mut runner) = make_test_headful(GameView::Tetris { paused: false });
     runner.state_mut().round_timer = RoundTimer::new(Duration::from_millis(200));
 
-    app.debug_hud.toggle_round_timer_disabled();
-    app.update_round_timer_and_game_over(&mut runner, Duration::from_secs(1));
+    use engine::surface::SurfaceSize;
+
+    let size = SurfaceSize::new(960, 640);
+    let mut ctx = AppContext { surface_size: size };
+    let toggle = |hud: &DebugHud| {
+        let rect = hud.timer_toggle_rect(size.width, size.height).unwrap();
+        InputFrame {
+            mouse_pos: Some((rect.x + 1, rect.y + 1)),
+            mouse_buttons_pressed: [MouseButton::Left].into(),
+            ..InputFrame::default()
+        }
+    };
+
+    let input = toggle(&app.debug_hud);
+    app.update_state(&mut runner, &input, Duration::from_secs(1), &mut ctx);
+    assert!(runner.state().round_timer_disabled);
     assert!(
         matches!(runner.state().view, GameView::Tetris { paused: false }),
         "timer-disabled mode should not trigger timeout game over"
@@ -438,8 +474,9 @@ fn debug_hud_timer_toggle_disables_timer_tick_and_timeout() {
         "timer-disabled mode should not advance timer elapsed"
     );
 
-    app.debug_hud.toggle_round_timer_disabled();
-    app.update_round_timer_and_game_over(&mut runner, Duration::from_millis(250));
+    let input = toggle(&app.debug_hud);
+    app.update_state(&mut runner, &input, Duration::from_millis(250), &mut ctx);
+    assert!(!runner.state().round_timer_disabled);
     assert!(
         matches!(runner.state().view, GameView::GameOver),
         "re-enabled timer should restore timeout game over behavior"
@@ -453,7 +490,7 @@ fn gravity_timeline_is_deterministic_for_same_inputs() {
         setup_grounded_lock_delay_case(&mut runner);
 
         app.apply_gravity_steps(&mut runner, Duration::from_millis(250));
-        runner.step_profiled(InputAction::MoveRight, &mut app.debug_hud);
+        runner.step(InputAction::MoveRight);
         app.apply_gravity_steps(&mut runner, Duration::from_millis(250));
         runner.state_mut().view = GameView::Tetris { paused: true };
         app.apply_gravity_steps(&mut runner, Duration::from_millis(500));
@@ -479,6 +516,12 @@ fn timeline_restore_keeps_the_board_score_and_timers_then_advances_live() {
     let fraction = Duration::from_nanos(200_123_456);
     app.update_round_timer_and_game_over(&mut runner, fraction);
     app.apply_gravity_steps(&mut runner, fraction);
+    runner
+        .state_mut()
+        .display
+        .dig_camera
+        .update(2, Duration::ZERO, false);
+    let display = runner.state().display;
     let saved = serde_json::to_vec(runner.state()).unwrap();
 
     let mut restored = app.restore_state(serde_json::from_slice(&saved).unwrap());
@@ -486,6 +529,7 @@ fn timeline_restore_keeps_the_board_score_and_timers_then_advances_live() {
     assert_eq!(serde_json::to_value(restored.state()).unwrap(), expected);
     assert_eq!(restored.state().round_timer.elapsed(), fraction);
     assert_eq!(restored.state().gravity_elapsed, fraction);
+    assert_eq!(restored.state().display, display);
 
     let board_before = restored.state().tetris.snapshot();
     restored.step(InputAction::HardDrop);
@@ -520,7 +564,7 @@ fn line_clear_delay_progresses_with_frame_dt_instead_of_waiting_for_gravity_inte
             .set_current_piece_for_test(Piece::O, Vec2i::new(4, 1), 0);
     }
 
-    runner.step_profiled(InputAction::HardDrop, &mut app.debug_hud);
+    runner.step(InputAction::HardDrop);
     assert!(runner.state().tetris.is_line_clear_active());
     assert_eq!(runner.state().tetris.lines_cleared(), 0);
 
@@ -546,7 +590,7 @@ fn one_tick_menu_click_uses_the_current_layout_and_records_both_edges() {
     let (mut app, mut game) = make_test_headful(GameView::MainMenu);
     let size = SurfaceSize::new(1000, 680);
     let mut ctx = AppContext { surface_size: size };
-    let layout = GameUiLayout::compute(game.state(), size, false);
+    let layout = GameUiLayout::compute(game.state(), size);
     let point = (0..size.height)
         .find_map(|y| {
             let pointer = (size.width / 2, y);
@@ -566,13 +610,53 @@ fn one_tick_menu_click_uses_the_current_layout_and_records_both_edges() {
     assert!(state.view.is_tetris_playing());
     let saved = serde_json::to_vec(state).unwrap();
     let restored: GameState = serde_json::from_slice(&saved).unwrap();
+    assert_eq!(restored.display.viewport, size);
+    assert_eq!(restored.pointer(), Some(point));
     let tap = restored.input.unwrap();
     assert!(tap.buttons_down.is_empty());
     assert_eq!(tap.buttons_pressed, [MouseButton::Left]);
     assert_eq!(tap.buttons_released, [MouseButton::Left]);
-    assert_eq!(tap.pointer_at(size), Some(point));
-    assert_eq!(
-        tap.pointer_at(SurfaceSize::new(500, 340)),
-        Some((point.0 / 2, point.1 / 2))
+}
+
+#[test]
+fn restored_settings_keeps_its_values_and_can_be_closed_with_the_mouse() {
+    let (mut app, mut runner) = make_test_headful(GameView::MainMenu);
+    let size = runner.state().display.viewport;
+    let mut ctx = AppContext { surface_size: size };
+    app.player_settings.gameplay.show_round_timer = true;
+    app.process_keyboard_frame(
+        &mut runner,
+        &input_frame_for_keys(&[VirtualKeyCode::O], &[VirtualKeyCode::O], &[]),
+        Instant::now(),
     );
+    let overlay = runner.state_mut().settings_overlay.as_mut().unwrap();
+    overlay.gameplay.show_round_timer = false;
+    let saved = serde_json::to_vec(runner.state()).unwrap();
+    let mut restored = app.restore_state(serde_json::from_slice(&saved).unwrap());
+
+    app.update_state(
+        &mut restored,
+        &InputFrame::default(),
+        Duration::ZERO,
+        &mut ctx,
+    );
+    assert!(!restored.state().display.show_round_timer);
+    let layout = GameUiLayout::compute(restored.state(), size);
+    let back = layout.settings.unwrap().back_button;
+    let point = (back.x + back.w / 2, back.y + back.h / 2);
+    assert_eq!(
+        layout.action_at(restored.state(), point),
+        Some(GameUiAction::CloseSettings)
+    );
+
+    let click = InputFrame {
+        mouse_pos: Some(point),
+        mouse_buttons_pressed: [MouseButton::Left].into(),
+        mouse_buttons_released: [MouseButton::Left].into(),
+        ..InputFrame::default()
+    };
+    app.update_state(&mut restored, &click, Duration::ZERO, &mut ctx);
+    assert!(restored.state().settings_overlay.is_none());
+    assert!(restored.state().display.show_round_timer);
+    assert_eq!(restored.state().view, GameView::MainMenu);
 }

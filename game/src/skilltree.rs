@@ -6,6 +6,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::persistence::save_json;
 use crate::tetris_core::Vec2i;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -314,13 +315,11 @@ pub struct SkillTreeRuntime {
     pub progress: SkillTreeProgress,
 
     pub def_path: Option<PathBuf>,
-    pub progress_path: PathBuf,
 
     pub camera: SkillTreeCamera,
     pub editor: SkillTreeEditorState,
 
     editor_history: SkillTreeEditorHistory,
-    timeline_managed_progress: bool,
 
     // Cached indices (rebuilt on load/edit).
     id_to_index: HashMap<String, usize>,
@@ -350,11 +349,9 @@ impl SkillTreeRuntime {
             def: SkillTreeDef::default(),
             progress: SkillTreeProgress::default(),
             def_path: None,
-            progress_path: default_progress_path(),
             camera: SkillTreeCamera::default(),
             editor: SkillTreeEditorState::default(),
             editor_history: SkillTreeEditorHistory::default(),
-            timeline_managed_progress: false,
             id_to_index: HashMap::new(),
             unlocked_set: HashSet::new(),
         };
@@ -376,11 +373,9 @@ impl SkillTreeRuntime {
             def: snapshot.def,
             progress: snapshot.progress,
             def_path: None,
-            progress_path: default_progress_path(),
             camera: snapshot.camera,
             editor: snapshot.editor,
             editor_history: SkillTreeEditorHistory::default(),
-            timeline_managed_progress: false,
             id_to_index: HashMap::new(),
             unlocked_set: HashSet::new(),
         };
@@ -390,18 +385,13 @@ impl SkillTreeRuntime {
 
     pub fn load_default() -> Self {
         let (def, def_path, load_warning) = load_def_from_default_path();
-        let progress_path = default_progress_path();
-        let progress = load_progress(&progress_path).unwrap_or_default();
-
         let mut rt = Self {
             def,
-            progress,
+            progress: SkillTreeProgress::default(),
             def_path,
-            progress_path,
             camera: SkillTreeCamera::default(),
             editor: SkillTreeEditorState::default(),
             editor_history: SkillTreeEditorHistory::default(),
-            timeline_managed_progress: false,
             id_to_index: HashMap::new(),
             unlocked_set: HashSet::new(),
         };
@@ -556,17 +546,14 @@ impl SkillTreeRuntime {
             self.unlocked_set.insert(id.to_string());
             self.progress.unlocked.push(id.to_string());
         }
-        self.persist_progress();
         true
     }
 
     pub fn add_money(&mut self, amount: u32) {
         self.progress.money = self.progress.money.saturating_add(amount);
-        self.persist_progress();
     }
 
-    pub(crate) fn use_timeline_progress(&mut self) {
-        self.timeline_managed_progress = true;
+    pub fn restore_definition_path(&mut self) {
         if self.def_path.is_none() {
             self.def_path = std::env::var_os("ROLLOUT_SKILLTREE_PATH")
                 .map(PathBuf::from)
@@ -576,18 +563,11 @@ impl SkillTreeRuntime {
         }
     }
 
-    fn persist_progress(&self) {
-        if !self.timeline_managed_progress {
-            let _ = save_progress(&self.progress_path, &self.progress);
-        }
-    }
-
     pub fn save_def(&self) -> std::io::Result<()> {
         let Some(path) = self.def_path.as_ref() else {
             return Ok(());
         };
-        let json = serde_json::to_string_pretty(&self.def).unwrap_or_else(|_| "{}".to_string());
-        atomic_write(path, json.as_bytes())
+        save_json(path, &self.def)
     }
 
     pub fn reload_def(&mut self) {
@@ -1116,47 +1096,6 @@ fn load_def(path: &Path) -> Result<SkillTreeDef, std::io::Error> {
     Ok(def)
 }
 
-fn default_progress_path() -> PathBuf {
-    if let Ok(p) = std::env::var("ROLLOUT_SKILLTREE_PROGRESS_PATH") {
-        return PathBuf::from(p);
-    }
-
-    // `CARGO_MANIFEST_DIR` is `.../rollout_engine/game`; the workspace `target/` lives at `..`.
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("target")
-        .join("skilltree_progress.json")
-}
-
-fn load_progress(path: &Path) -> Result<SkillTreeProgress, std::io::Error> {
-    let bytes = fs::read(path)?;
-    let p: SkillTreeProgress = serde_json::from_slice(&bytes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    Ok(p)
-}
-
-fn save_progress(path: &Path, progress: &SkillTreeProgress) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let json = serde_json::to_string_pretty(progress).unwrap_or_else(|_| "{}".to_string());
-    atomic_write(path, json.as_bytes())
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes)?;
-    match fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            // Best-effort fallback for Windows rename semantics (rename over an existing file can fail).
-            fs::copy(&tmp, path)?;
-            let _ = fs::remove_file(&tmp);
-            Ok(())
-        }
-    }
-}
-
 fn normalize_and_validate(def: &mut SkillTreeDef) {
     if def.version == 0 {
         def.version = 1;
@@ -1331,11 +1270,9 @@ mod tests {
             def,
             progress,
             def_path: None,
-            progress_path: PathBuf::new(),
             camera: SkillTreeCamera::default(),
             editor: SkillTreeEditorState::default(),
             editor_history: SkillTreeEditorHistory::default(),
-            timeline_managed_progress: false,
             id_to_index: HashMap::new(),
             unlocked_set: HashSet::new(),
         };

@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::persistence::save_json;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct AudioSettings {
     pub master_volume: f32,
@@ -180,14 +182,7 @@ impl SettingsStore {
     }
 
     pub fn save(&self, settings: &PlayerSettings) -> io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
-        }
-        let text = serde_json::to_string_pretty(settings)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        fs::write(&self.path, text)
+        save_json(&self.path, settings)
     }
 }
 

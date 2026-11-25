@@ -82,6 +82,10 @@ impl GameView {
         matches!(self, GameView::Tetris { paused: false })
     }
 
+    pub fn can_open_settings(self) -> bool {
+        matches!(self, Self::MainMenu | Self::Tetris { paused: true })
+    }
+
     pub fn is_tetris_paused(self) -> bool {
         matches!(self, GameView::Tetris { paused: true })
     }

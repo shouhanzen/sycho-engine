@@ -1,8 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    fs,
     ops::Add,
-    path::{Path, PathBuf},
 };
 
 use serde::{Deserialize, Serialize};
@@ -86,17 +84,6 @@ impl Piece {
         Piece::MossSeed, // Moss seed 1x1
     ];
 
-    pub const LEGACY_ALL: [Piece; 8] = [
-        Piece::I,
-        Piece::O,
-        Piece::Glass,
-        Piece::T,
-        Piece::S,
-        Piece::Z,
-        Piece::J,
-        Piece::L,
-    ];
-
     pub fn all() -> Vec<Piece> {
         Self::ALL.to_vec()
     }
@@ -164,23 +151,6 @@ pub struct DepthWallDef {
     pub hp: u32,
     pub biome_from: String,
     pub biome_to: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct DepthWallProgress {
-    version: u32,
-    #[serde(default)]
-    broken_walls: HashSet<String>,
-}
-
-impl Default for DepthWallProgress {
-    fn default() -> Self {
-        Self {
-            version: 1,
-            broken_walls: HashSet::new(),
-        }
-    }
 }
 
 pub fn default_depth_wall_defs() -> Vec<DepthWallDef> {
@@ -310,10 +280,6 @@ pub struct TetrisCore {
     broken_walls: HashSet<String>,
     #[serde(default)]
     glass_shatter_count: u32,
-    #[serde(skip, default = "default_depth_wall_progress_path")]
-    depth_wall_progress_path: PathBuf,
-    #[serde(skip)]
-    timeline_managed_progress: bool,
 }
 
 fn default_bottomwell_rows() -> usize {
@@ -346,17 +312,6 @@ fn default_depth_wall_damage_per_line() -> u32 {
 
 fn default_depth_wall_multi_clear_bonus_percent() -> u32 {
     DEFAULT_DEPTH_WALL_MULTI_CLEAR_BONUS_PERCENT
-}
-
-fn default_depth_wall_progress_path() -> PathBuf {
-    if let Ok(p) = std::env::var("ROLLOUT_DEPTH_WALL_PROGRESS_PATH") {
-        return PathBuf::from(p);
-    }
-
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("target")
-        .join("depth_wall_progress.json")
 }
 
 impl TetrisCore {
@@ -409,8 +364,6 @@ impl TetrisCore {
             depth_wall_multi_clear_bonus_percent: DEFAULT_DEPTH_WALL_MULTI_CLEAR_BONUS_PERCENT,
             broken_walls: HashSet::new(),
             glass_shatter_count: 0,
-            depth_wall_progress_path: default_depth_wall_progress_path(),
-            timeline_managed_progress: false,
         }
     }
 
@@ -522,16 +475,7 @@ impl TetrisCore {
         self.depth_wall_multi_clear_bonus_percent = multi_bonus_percent.max(100);
     }
 
-    pub fn set_depth_wall_progress_path(&mut self, path: PathBuf) {
-        self.depth_wall_progress_path = path;
-    }
-
-    pub(crate) fn use_timeline_progress(&mut self) {
-        self.timeline_managed_progress = true;
-    }
-
-    pub fn inherit_timeline_progress(&mut self, previous: &Self) {
-        self.use_timeline_progress();
+    pub fn inherit_depth_wall_progress(&mut self, previous: &Self) {
         self.broken_walls.clone_from(&previous.broken_walls);
     }
 
@@ -589,7 +533,6 @@ impl TetrisCore {
         self.active_wall_hp_remaining = 0;
         self.depth_progress_paused = false;
         self.glass_shatter_count = 0;
-        self.reload_depth_wall_progress();
 
         if self.bottomwell_enabled {
             self.prefill_bottomwell();
@@ -1632,9 +1575,6 @@ impl TetrisCore {
         self.active_wall_hp_remaining = 0;
         self.depth_progress_paused = false;
         self.broken_walls.insert(wall_id);
-        if !self.timeline_managed_progress {
-            let _ = self.save_depth_wall_progress();
-        }
     }
 
     /// Ensure the bottomwell floor is maintained — bottom `bottomwell_rows`
@@ -1679,22 +1619,6 @@ impl TetrisCore {
             cell,
             CELL_DIRT | CELL_GARBAGE | CELL_STONE | CELL_ORE | CELL_COIN | CELL_GRASS
         )
-    }
-
-    fn reload_depth_wall_progress(&mut self) {
-        if self.timeline_managed_progress {
-            return;
-        }
-        let progress = load_depth_wall_progress(&self.depth_wall_progress_path).unwrap_or_default();
-        self.broken_walls = progress.broken_walls;
-    }
-
-    fn save_depth_wall_progress(&self) -> std::io::Result<()> {
-        let progress = DepthWallProgress {
-            version: 1,
-            broken_walls: self.broken_walls.clone(),
-        };
-        save_depth_wall_progress(&self.depth_wall_progress_path, &progress)
     }
 
     fn place_piece(&mut self) {
@@ -1971,37 +1895,6 @@ fn line_clear_points(lines: u32) -> u32 {
     base.saturating_add(rem_points)
 }
 
-fn load_depth_wall_progress(path: &Path) -> Result<DepthWallProgress, std::io::Error> {
-    let bytes = fs::read(path)?;
-    let mut progress: DepthWallProgress = serde_json::from_slice(&bytes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    if progress.version == 0 {
-        progress.version = 1;
-    }
-    Ok(progress)
-}
-
-fn save_depth_wall_progress(path: &Path, progress: &DepthWallProgress) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let json = serde_json::to_string_pretty(progress).unwrap_or_else(|_| "{}".to_string());
-    atomic_write(path, json.as_bytes())
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes)?;
-    match fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            fs::copy(&tmp, path)?;
-            let _ = fs::remove_file(&tmp);
-            Ok(())
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Rng {
     state: u64,
@@ -2259,10 +2152,6 @@ mod piece_grid_tests {
 #[cfg(test)]
 mod bottomwell_tests {
     use super::*;
-    use std::{
-        process,
-        time::{SystemTime, UNIX_EPOCH},
-    };
 
     fn make_bottomwell_core(seed: u64) -> TetrisCore {
         let mut core = TetrisCore::new(seed);
@@ -2296,23 +2185,10 @@ mod bottomwell_tests {
         }
     }
 
-    fn unique_progress_path(test_name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        std::env::temp_dir().join(format!(
-            "sycho_depth_wall_{test_name}_{}_{}.json",
-            process::id(),
-            nanos
-        ))
-    }
-
-    fn make_wall_test_core(progress_path: PathBuf, hp: u32) -> TetrisCore {
+    fn make_wall_test_core(hp: u32) -> TetrisCore {
         let mut core = TetrisCore::new(7);
         core.set_available_pieces(Piece::all());
         core.set_bottomwell_enabled(true);
-        core.set_depth_wall_progress_path(progress_path);
         core.set_depth_wall_defs(vec![DepthWallDef {
             id: "test_wall".to_string(),
             depth_trigger: (DEFAULT_BOTTOMWELL_ROWS as u64).saturating_add(1),
@@ -2664,8 +2540,7 @@ mod bottomwell_tests {
 
     #[test]
     fn wall_activates_at_trigger_depth_and_pauses_reveal() {
-        let progress_path = unique_progress_path("activation");
-        let mut core = make_wall_test_core(progress_path.clone(), 8);
+        let mut core = make_wall_test_core(8);
         let depth_before = core.earth_depth();
 
         fill_clearable_row(&mut core);
@@ -2678,15 +2553,11 @@ mod bottomwell_tests {
             depth_before,
             "depth should stop advancing as soon as the wall activates"
         );
-
-        let _ = std::fs::remove_file(&progress_path);
-        let _ = std::fs::remove_file(progress_path.with_extension("tmp"));
     }
 
     #[test]
     fn active_wall_damage_breaks_and_unpauses_depth_progression() {
-        let progress_path = unique_progress_path("damage_break");
-        let mut core = make_wall_test_core(progress_path.clone(), 8);
+        let mut core = make_wall_test_core(8);
 
         // Activate wall using a bottomwell clear.
         fill_clearable_row(&mut core);
@@ -2717,26 +2588,22 @@ mod bottomwell_tests {
             core.earth_depth() >= depth_at_activation + 1,
             "depth progression should resume on the clear after the break"
         );
-
-        let _ = std::fs::remove_file(&progress_path);
-        let _ = std::fs::remove_file(progress_path.with_extension("tmp"));
     }
 
     #[test]
-    fn broken_walls_persist_and_are_skipped_on_new_runs() {
-        let progress_path = unique_progress_path("persist");
+    fn broken_walls_carry_forward_from_a_restored_state() {
+        let mut first_run = make_wall_test_core(4);
+        fill_clearable_row(&mut first_run);
+        assert_eq!(first_run.clear_lines(), 1);
+        fill_clearable_non_bottomwell_row(&mut first_run);
+        assert_eq!(first_run.clear_lines(), 1);
+        assert!(first_run.broken_walls.contains("test_wall"));
 
-        {
-            let mut first_run = make_wall_test_core(progress_path.clone(), 4);
-            fill_clearable_row(&mut first_run);
-            assert_eq!(first_run.clear_lines(), 1);
-            fill_clearable_non_bottomwell_row(&mut first_run);
-            assert_eq!(first_run.clear_lines(), 1);
-            assert_eq!(first_run.active_wall_id(), None);
-            assert!(!first_run.depth_progress_paused());
-        }
-
-        let mut second_run = make_wall_test_core(progress_path.clone(), 4);
+        let snapshot = serde_json::to_value(&first_run).unwrap();
+        let restored = serde_json::from_value(snapshot).unwrap();
+        let mut second_run = make_wall_test_core(4);
+        assert!(second_run.broken_walls.is_empty());
+        second_run.inherit_depth_wall_progress(&restored);
         let depth_before = second_run.earth_depth();
         fill_clearable_row(&mut second_run);
         assert_eq!(second_run.clear_lines(), 1);
@@ -2747,8 +2614,5 @@ mod bottomwell_tests {
             depth_before + 1,
             "a previously broken wall should no longer block progression"
         );
-
-        let _ = std::fs::remove_file(&progress_path);
-        let _ = std::fs::remove_file(progress_path.with_extension("tmp"));
     }
 }

@@ -1,25 +1,18 @@
 use std::error::Error;
-use std::io::{self, BufReader};
-use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
-use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
-use engine::embedded::{
-    DEFAULT_PREVIEW_SIZE, EditorEvent, PreviewFrame, TimelineStatus, write_message,
-};
+use engine::embedded::{EditorEvent, TimelineStatus};
 #[cfg(target_os = "macos")]
-use engine::shared_surface::{self, SurfaceInbox};
+use engine::shared_surface;
 use engine::surface::SurfaceSize;
 use engine::timeline::TimelineCommand;
-use pixels::{Pixels, PixelsBuilder, SurfaceTexture};
+use pixels::{PixelsBuilder, SurfaceTexture, wgpu};
 use winit::dpi::LogicalSize;
 use winit::event::{
     ElementState, Event, ModifiersState, MouseButton, MouseScrollDelta, VirtualKeyCode, WindowEvent,
 };
-use winit::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
+use winit::event_loop::{ControlFlow, EventLoopBuilder};
 use winit::platform::run_return::EventLoopExtRunReturn;
 use winit::window::{CursorIcon, WindowBuilder};
 
@@ -27,260 +20,33 @@ use winit::window::{CursorIcon, WindowBuilder};
 mod board;
 #[path = "canvas.rs"]
 mod canvas;
+#[path = "connection.rs"]
+mod connection;
+#[path = "profiler.rs"]
+mod profiler;
+#[path = "render.rs"]
+mod render;
+#[path = "text.rs"]
+mod text;
 
-use board::{Board, Bounds, Edges, Panel, Point, TITLE_HEIGHT, TimelineLayout, Transport};
-use canvas::{Canvas, Chrome, viewport};
+use board::{
+    Board, Bounds, Edges, Panel, PanelMenu, Point, TITLE_HEIGHT, TimelineLayout, Transport,
+    viewport,
+};
+use canvas::Chrome;
+use connection::Snapshot;
+pub use connection::{Bridge, Phase};
+use profiler::ProfileLayout;
+use render::{FrameRequest, RenderWorker};
 
 const BOARD_PATH: &str = ".sycho-board.json";
-const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const SEEK_INTERVAL: Duration = Duration::from_millis(55);
 const SAVE_DELAY: Duration = Duration::from_millis(350);
 const PANEL_DRAG_THRESHOLD: f64 = 6.0;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Phase {
-    Building,
-    Reconnecting,
-    Running,
-    Failed,
-    GpuFailed,
-    ReloadFailed,
-    Exited,
-}
-
-#[derive(Clone)]
-pub struct Bridge(Arc<Mutex<Shared>>);
-
-struct Shared {
-    generation: Option<u64>,
-    phase: Phase,
-    input: Option<Sender<EditorEvent>>,
-    game_size: SurfaceSize,
-    frame: Option<Arc<PreviewFrame>>,
-    redraw: Option<EventLoopProxy<()>>,
-    redraw_pending: bool,
-    #[cfg(target_os = "macos")]
-    gpu_device: Option<u64>,
-}
-
-impl Shared {
-    fn request_redraw(&mut self) {
-        if !self.redraw_pending
-            && let Some(redraw) = &self.redraw
-        {
-            self.redraw_pending = redraw.send_event(()).is_ok();
-        }
-    }
-}
-
-#[derive(Clone)]
-struct Snapshot {
-    generation: Option<u64>,
-    phase: Phase,
-    connected: bool,
-    frame: Option<Arc<PreviewFrame>>,
-}
-
-impl Snapshot {
-    fn timeline(&self) -> TimelineStatus {
-        self.frame
-            .as_ref()
-            .map_or(TimelineStatus::default(), |frame| frame.status)
-    }
-}
-
-impl Bridge {
-    pub fn new() -> Self {
-        Self(Arc::new(Mutex::new(Shared {
-            generation: None,
-            phase: Phase::Building,
-            input: None,
-            game_size: DEFAULT_PREVIEW_SIZE,
-            frame: None,
-            redraw: None,
-            redraw_pending: false,
-            #[cfg(target_os = "macos")]
-            gpu_device: None,
-        })))
-    }
-
-    pub fn set_phase(&self, phase: Phase) {
-        let mut shared = self.0.lock().expect("editor bridge");
-        shared.phase = phase;
-        shared.request_redraw();
-    }
-
-    pub fn disconnect(&self, phase: Phase) {
-        let mut shared = self.0.lock().expect("editor bridge");
-        shared.generation = None;
-        shared.phase = phase;
-        shared.input = None;
-        shared.request_redraw();
-    }
-
-    pub fn endpoint(&self, generation: u64) -> io::Result<(SocketAddr, Option<String>)> {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-        listener.set_nonblocking(true)?;
-        let address = listener.local_addr()?;
-        let transport = None;
-        #[cfg(target_os = "macos")]
-        let (inbox, transport) = {
-            let device = self.0.lock().expect("editor bridge").gpu_device;
-            match device.map(SurfaceInbox::open) {
-                Some(Ok((inbox, endpoint))) => (Some(inbox), Some(endpoint)),
-                Some(Err(err)) => {
-                    eprintln!("could not register shared preview surfaces, using RGBA: {err}");
-                    (None, None)
-                }
-                None => (None, transport),
-            }
-        };
-        {
-            let mut shared = self.0.lock().expect("editor bridge");
-            shared.generation = Some(generation);
-            shared.phase = Phase::Reconnecting;
-            shared.input = None;
-            shared.request_redraw();
-        }
-        let bridge = self.clone();
-        thread::spawn(move || {
-            loop {
-                if bridge.0.lock().expect("editor bridge").generation != Some(generation) {
-                    return;
-                }
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        bridge.read_game(
-                            stream,
-                            generation,
-                            #[cfg(target_os = "macos")]
-                            inbox.as_ref(),
-                        );
-                        return;
-                    }
-                    Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                        thread::sleep(ACCEPT_POLL_INTERVAL);
-                    }
-                    Err(err) => {
-                        eprintln!("editor preview connection failed: {err}");
-                        bridge.disconnect_generation(generation);
-                        return;
-                    }
-                }
-            }
-        });
-        Ok((address, transport))
-    }
-
-    fn disconnect_generation(&self, generation: u64) {
-        let mut shared = self.0.lock().expect("editor bridge");
-        if shared.generation == Some(generation) {
-            shared.input = None;
-            if matches!(shared.phase, Phase::Running | Phase::Reconnecting) {
-                shared.phase = Phase::Reconnecting;
-            }
-            shared.request_redraw();
-        }
-    }
-
-    fn read_game(
-        &self,
-        stream: TcpStream,
-        generation: u64,
-        #[cfg(target_os = "macos")] inbox: Option<&SurfaceInbox>,
-    ) {
-        // Accepted sockets can inherit the listener's nonblocking mode on macOS.
-        if let Err(err) = stream
-            .set_nonblocking(false)
-            .and_then(|()| stream.set_nodelay(true))
-        {
-            eprintln!("editor preview setup failed: {err}");
-            return;
-        }
-        let Ok(mut writer) = stream.try_clone() else {
-            return;
-        };
-        if writer
-            .set_write_timeout(Some(Duration::from_secs(3)))
-            .is_err()
-        {
-            return;
-        }
-        let (input, events) = mpsc::channel();
-        thread::spawn(move || {
-            for event in events {
-                if write_message(&mut writer, &event).is_err() {
-                    let _ = writer.shutdown(Shutdown::Both);
-                    break;
-                }
-            }
-        });
-        let mut reader = BufReader::new(stream);
-        #[cfg(target_os = "macos")]
-        let release = input.clone();
-        let mut input = Some(input);
-        loop {
-            #[cfg(target_os = "macos")]
-            let incoming = PreviewFrame::read_with_surfaces(&mut reader, inbox, &release);
-            #[cfg(not(target_os = "macos"))]
-            let incoming = PreviewFrame::read(&mut reader).map(Some);
-            let frame = match incoming {
-                Ok(Some(frame)) => frame,
-                Ok(None) => continue,
-                Err(err) => {
-                    if !matches!(
-                        err.kind(),
-                        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
-                    ) {
-                        eprintln!("editor could not read the game preview: {err}");
-                    }
-                    break;
-                }
-            };
-            let mut shared = self.0.lock().expect("editor bridge");
-            if shared.generation != Some(generation) {
-                break;
-            }
-            if let Some(input) = input.take() {
-                if frame.size != shared.game_size {
-                    let _ = input.send(EditorEvent::Resize(shared.game_size));
-                }
-                shared.input = Some(input);
-                if shared.phase == Phase::Reconnecting {
-                    shared.phase = Phase::Running;
-                }
-            }
-            shared.frame = Some(Arc::new(frame));
-            shared.request_redraw();
-        }
-        self.disconnect_generation(generation);
-    }
-
-    fn snapshot(&self) -> Snapshot {
-        let shared = self.0.lock().expect("editor bridge");
-        Snapshot {
-            generation: shared.generation,
-            phase: shared.phase,
-            connected: shared.input.is_some(),
-            frame: shared.frame.clone(),
-        }
-    }
-
-    fn send(&self, event: EditorEvent) {
-        if let Some(input) = &self.0.lock().expect("editor bridge").input {
-            let _ = input.send(event);
-        }
-    }
-
-    fn resize_game(&self, size: SurfaceSize) {
-        let mut shared = self.0.lock().expect("editor bridge");
-        if shared.game_size != size {
-            shared.game_size = size;
-            if let Some(input) = &shared.input {
-                let _ = input.send(EditorEvent::Resize(size));
-            }
-        }
-    }
+enum UiEvent {
+    PreviewChanged,
+    RenderStopped,
 }
 
 #[derive(Clone, Copy)]
@@ -307,6 +73,7 @@ enum Gesture {
         edges: Edges,
     },
     ZoomGame,
+    VolumeGame,
     Scrub,
 }
 
@@ -330,9 +97,61 @@ struct Interaction {
     last_seek: Option<Instant>,
     modifiers: ModifiersState,
     generation: Option<u64>,
+    volume_request: u64,
+    pending_volume: Option<(u64, u8)>,
+    menu_open: bool,
+    profile_click: Option<Point>,
+    window_size: Option<SurfaceSize>,
 }
 
 impl Interaction {
+    fn chrome(&self, board: Board, display: Display, game: &Snapshot) -> Chrome {
+        Chrome {
+            board,
+            size: display.logical(),
+            phase: game.phase,
+            connected: game.connected,
+            frame_size: game.frame.as_ref().map(|frame| frame.size),
+            master_volume: self.master_volume(game),
+            timeline: game.timeline(),
+            preview_focus: self.preview_focus,
+            hovered: self.hovered_button(board),
+            drag_ms: self.drag_ms,
+            dock_target: self.dock_candidate(board),
+            menu_open: self.menu_open,
+        }
+    }
+
+    fn master_volume(&self, game: &Snapshot) -> Option<u8> {
+        if !game.connected {
+            return None;
+        }
+        let volume = game.frame.as_ref()?.master_volume?;
+        let pending = self
+            .pending_volume
+            .filter(|&(request, _)| volume.request.is_none_or(|applied| applied < request));
+        Some(pending.map_or(volume.percent, |(_, percent)| percent))
+    }
+
+    fn set_master_volume(&mut self, bridge: &Bridge, percent: u8, commit: bool) {
+        self.volume_request += 1;
+        let request = self.volume_request;
+        self.pending_volume = Some((request, percent));
+        bridge.send(EditorEvent::MasterVolume {
+            percent,
+            request,
+            commit,
+        });
+    }
+
+    fn commit_volume(&mut self, bridge: &Bridge) {
+        if matches!(self.gesture, Some(Gesture::VolumeGame))
+            && let Some((_, percent)) = self.pending_volume
+        {
+            self.set_master_volume(bridge, percent, true);
+        }
+    }
+
     fn update_connection(&mut self, bridge: &Bridge, snapshot: &Snapshot, window_focused: bool) {
         let generation = snapshot.generation.filter(|_| snapshot.connected);
         if generation == self.generation {
@@ -340,7 +159,8 @@ impl Interaction {
         }
         self.generation = generation;
         self.pending_seek = None;
-        if matches!(self.gesture, Some(Gesture::Scrub)) {
+        self.pending_volume = None;
+        if matches!(self.gesture, Some(Gesture::Scrub | Gesture::VolumeGame)) {
             self.gesture = None;
             self.drag_ms = None;
         }
@@ -352,10 +172,20 @@ impl Interaction {
 
     fn game_point(&self, board: Board, snapshot: &Snapshot, dpi: f64) -> Option<(u32, u32)> {
         let cursor = self.cursor?;
+        if self.menu_open
+            || self.window_size.is_some_and(|size| {
+                !viewport(size).contains(cursor)
+                    || PanelMenu::new(size)
+                        .covers(self.menu_open)
+                        .any(|bounds| bounds.contains(cursor))
+            })
+        {
+            return None;
+        }
         let world = board.world_at(cursor);
         let size = snapshot.frame.as_ref()?.size;
         if board.panel_at(world) != Some(Panel::Game)
-            || (!board.timeline_docked && board.game.grip().contains(world))
+            || board.game_grip().is_some_and(|grip| grip.contains(world))
             || size != board.game_size(dpi)
         {
             return None;
@@ -428,6 +258,15 @@ impl Interaction {
             }
             (Some(Gesture::ZoomGame), Some(point)) => {
                 board.game_zoom = board.game_header().zoom_at(board.world_at(point).x);
+            }
+            (Some(Gesture::VolumeGame), Some(point)) => {
+                let percent = board.game_header().volume_at(board.world_at(point).x);
+                if self
+                    .pending_volume
+                    .is_none_or(|(_, previous)| previous != percent)
+                {
+                    self.set_master_volume(bridge, percent, false);
+                }
             }
             (Some(Gesture::Scrub), _) => self.seek_cursor(*board, snapshot.timeline()),
             _ if self.preview_focus => {
@@ -533,6 +372,7 @@ impl Interaction {
                 if self.dock_candidate(*board) {
                     board.dock_timeline();
                 }
+                self.commit_volume(bridge);
                 self.gesture = None;
             }
             if self.preview_buttons.contains(&button) {
@@ -545,6 +385,21 @@ impl Interaction {
             return;
         }
         let Some(point) = self.cursor else { return };
+        let menu = PanelMenu::new(display.logical());
+        if button == MouseButton::Left && menu.button.contains(point) {
+            self.set_preview_focus(bridge, false);
+            self.menu_open = !self.menu_open;
+            return;
+        }
+        if self.menu_open {
+            if button == MouseButton::Left
+                && let Some(panel) = menu.panel_at(point)
+            {
+                board.toggle_panel(panel, viewport(display.logical()));
+            }
+            self.menu_open = false;
+            return;
+        }
         let world = board.world_at(point);
         let panel = board.panel_at(world);
         if button == MouseButton::Middle || (panel.is_none() && button == MouseButton::Left) {
@@ -560,16 +415,29 @@ impl Interaction {
         let Some(panel) = panel else { return };
         let bounds = board.bounds(panel);
         if button == MouseButton::Left {
-            board.front = panel;
-            if panel == Panel::Game && board.game_header().hit_zoom(world) {
-                board.game_zoom = board.game_header().zoom_at(world.x);
-                self.gesture = Some(Gesture::ZoomGame);
+            board.raise(panel);
+            if panel == Panel::Profiler && ProfileLayout::new(bounds).live.contains(world) {
+                self.set_preview_focus(bridge, false);
+                self.profile_click = Some(world);
                 return;
+            }
+            if panel == Panel::Game {
+                let header = board.game_header();
+                if header.hit_zoom(world) {
+                    board.game_zoom = header.zoom_at(world.x);
+                    self.gesture = Some(Gesture::ZoomGame);
+                    return;
+                }
+                if header.hit_volume(world) && self.master_volume(snapshot).is_some() {
+                    self.set_master_volume(bridge, header.volume_at(world.x), false);
+                    self.gesture = Some(Gesture::VolumeGame);
+                    return;
+                }
             }
             if let Some(edges) = Edges::within(*board, panel, world) {
                 self.set_preview_focus(bridge, false);
                 // The Timeline keeps its height when the dock's outer edge is dragged.
-                let panel = if board.timeline_docked {
+                let panel = if board.timeline_docked && panel != Panel::Profiler {
                     Panel::Game
                 } else {
                     panel
@@ -612,6 +480,10 @@ impl Interaction {
             }
         } else if button == MouseButton::Left {
             self.set_preview_focus(bridge, false);
+            if panel == Panel::Profiler {
+                self.profile_click = Some(world);
+                return;
+            }
             if !snapshot.connected {
                 return;
             }
@@ -638,6 +510,12 @@ impl Interaction {
         key: VirtualKeyCode,
         state: ElementState,
     ) {
+        if self.menu_open && key == VirtualKeyCode::Escape {
+            if state == ElementState::Pressed {
+                self.menu_open = false;
+            }
+            return;
+        }
         if key == VirtualKeyCode::Key0 && (self.modifiers.logo() || self.modifiers.ctrl()) {
             if state == ElementState::Pressed {
                 self.set_preview_focus(bridge, false);
@@ -645,12 +523,14 @@ impl Interaction {
             }
         } else if key == VirtualKeyCode::Tab {
             if state == ElementState::Pressed {
-                self.set_preview_focus(bridge, !self.preview_focus);
-                board.front = if self.preview_focus {
-                    Panel::Game
-                } else {
-                    Panel::Timeline
-                };
+                self.set_preview_focus(bridge, !self.preview_focus && board.visible(Panel::Game));
+                if self.preview_focus {
+                    board.raise(Panel::Game);
+                } else if board.visible(Panel::Timeline) {
+                    board.raise(Panel::Timeline);
+                } else if board.visible(Panel::Profiler) {
+                    board.raise(Panel::Profiler);
+                }
             }
         } else if self.preview_focus {
             bridge.send(EditorEvent::Key(key, state));
@@ -692,7 +572,7 @@ impl Interaction {
         }
     }
 
-    fn cursor_icon(&self, board: Board) -> CursorIcon {
+    fn cursor_icon(&self, board: Board, snapshot: &Snapshot) -> CursorIcon {
         let edges = match self.gesture {
             Some(Gesture::Resize { edges, .. }) => Some(edges),
             Some(_) => return CursorIcon::Grabbing,
@@ -700,12 +580,32 @@ impl Interaction {
                 let Some(point) = self.cursor else {
                     return CursorIcon::Default;
                 };
+                if let Some(size) = self.window_size {
+                    let menu = PanelMenu::new(size);
+                    if menu
+                        .covers(self.menu_open)
+                        .any(|bounds| bounds.contains(point))
+                    {
+                        return CursorIcon::Hand;
+                    }
+                }
                 let world = board.world_at(point);
                 let Some(panel) = board.panel_at(world) else {
                     return CursorIcon::Grab;
                 };
-                if panel == Panel::Game && board.game_header().hit_zoom(world) {
-                    return CursorIcon::Hand;
+                if panel == Panel::Game {
+                    let header = board.game_header();
+                    if header.hit_zoom(world)
+                        || header.hit_volume(world) && self.master_volume(snapshot).is_some()
+                    {
+                        return CursorIcon::Hand;
+                    }
+                }
+                if panel == Panel::Profiler {
+                    let layout = ProfileLayout::new(board.profiler);
+                    if layout.live.contains(world) || layout.graph.contains(world) {
+                        return CursorIcon::Hand;
+                    }
                 }
                 let edges = Edges::within(board, panel, world);
                 if edges.is_none() && world.y < board.bounds(panel).y + TITLE_HEIGHT {
@@ -762,16 +662,10 @@ impl Display {
         )
     }
 
-    fn resize(
-        &mut self,
-        pixels: &mut Pixels,
-        size: winit::dpi::PhysicalSize<u32>,
-    ) -> Result<(), pixels::TextureError> {
+    fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
         if size.width != 0 && size.height != 0 {
-            pixels.resize_surface(size.width, size.height)?;
             self.surface = SurfaceSize::new(size.width, size.height);
         }
-        Ok(())
     }
 }
 
@@ -785,10 +679,11 @@ fn save_board(path: &Path, board: Board, saved: &mut Option<Board>) {
 }
 
 pub fn run(bridge: Bridge, game_name: &str, ready: impl FnOnce()) -> Result<(), Box<dyn Error>> {
-    let mut events = EventLoopBuilder::<()>::with_user_event().build();
+    let mut events = EventLoopBuilder::<UiEvent>::with_user_event().build();
     let window = WindowBuilder::new()
         .with_title(format!("Sycho Editor · {game_name}"))
         .with_inner_size(LogicalSize::new(1120.0, 850.0))
+        .with_maximized(true)
         .with_min_inner_size(LogicalSize::new(535.0, 390.0))
         .build(&events)?;
     let size = window.inner_size();
@@ -796,24 +691,45 @@ pub fn run(bridge: Bridge, game_name: &str, ready: impl FnOnce()) -> Result<(), 
         surface: SurfaceSize::new(size.width, size.height),
         dpi: window.scale_factor(),
     };
-    let builder = PixelsBuilder::new(1, 1, SurfaceTexture::new(size.width, size.height, &window));
     #[cfg(target_os = "macos")]
     let use_shared_surfaces = std::env::var("SYCHO_PREVIEW_TRANSPORT").as_deref() != Ok("rgba");
-    #[cfg(target_os = "macos")]
-    let builder = if use_shared_surfaces {
-        // The game uses this same device. On dual-GPU Macs, defaulting to the
-        // integrated editor device can put the game on a slower GPU than RGBA.
-        builder.request_adapter_options(pixels::wgpu::RequestAdapterOptions {
-            power_preference: pixels::wgpu::util::power_preference_from_env()
-                .unwrap_or(pixels::wgpu::PowerPreference::HighPerformance),
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        })
-    } else {
-        builder
+    let build_pixels = |timestamps| {
+        let builder =
+            PixelsBuilder::new(1, 1, SurfaceTexture::new(size.width, size.height, &window));
+        #[cfg(target_os = "macos")]
+        let builder = if use_shared_surfaces {
+            builder.request_adapter_options(wgpu::RequestAdapterOptions {
+                power_preference: wgpu::util::power_preference_from_env()
+                    .unwrap_or(wgpu::PowerPreference::HighPerformance),
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+        } else {
+            builder
+        };
+        let builder = if timestamps {
+            let mut limits = wgpu::Limits::default();
+            limits.max_texture_dimension_2d = limits
+                .max_texture_dimension_2d
+                .max(size.width)
+                .max(size.height);
+            builder.device_descriptor(wgpu::DeviceDescriptor {
+                label: Some("editor profiler device"),
+                features: wgpu::Features::TIMESTAMP_QUERY,
+                limits,
+            })
+        } else {
+            builder
+        };
+        builder.build()
     };
-    let mut pixels = builder.build()?;
-    let mut canvas = Canvas::new(&pixels);
+    // Winit creates the native window and its surface on the window thread.
+    let pixels = build_pixels(true).or_else(|_| build_pixels(false))?;
+    #[cfg(target_os = "macos")]
+    let gpu_device = use_shared_surfaces
+        .then(|| shared_surface::device_id(&pixels.context().device))
+        .flatten();
+    let render = RenderWorker::start(pixels, display.surface, events.create_proxy())?;
     let path = Path::new(BOARD_PATH);
     let mut saved = match Board::load(path) {
         Ok(board) => board,
@@ -828,44 +744,68 @@ pub fn run(bridge: Bridge, game_name: &str, ready: impl FnOnce()) -> Result<(), 
         board
     });
     let mut save_at = None;
-    let mut input = Interaction::default();
+    let mut input = Interaction {
+        window_size: Some(display.logical()),
+        ..Interaction::default()
+    };
+    let mut profile_session = 0;
+    let mut profile_click = None;
     let mut window_focused = true;
-    let mut failure: Option<Box<dyn Error>> = None;
+    let mut occluded = false;
+    let mut closing = false;
     bridge.resize_game(board.game_size(display.dpi));
-    {
-        let mut shared = bridge.0.lock().expect("editor bridge");
-        shared.redraw = Some(events.create_proxy());
+    bridge.set_profiling(board.show_profiler);
+    bridge.attach_window(
+        events.create_proxy(),
         #[cfg(target_os = "macos")]
-        if use_shared_surfaces {
-            shared.gpu_device = shared_surface::device_id(&pixels.context().device);
-        }
-    }
+        gpu_device,
+    );
     ready();
     window.request_redraw();
     events.run_return(|event, _, control| {
+        if closing {
+            *control = if matches!(event, Event::UserEvent(UiEvent::RenderStopped)) {
+                ControlFlow::Exit
+            } else {
+                ControlFlow::Wait
+            };
+            return;
+        }
         *control = input.wait(save_at);
         match event {
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
-            } => *control = ControlFlow::Exit,
+            } => {
+                closing = true;
+                render.close();
+            }
+            Event::UserEvent(UiEvent::RenderStopped) => *control = ControlFlow::Exit,
             Event::WindowEvent { event, .. } => {
                 let snapshot = bridge.snapshot();
                 input.update_connection(&bridge, &snapshot, window_focused);
-                let previous_board = board;
-                let previous_focus = input.preview_focus;
-                let previous_drag = input.drag_ms;
-                let previous_hover = input.hovered_button(board);
-                let previous_dock_target = input.dock_candidate(board);
-                let resized = match event {
-                    WindowEvent::Resized(size) => Some(display.resize(&mut pixels, size)),
+                let previous = input.chrome(board, display, &snapshot);
+                match event {
+                    WindowEvent::Resized(size) => {
+                        display.resize(size);
+                        input.window_size = Some(display.logical());
+                        window.request_redraw();
+                    }
                     WindowEvent::ScaleFactorChanged {
                         scale_factor,
                         new_inner_size,
                     } => {
                         display.dpi = scale_factor;
+                        display.resize(*new_inner_size);
+                        input.window_size = Some(display.logical());
                         bridge.resize_game(board.game_size(display.dpi));
-                        Some(display.resize(&mut pixels, *new_inner_size))
+                        window.request_redraw();
+                    }
+                    WindowEvent::Occluded(hidden) => {
+                        occluded = hidden;
+                        if !hidden {
+                            window.request_redraw();
+                        }
                     }
                     WindowEvent::CursorMoved { position, .. } => {
                         let position = position.to_logical::<f64>(display.dpi);
@@ -876,19 +816,15 @@ pub fn run(bridge: Bridge, game_name: &str, ready: impl FnOnce()) -> Result<(), 
                             &snapshot,
                             display.dpi,
                         );
-                        None
                     }
                     WindowEvent::CursorLeft { .. } if input.gesture.is_none() => {
                         input.pointer(&bridge, &mut board, None, &snapshot, display.dpi);
-                        None
                     }
                     WindowEvent::MouseInput { button, state, .. } => {
                         input.mouse(&bridge, &mut board, &snapshot, display, button, state);
-                        None
                     }
                     WindowEvent::MouseWheel { delta, .. } => {
                         input.wheel(&bridge, &mut board, &snapshot, display.dpi, delta);
-                        None
                     }
                     WindowEvent::TouchpadMagnify { delta, .. } => {
                         if input.gesture.is_none()
@@ -896,55 +832,49 @@ pub fn run(bridge: Bridge, game_name: &str, ready: impl FnOnce()) -> Result<(), 
                         {
                             board.zoom_at(point, delta.clamp(-0.9, 0.9).exp());
                         }
-                        None
                     }
                     WindowEvent::ModifiersChanged(modifiers) => {
                         input.modifiers = modifiers;
-                        None
                     }
                     WindowEvent::KeyboardInput { input: key, .. } => {
                         if let Some(code) = key.virtual_keycode {
                             input.key(&bridge, &mut board, display, code, key.state);
                         }
-                        None
                     }
                     WindowEvent::Focused(focused) => {
                         window_focused = focused;
                         bridge.send(EditorEvent::Focus(focused));
                         if !focused {
+                            input.commit_volume(&bridge);
                             input.preview_buttons.clear();
                             input.modifiers = ModifiersState::empty();
                             input.gesture = None;
                             input.drag_ms = None;
                             input.pending_seek = None;
                         }
-                        None
                     }
-                    _ => None,
-                };
-                if let Some(result) = resized {
-                    if let Err(err) = result {
-                        failure = Some(err.into());
-                        *control = ControlFlow::Exit;
-                    }
+                    _ => {}
+                }
+                if let Some(point) = input.profile_click.take() {
+                    profile_click = Some((board.profiler, point));
                     window.request_redraw();
                 }
-                if previous_board != board {
+                if previous.board.show_profiler != board.show_profiler {
+                    bridge.set_profiling(board.show_profiler);
+                    profile_session += 1;
+                    profile_click = None;
+                }
+                if previous.board != board {
                     bridge.resize_game(board.game_size(display.dpi));
                     save_at = Some(Instant::now() + SAVE_DELAY);
                 }
-                if previous_board != board
-                    || previous_focus != input.preview_focus
-                    || previous_drag != input.drag_ms
-                    || previous_hover != input.hovered_button(board)
-                    || previous_dock_target != input.dock_candidate(board)
-                {
+                if previous != input.chrome(board, display, &snapshot) {
                     window.request_redraw();
                 }
-                window.set_cursor_icon(input.cursor_icon(board));
+                window.set_cursor_icon(input.cursor_icon(board, &snapshot));
             }
-            Event::UserEvent(()) => {
-                bridge.0.lock().expect("editor bridge").redraw_pending = false;
+            Event::UserEvent(UiEvent::PreviewChanged) => {
+                bridge.acknowledge_redraw();
                 window.request_redraw();
             }
             Event::MainEventsCleared => {
@@ -954,47 +884,36 @@ pub fn run(bridge: Bridge, game_name: &str, ready: impl FnOnce()) -> Result<(), 
                     save_at = None;
                 }
                 *control = input.wait(save_at);
-                #[cfg(target_os = "macos")]
-                canvas.poll_gpu(&pixels, control);
             }
-            Event::RedrawRequested(_) => {
+            Event::RedrawRequested(_) if !occluded => {
                 let snapshot = bridge.snapshot();
                 input.update_connection(&bridge, &snapshot, window_focused);
-                let chrome = Chrome {
-                    board,
-                    size: display.logical(),
-                    phase: snapshot.phase,
-                    connected: snapshot.connected,
-                    frame_size: snapshot.frame.as_ref().map(|frame| frame.size),
-                    timeline: snapshot.timeline(),
-                    preview_focus: input.preview_focus,
-                    hovered: input.hovered_button(board),
-                    drag_ms: input.drag_ms,
-                    dock_target: input.dock_candidate(board),
-                };
-                if let Err(err) =
-                    canvas.draw(&pixels, chrome, display.surface, snapshot.frame.as_ref())
-                {
-                    failure = Some(err.into());
-                    *control = ControlFlow::Exit;
-                }
+                let chrome = input.chrome(board, display, &snapshot);
+                render.submit(FrameRequest {
+                    chrome,
+                    surface: display.surface,
+                    frame: snapshot.frame,
+                    arrival: snapshot.arrival,
+                    profile_session,
+                    profile_click: profile_click.take(),
+                });
             }
             _ => {}
         }
     });
     save_board(path, board, &mut saved);
-    failure.map_or(Ok(()), Err)
+    render.finish().map_err(|err| -> Box<dyn Error> { err })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engine::embedded::{DEFAULT_PREVIEW_SIZE, PreviewFrame};
     use engine::timeline::Frame;
+    use std::sync::{Arc, mpsc};
 
     fn fixture() -> (Bridge, mpsc::Receiver<EditorEvent>, Snapshot) {
-        let bridge = Bridge::new();
-        let (sender, events) = mpsc::channel();
-        bridge.0.lock().unwrap().input = Some(sender);
+        let (bridge, events) = Bridge::with_test_input();
         let tip = Some(Frame {
             id: 5,
             at_ms: 1_000,
@@ -1011,12 +930,62 @@ mod tests {
                     paused: false,
                     playing: false,
                 },
+                master_volume: None,
+                profile: None,
                 pixels: Vec::new(),
                 #[cfg(target_os = "macos")]
                 surface: None,
             })),
+            arrival: None,
         };
         (bridge, events, snapshot)
+    }
+
+    #[test]
+    fn plus_menu_can_show_hide_and_reopen_the_profiler() {
+        let (bridge, events, snapshot) = fixture();
+        let mut board = Board::default();
+        let display = Display {
+            surface: SurfaceSize::new(1000, 700),
+            dpi: 1.0,
+        };
+        let menu = PanelMenu::new(display.logical());
+        let inside = |bounds: Bounds| Point::new(bounds.x + 12.0, bounds.y + 10.0);
+        let mut input = Interaction::default();
+        for enabled in [true, false, true] {
+            input.cursor = Some(inside(menu.button));
+            input.mouse(
+                &bridge,
+                &mut board,
+                &snapshot,
+                display,
+                MouseButton::Left,
+                ElementState::Pressed,
+            );
+            assert!(input.menu_open);
+            input.cursor = Some(inside(menu.row(2)));
+            input.mouse(
+                &bridge,
+                &mut board,
+                &snapshot,
+                display,
+                MouseButton::Left,
+                ElementState::Pressed,
+            );
+            assert!(!input.menu_open);
+            assert_eq!(board.visible(Panel::Profiler), enabled);
+            bridge.set_profiling(board.show_profiler);
+            assert!(
+                matches!(events.try_recv().unwrap(), EditorEvent::Profile(value) if value == enabled)
+            );
+        }
+        assert_eq!(board.front(), Some(Panel::Profiler));
+        assert!(
+            board
+                .project(board.profiler)
+                .intersect(viewport(display.logical()))
+                .is_some()
+        );
     }
 
     #[test]
@@ -1213,6 +1182,109 @@ mod tests {
         assert_eq!(
             input.game_point(board, &snapshot, display.dpi),
             Some((1879, 1239))
+        );
+    }
+
+    #[test]
+    fn header_volume_adjusts_while_paused_and_holds_its_value_until_acknowledged() {
+        let (bridge, events, mut snapshot) = fixture();
+        let frame = Arc::get_mut(snapshot.frame.as_mut().unwrap()).unwrap();
+        frame.status.paused = true;
+        frame.master_volume = Some(engine::embedded::MasterVolume {
+            percent: 65,
+            request: None,
+        });
+        let mut board = Board {
+            game: Bounds::new(40.0, 50.0, 260.0, 200.0),
+            zoom: 0.8,
+            ..Board::default()
+        };
+        let display = Display {
+            surface: SurfaceSize::new(800, 600),
+            dpi: 1.0,
+        };
+        let header = board.game_header();
+        let track = header.volume_track;
+        let at = |x| board.screen_at(Point::new(x, track.y));
+        let pressed = at(track.x + track.w / 2.0);
+        let right = at(track.right() + 15.0);
+        let mut input = Interaction {
+            cursor: Some(pressed),
+            ..Interaction::default()
+        };
+        assert!(!header.hit_zoom(board.world_at(pressed)));
+        input.mouse(
+            &bridge,
+            &mut board,
+            &snapshot,
+            display,
+            MouseButton::Left,
+            ElementState::Pressed,
+        );
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            EditorEvent::MasterVolume {
+                percent: 50,
+                request: 1,
+                commit: false
+            }
+        ));
+        assert_eq!(
+            input.chrome(board, display, &snapshot).master_volume,
+            Some(50)
+        );
+
+        input.pointer(&bridge, &mut board, Some(right), &snapshot, display.dpi);
+        input.mouse(
+            &bridge,
+            &mut board,
+            &snapshot,
+            display,
+            MouseButton::Left,
+            ElementState::Released,
+        );
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            EditorEvent::MasterVolume {
+                percent: 100,
+                request: 2,
+                commit: false
+            }
+        ));
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            EditorEvent::MasterVolume {
+                percent: 100,
+                request: 3,
+                commit: true
+            }
+        ));
+        assert!(events.try_recv().is_err());
+        assert_eq!(board.game_zoom, 1.0);
+        assert_eq!(
+            input.chrome(board, display, &snapshot).master_volume,
+            Some(100)
+        );
+
+        Arc::get_mut(snapshot.frame.as_mut().unwrap())
+            .unwrap()
+            .master_volume = Some(engine::embedded::MasterVolume {
+            percent: 50,
+            request: Some(1),
+        });
+        assert_eq!(
+            input.chrome(board, display, &snapshot).master_volume,
+            Some(100)
+        );
+        Arc::get_mut(snapshot.frame.as_mut().unwrap())
+            .unwrap()
+            .master_volume = Some(engine::embedded::MasterVolume {
+            percent: 32,
+            request: Some(3),
+        });
+        assert_eq!(
+            input.chrome(board, display, &snapshot).master_volume,
+            Some(32)
         );
     }
 

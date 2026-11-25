@@ -1,3 +1,4 @@
+use engine::profiling::{FrameOutput, FrameTimings};
 use std::time::Duration;
 
 use engine::graphics::{CpuRenderer, Renderer2d};
@@ -89,16 +90,13 @@ fn draw_text_renders_brackets_and_dollar_sign() {
 #[test]
 fn debug_hud_emits_lines_with_expected_labels() {
     let mut hud = DebugHud::new();
-    hud.record_input(Duration::from_micros(250));
-    hud.record_gravity(Duration::from_micros(500));
-    hud.on_frame(
-        Duration::from_millis(16),
-        Duration::from_millis(1),
-        Duration::from_millis(2),
-        Duration::from_millis(1),
-        Duration::from_millis(3),
-        Duration::from_millis(7),
-    );
+    hud.mark_input();
+    hud.on_frame(FrameTimings {
+        interval: Duration::from_millis(16),
+        update: Duration::from_millis(1),
+        draw: Duration::from_millis(2),
+        output: FrameOutput::Present(Duration::from_millis(3)),
+    });
 
     let lines = hud.lines();
     assert!(

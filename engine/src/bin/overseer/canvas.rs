@@ -1,39 +1,164 @@
-use std::sync::Arc;
 #[cfg(target_os = "macos")]
-use std::{
-    collections::VecDeque,
-    sync::atomic::{AtomicUsize, Ordering},
-    time::{Duration, Instant},
+use std::collections::VecDeque;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+    mpsc::{self, Receiver, Sender},
 };
 
 use engine::embedded::{PreviewFrame, TimelineStatus};
+use engine::gpu_timer::{GpuTimer, TimestampReadback};
 use engine::graphics::{Color, GpuRenderer2d, Renderer2d};
 #[cfg(target_os = "macos")]
 use engine::shared_surface::Surface;
 use engine::surface::SurfaceSize;
 use engine::ui::Rect;
-use pixels::{Pixels, wgpu};
+use pixels::{Pixels, PixelsContext, wgpu};
 
 use super::board::{
-    Board, Bounds, Panel, Point, TITLE_HEIGHT, TRANSPORT_CONTROLS, TimelineLayout, Transport,
+    Board, Bounds, Panel, PanelMenu, Point, TITLE_HEIGHT, TRANSPORT_CONTROLS, TimelineLayout,
+    Transport, viewport,
 };
+use super::profiler::{self, FrameKey, History};
+use super::text::{Style, TextRenderer};
 use super::{Phase, dock_command};
 
 const CANVAS: Color = [235, 229, 216, 255];
 const GRID: Color = [210, 201, 183, 255];
 const PAPER: Color = [253, 249, 238, 255];
-const HEADER: Color = [242, 235, 220, 255];
-const INK: Color = [18, 24, 20, 255];
-const MUTED: Color = [49, 57, 45, 255];
-const BORDER: Color = [179, 172, 154, 255];
-const GREEN: Color = [18, 49, 33, 255];
-const GREEN_LIGHT: Color = [224, 234, 213, 255];
-const RED: Color = [110, 35, 25, 255];
+pub(super) const HEADER: Color = [242, 235, 220, 255];
+pub(super) const INK: Color = [18, 24, 20, 255];
+pub(super) const MUTED: Color = [49, 57, 45, 255];
+pub(super) const BORDER: Color = [179, 172, 154, 255];
+pub(super) const GREEN: Color = [18, 49, 33, 255];
+pub(super) const GREEN_LIGHT: Color = [224, 234, 213, 255];
+pub(super) const RED: Color = [110, 35, 25, 255];
 const BLACK: Color = [14, 19, 19, 255];
 const WHITE: Color = [251, 246, 230, 255];
 
-pub fn viewport(size: SurfaceSize) -> Bounds {
-    Bounds::new(0.0, 0.0, f64::from(size.width), f64::from(size.height))
+#[derive(Clone, Copy)]
+struct PixelGrid {
+    logical: SurfaceSize,
+    surface: SurfaceSize,
+    scale: Point,
+}
+
+impl PixelGrid {
+    fn new(logical: SurfaceSize, surface: SurfaceSize) -> Self {
+        Self {
+            logical,
+            surface,
+            scale: Point::new(
+                f64::from(surface.width) / f64::from(logical.width),
+                f64::from(surface.height) / f64::from(logical.height),
+            ),
+        }
+    }
+
+    // Snap edges independently so adjacent fills share the same physical edge.
+    fn snap(self, bounds: Bounds) -> Bounds {
+        let x = (bounds.x * self.scale.x).round();
+        let y = (bounds.y * self.scale.y).round();
+        Bounds::new(
+            x,
+            y,
+            (bounds.right() * self.scale.x).round() - x,
+            (bounds.bottom() * self.scale.y).round() - y,
+        )
+    }
+
+    fn horizontal_rule(self, bounds: Bounds) -> Bounds {
+        let mut pixels = self.snap(bounds);
+        pixels.w = pixels.w.max(1.0);
+        pixels.h = stroke_pixels(bounds.h * self.scale.y);
+        pixels
+    }
+
+    fn vertical_rule(self, bounds: Bounds) -> Bounds {
+        let mut pixels = self.snap(bounds);
+        pixels.w = stroke_pixels(bounds.w * self.scale.x);
+        pixels.h = pixels.h.max(1.0);
+        pixels
+    }
+
+    fn logical_bounds(self, physical: Bounds) -> Bounds {
+        Bounds::new(
+            physical.x / self.scale.x,
+            physical.y / self.scale.y,
+            physical.w / self.scale.x,
+            physical.h / self.scale.y,
+        )
+    }
+
+    fn panel(self, board: Board, panel: Panel) -> PanelPixels {
+        let bounds = board.bounds(panel);
+        let outer = self.snap(board.project(bounds));
+        let border_x = stroke_pixels(board.zoom * self.scale.x);
+        let border_y = stroke_pixels(board.zoom * self.scale.y);
+        let interior = Bounds::new(
+            outer.x + border_x,
+            outer.y + border_y,
+            (outer.w - border_x * 2.0).max(0.0),
+            (outer.h - border_y * 2.0).max(0.0),
+        );
+        let body_y = (board
+            .screen_at(Point::new(bounds.x, bounds.y + TITLE_HEIGHT))
+            .y
+            * self.scale.y)
+            .round()
+            .clamp(interior.y, interior.bottom());
+        PanelPixels {
+            outer,
+            interior,
+            header: Bounds::new(interior.x, interior.y, interior.w, body_y - interior.y),
+            body: Bounds::new(interior.x, body_y, interior.w, interior.bottom() - body_y),
+        }
+    }
+
+    fn visible_regions(
+        self,
+        chrome: Chrome,
+        panel: Panel,
+        area: Bounds,
+        extra_cover: Option<Bounds>,
+    ) -> Vec<Bounds> {
+        if !chrome.board.visible(panel) {
+            return Vec::new();
+        }
+        let Some(region) = area.intersect(viewport(self.surface)) else {
+            return Vec::new();
+        };
+        let covers = chrome
+            .board
+            .occluders(panel, self.logical, chrome.menu_open)
+            .chain(extra_cover);
+        covers
+            .map(|cover| self.snap(cover))
+            .fold(vec![region], |regions, cover| {
+                if regions
+                    .iter()
+                    .any(|region| region.intersect(cover).is_some())
+                {
+                    regions
+                        .into_iter()
+                        .flat_map(|region| region.excluding(cover))
+                        .collect()
+                } else {
+                    regions
+                }
+            })
+    }
+}
+
+fn stroke_pixels(thickness: f64) -> f64 {
+    thickness.round().max(1.0)
+}
+
+struct PanelPixels {
+    outer: Bounds,
+    interior: Bounds,
+    header: Bounds,
+    body: Bounds,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -43,185 +168,216 @@ pub struct Chrome {
     pub phase: Phase,
     pub connected: bool,
     pub frame_size: Option<SurfaceSize>,
+    pub master_volume: Option<u8>,
     pub timeline: TimelineStatus,
     pub preview_focus: bool,
     pub hovered: Option<Transport>,
     pub drag_ms: Option<u64>,
     pub dock_target: bool,
+    pub menu_open: bool,
+}
+
+pub(super) struct Submission {
+    pub composited: bool,
+    timestamps: Option<(FrameKey, TimestampReadback)>,
 }
 
 pub struct Canvas {
     ui: GpuRenderer2d,
+    text: TextRenderer,
     preview: GameBlit,
-    drawn: Option<Chrome>,
-    #[cfg(target_os = "macos")]
+    drawn: Option<(Chrome, SurfaceSize, u64)>,
     pending_gpu: Arc<AtomicUsize>,
+    gpu_timer: Option<GpuTimer>,
+    gpu_results: Receiver<(FrameKey, Option<u64>)>,
+    gpu_sender: Sender<(FrameKey, Option<u64>)>,
 }
 
 impl Canvas {
     pub fn new(pixels: &Pixels) -> Self {
         let format = pixels.surface_texture_format();
-        let device = &pixels.context().device;
+        let context = pixels.context();
+        let device = &context.device;
+        let (gpu_sender, gpu_results) = mpsc::channel();
         Self {
             ui: GpuRenderer2d::new(device, format),
+            text: TextRenderer::new(device, format),
             preview: GameBlit::new(device, format),
             drawn: None,
-            #[cfg(target_os = "macos")]
             pending_gpu: Arc::new(AtomicUsize::new(0)),
+            gpu_timer: GpuTimer::new(device, &context.queue),
+            gpu_results,
+            gpu_sender,
         }
     }
 
-    pub fn draw(
+    pub fn encode(
         &mut self,
-        pixels: &Pixels,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        context: &PixelsContext,
         chrome: Chrome,
         surface: SurfaceSize,
         frame: Option<&Arc<PreviewFrame>>,
-    ) -> Result<(), pixels::Error> {
-        if self.drawn != Some(chrome) {
-            self.ui.begin_frame(chrome.size);
-            draw_board(&mut self.ui, chrome);
-            self.drawn = Some(chrome);
+        history: &History,
+        profile_key: Option<FrameKey>,
+    ) -> Submission {
+        let grid = PixelGrid::new(chrome.size, surface);
+        let appearance = (chrome, surface, history.revision);
+        if self.drawn != Some(appearance) {
+            self.ui.begin_frame(surface);
+            self.text.begin_frame(chrome.size, surface);
+            draw_board(&mut self.ui, &mut self.text, chrome, grid, history);
+            self.drawn = Some(appearance);
         }
-        let area = chrome.board.project(chrome.board.game_body());
-        let visible = area
-            .intersect(viewport(chrome.size))
-            .map_or_else(Vec::new, |clipped| {
-                let pieces = if chrome.board.timeline_docked {
-                    vec![clipped]
-                } else {
-                    clipped.excluding(chrome.board.project(chrome.board.game.grip()))
-                };
-                if chrome.board.front == Panel::Timeline {
-                    let timeline = chrome.board.timeline;
-                    let cover =
-                        Bounds::new(timeline.x, timeline.y, timeline.w + 4.0, timeline.h + 5.0);
-                    pieces
-                        .into_iter()
-                        .flat_map(|piece| piece.excluding(chrome.board.project(cover)))
-                        .collect()
-                } else {
-                    pieces
-                }
-            });
+        let area = grid.panel(chrome.board, Panel::Game).body;
+        let grip = chrome
+            .board
+            .game_grip()
+            .map(|grip| chrome.board.project(grip));
+        let visible = grid.visible_regions(chrome, Panel::Game, area, grip);
         let has_image = !visible.is_empty() && frame.is_some();
         if let Some(frame) = frame.filter(|_| has_image) {
-            self.preview.upload(pixels.context(), frame);
-            self.preview
-                .place(&pixels.context().queue, area, chrome.size);
+            self.preview.upload(context, frame);
+            self.preview.place(&context.queue, area, surface);
         }
-        let result = pixels.render_with(|encoder, target, context| {
-            self.ui
-                .render(encoder, target, &context.device, &context.queue);
-            if has_image {
-                self.preview
-                    .draw(encoder, target, &visible, chrome.size, surface);
-            }
-            Ok(())
+        let timestamps = profile_key.and_then(|key| {
+            self.gpu_timer
+                .as_ref()?
+                .begin(encoder)
+                .map(|readback| (key, readback))
         });
+        self.ui
+            .render(encoder, target, &context.device, &context.queue);
+        self.text
+            .render(encoder, target, &context.device, &context.queue);
+        if has_image {
+            self.preview.draw(encoder, target, &visible);
+        }
+        if let Some((timer, (_, readback))) = self.gpu_timer.as_ref().zip(timestamps.as_ref()) {
+            timer.end(encoder, readback);
+        }
+        Submission {
+            composited: has_image,
+            timestamps,
+        }
+    }
+
+    pub fn after_submit(&self, _context: &PixelsContext, submission: Submission) {
+        if let Some((key, timestamps)) = submission.timestamps {
+            let pending = self.pending_gpu.clone();
+            let sender = self.gpu_sender.clone();
+            pending.fetch_add(1, Ordering::Relaxed);
+            timestamps.map(move |elapsed| {
+                let _ = sender.send((key, elapsed));
+                pending.fetch_sub(1, Ordering::Relaxed);
+            });
+        }
         #[cfg(target_os = "macos")]
-        if result.is_ok()
-            && has_image
+        if submission.composited
             && let Some(image) = &self.preview.image
             && image.frame.surface.is_some()
         {
             let frame = image.frame.clone();
             let pending = self.pending_gpu.clone();
             pending.fetch_add(1, Ordering::Relaxed);
-            // The game may render into this IOSurface again only after the
-            // last editor submission that samples it has finished.
-            pixels.context().queue.on_submitted_work_done(move || {
+            // Retain the IOSurface until the editor has finished sampling it.
+            _context.queue.on_submitted_work_done(move || {
                 drop(frame);
                 pending.fetch_sub(1, Ordering::Relaxed);
             });
         }
-        result
     }
 
-    #[cfg(target_os = "macos")]
-    pub fn poll_gpu(&self, pixels: &Pixels, flow: &mut winit::event_loop::ControlFlow) {
-        use winit::event_loop::ControlFlow;
-        if self.pending_gpu.load(Ordering::Relaxed) == 0 {
-            return;
+    pub fn take_gpu_profiles(&self) -> impl Iterator<Item = (FrameKey, Option<u64>)> + '_ {
+        self.gpu_results.try_iter()
+    }
+
+    pub fn poll_gpu(&self, pixels: &Pixels) -> bool {
+        if self.pending_gpu.load(Ordering::Relaxed) != 0 {
+            pixels.context().device.poll(wgpu::Maintain::Poll);
         }
-        pixels.context().device.poll(wgpu::Maintain::Poll);
-        if self.pending_gpu.load(Ordering::Relaxed) == 0 {
-            return;
-        }
-        // Keep servicing GPU completions if the producer has temporarily run
-        // out of surfaces and there are no more IPC-driven redraws.
-        let poll_at = Instant::now() + Duration::from_millis(2);
-        *flow = match *flow {
-            ControlFlow::Wait => ControlFlow::WaitUntil(poll_at),
-            ControlFlow::WaitUntil(at) => ControlFlow::WaitUntil(at.min(poll_at)),
-            current => current,
-        };
+        self.pending_gpu.load(Ordering::Relaxed) != 0
     }
 }
 
-struct Painter<'a> {
+pub(super) struct Painter<'a> {
     gfx: &'a mut dyn Renderer2d,
-    screen: Bounds,
+    text: &'a mut TextRenderer,
+    text_clips: Vec<Bounds>,
+    grid: PixelGrid,
     board: Board,
 }
 
 impl Painter<'_> {
-    fn screen_fill(&mut self, bounds: Bounds, color: Color) {
-        if let Some(rect) = bounds.intersect(self.screen) {
-            let x = rect.x.round() as u32;
-            let y = rect.y.round() as u32;
-            let w = (rect.right().round() as u32).saturating_sub(x);
-            let h = (rect.bottom().round() as u32).saturating_sub(y);
-            if w > 0 && h > 0 {
-                self.gfx.fill_rect(Rect::new(x, y, w, h), color);
-            }
+    fn pixel_fill(&mut self, bounds: Bounds, color: Color) {
+        if let Some(rect) = bounds.intersect(viewport(self.grid.surface)) {
+            self.gfx.fill_rect(
+                Rect::new(rect.x as u32, rect.y as u32, rect.w as u32, rect.h as u32),
+                color,
+            );
         }
     }
 
-    fn fill(&mut self, bounds: Bounds, color: Color) {
+    fn screen_fill(&mut self, bounds: Bounds, color: Color) {
+        self.pixel_fill(self.grid.snap(bounds), color);
+    }
+
+    pub(super) fn fill(&mut self, bounds: Bounds, color: Color) {
         self.screen_fill(self.board.project(bounds), color);
     }
 
-    fn screen_text(&mut self, point: Point, text: &str, color: Color, scale: u32) {
-        if self.screen.contains(point) {
-            self.gfx.draw_text_scaled(
-                point.x.round() as u32,
-                point.y.round() as u32,
+    pub(super) fn horizontal_rule(&mut self, bounds: Bounds, color: Color) {
+        self.pixel_fill(self.grid.horizontal_rule(self.board.project(bounds)), color);
+    }
+
+    pub(super) fn vertical_rule(&mut self, bounds: Bounds, color: Color) {
+        self.pixel_fill(self.grid.vertical_rule(self.board.project(bounds)), color);
+    }
+
+    fn screen_text(&mut self, point: Point, text: &str, color: Color, style: Style) {
+        self.text
+            .draw(point, text, style, style.size(), color, &self.text_clips);
+    }
+
+    pub(super) fn text(&mut self, point: Point, text: &str, color: Color, style: Style) {
+        if self.board.zoom >= 0.36 {
+            let size = (style.size() * self.board.zoom).max(10.0);
+            self.text.draw(
+                self.board.screen_at(point),
                 text,
+                style,
+                size,
                 color,
-                scale,
+                &self.text_clips,
             );
         }
     }
 
-    fn text(&mut self, point: Point, text: &str, color: Color) {
-        if self.board.zoom >= 0.36 {
-            let scale = (2.0 * self.board.zoom).round().max(1.0) as u32;
-            self.screen_text(self.board.screen_at(point), text, color, scale);
-        }
-    }
-
-    fn centered_text(&mut self, bounds: Bounds, label: &str, color: Color) {
-        if self.board.zoom < 0.36 {
+    pub(super) fn centered_text(
+        &mut self,
+        bounds: Bounds,
+        label: &str,
+        color: Color,
+        style: Style,
+    ) {
+        if self.board.zoom < 0.36 || label.is_empty() {
             return;
         }
         let bounds = self.board.project(bounds);
-        let glyphs = label.chars().count() as f64;
-        let scale = (2.0 * self.board.zoom)
-            .round()
-            .min(((bounds.w - 6.0) / (glyphs * 4.0)).floor())
-            .min(((bounds.h - 4.0) / 5.0).floor()) as u32;
-        if scale > 0 {
-            let scale_px = f64::from(scale);
-            self.screen_text(
-                Point::new(
-                    bounds.x + (bounds.w - glyphs * 4.0 * scale_px) / 2.0,
-                    bounds.y + (bounds.h - 5.0 * scale_px) / 2.0,
-                ),
-                label,
-                color,
-                scale,
+        let mut size = (style.size() * self.board.zoom).max(10.0);
+        let metrics = self.text.measure(label, style, size);
+        size *= ((bounds.w - 6.0) / metrics.x)
+            .min((bounds.h - 2.0) / metrics.y)
+            .min(1.0);
+        if size >= 9.0 {
+            let metrics = self.text.measure(label, style, size);
+            let point = Point::new(
+                bounds.x + (bounds.w - metrics.x) / 2.0,
+                bounds.y + (bounds.h - metrics.y) / 2.0,
             );
+            self.text
+                .draw(point, label, style, size, color, &self.text_clips);
         }
     }
 
@@ -241,12 +397,24 @@ impl Painter<'_> {
     }
 }
 
-fn draw_board(gfx: &mut dyn Renderer2d, chrome: Chrome) {
+fn draw_board(
+    gfx: &mut dyn Renderer2d,
+    text: &mut TextRenderer,
+    chrome: Chrome,
+    grid: PixelGrid,
+    history: &History,
+) {
     let board = chrome.board;
     let width = f64::from(chrome.size.width);
     let height = f64::from(chrome.size.height);
-    let screen = Bounds::new(0.0, 0.0, width, height);
-    let mut paint = Painter { gfx, screen, board };
+    let screen = viewport(chrome.size);
+    let mut paint = Painter {
+        gfx,
+        text,
+        text_clips: Vec::new(),
+        grid,
+        board,
+    };
     paint.screen_fill(screen, CANVAS);
     let spacing = (24.0 * board.zoom).max(10.0);
     let mut y = board.pan.y.rem_euclid(spacing);
@@ -260,54 +428,92 @@ fn draw_board(gfx: &mut dyn Renderer2d, chrome: Chrome) {
     }
 
     let dock = board.dock_bounds();
-    let shadow = Point::new(4.0, 5.0);
+    let shadow = super::board::PANEL_SHADOW;
     if let Some(bounds) = dock {
         paint.fill(bounds.translated(shadow), GRID);
     }
     for panel in board.order() {
         let bounds = board.bounds(panel);
-        if dock.is_none() {
-            paint.fill(bounds.translated(shadow), GRID);
+        let docked = dock.is_some() && panel != Panel::Profiler;
+        if let Some(shadow) = board.panel_shadow(panel) {
+            paint.fill(shadow, GRID);
         }
-        paint.fill(
-            bounds,
-            if dock.is_some() || board.front == panel {
+        let pixels = grid.panel(board, panel);
+        paint.pixel_fill(
+            pixels.outer,
+            if docked || board.front() == Some(panel) {
                 GREEN
             } else {
                 BORDER
             },
         );
-        paint.fill(
-            Bounds::new(
-                bounds.x + 1.0,
-                bounds.y + 1.0,
-                bounds.w - 2.0,
-                bounds.h - 2.0,
-            ),
-            PAPER,
-        );
-        paint.fill(
-            Bounds::new(
-                bounds.x + 1.0,
-                bounds.y + 1.0,
-                bounds.w - 2.0,
-                TITLE_HEIGHT - 1.0,
-            ),
-            HEADER,
-        );
+        paint.pixel_fill(pixels.interior, PAPER);
+        paint.pixel_fill(pixels.header, HEADER);
+        paint.text_clips = grid
+            .visible_regions(chrome, panel, pixels.outer, None)
+            .into_iter()
+            .map(|bounds| grid.logical_bounds(bounds))
+            .collect();
         match panel {
-            Panel::Game => draw_game(&mut paint, chrome),
+            Panel::Game => draw_game(&mut paint, chrome, pixels.body),
             Panel::Timeline => draw_timeline(&mut paint, chrome),
+            Panel::Profiler => profiler::draw(&mut paint, bounds, history),
         }
-        if dock.is_none() || panel == Panel::Timeline {
+        if !docked || panel == Panel::Timeline {
             draw_grip(&mut paint, bounds);
         }
     }
     if chrome.dock_target {
-        paint.fill(
+        paint.horizontal_rule(
             Bounds::new(board.game.x, board.game.bottom() - 1.0, board.game.w, 4.0),
             GREEN,
         );
+    }
+    paint.text_clips = vec![screen];
+    draw_panel_menu(&mut paint, chrome);
+}
+
+fn draw_panel_menu(paint: &mut Painter<'_>, chrome: Chrome) {
+    let menu = PanelMenu::new(chrome.size);
+    let button = menu.button;
+    paint.screen_fill(button, GREEN);
+    paint.screen_fill(
+        Bounds::new(button.x + 10.0, button.y + 17.0, 16.0, 2.0),
+        WHITE,
+    );
+    paint.screen_fill(
+        Bounds::new(button.x + 17.0, button.y + 10.0, 2.0, 16.0),
+        WHITE,
+    );
+    if !chrome.menu_open {
+        return;
+    }
+    paint.screen_fill(menu.popup, BORDER);
+    paint.screen_fill(
+        Bounds::new(
+            menu.popup.x + 1.0,
+            menu.popup.y + 1.0,
+            menu.popup.w - 2.0,
+            menu.popup.h - 2.0,
+        ),
+        PAPER,
+    );
+    for (index, panel) in Panel::ALL.into_iter().enumerate() {
+        let row = menu.row(index);
+        if chrome.board.visible(panel) {
+            paint.screen_fill(row, GREEN_LIGHT);
+        }
+        paint.screen_text(
+            Point::new(row.x + 9.0, row.y + 6.0),
+            panel.title(),
+            INK,
+            Style::Label,
+        );
+        let center = Point::new(row.right() - 16.0, row.y + 15.0);
+        paint.screen_fill(Bounds::new(center.x - 4.0, center.y, 9.0, 1.0), GREEN);
+        if !chrome.board.visible(panel) {
+            paint.screen_fill(Bounds::new(center.x, center.y - 4.0, 1.0, 9.0), GREEN);
+        }
     }
 }
 
@@ -336,62 +542,94 @@ fn draw_grip(paint: &mut Painter<'_>, bounds: Bounds) {
     }
 }
 
-fn draw_game(paint: &mut Painter<'_>, chrome: Chrome) {
+fn draw_game(paint: &mut Painter<'_>, chrome: Chrome, body_pixels: Bounds) {
     let bounds = chrome.board.game;
     let body = chrome.board.game_body();
     let header = chrome.board.game_header();
     let phase = match chrome.phase {
-        Phase::Building => Some(("BUILDING", MUTED)),
-        Phase::Reconnecting => Some(("CONNECTING", MUTED)),
+        Phase::Building => Some(("Building", MUTED)),
+        Phase::Reconnecting => Some(("Connecting", MUTED)),
         Phase::Running => None,
-        Phase::Failed => Some(("BUILD FAILED", RED)),
-        Phase::GpuFailed => Some(("GPU UNAVAILABLE", RED)),
-        Phase::ReloadFailed => Some(("RELOAD FAILED", RED)),
-        Phase::Exited => Some(("GAME EXITED", RED)),
+        Phase::Failed => Some(("Build failed", RED)),
+        Phase::GpuFailed => Some(("GPU unavailable", RED)),
+        Phase::ReloadFailed => Some(("Reload failed", RED)),
+        Phase::Exited => Some(("Game exited", RED)),
     };
     let title_color = phase.filter(|(_, color)| *color == RED).map_or(
         if chrome.preview_focus { GREEN } else { INK },
         |(_, color)| color,
     );
     paint.text(
-        Point::new(bounds.x + 12.0, bounds.y + 10.0),
-        "GAME",
+        Point::new(bounds.x + 12.0, bounds.y + 6.0),
+        "Game",
         title_color,
+        Style::Title,
     );
     if bounds.w >= 470.0
         && let Some((label, color)) = phase
     {
-        paint.text(Point::new(bounds.x + 65.0, bounds.y + 10.0), label, color);
+        paint.text(
+            Point::new(bounds.x + 65.0, bounds.y + 7.0),
+            label,
+            color,
+            Style::Caption,
+        );
     }
 
+    if let Some(percent) = chrome.master_volume {
+        let track = header.volume_track;
+        let thumb = header.volume_thumb_x(percent);
+        let speaker = [
+            0b0001000, 0b0011000, 0b1111010, 0b1111001, 0b1111010, 0b0011000, 0b0001000,
+        ];
+        paint.icon(
+            Bounds::new(track.x - 19.0, track.y - 5.5, 14.0, 14.0),
+            speaker,
+            MUTED,
+        );
+        paint.horizontal_rule(track, BORDER);
+        if percent > 0 {
+            paint.horizontal_rule(
+                Bounds::new(track.x, track.y, thumb - track.x, track.h),
+                GREEN,
+            );
+        }
+        paint.fill(Bounds::new(thumb - 3.0, track.y - 3.0, 6.0, 9.0), GREEN);
+    }
     let track = header.zoom_track;
-    paint.fill(track, BORDER);
-    paint.fill(
+    paint.horizontal_rule(track, BORDER);
+    paint.vertical_rule(
         Bounds::new(track.x + track.w / 2.0 - 0.5, track.y - 2.0, 1.0, 7.0),
         MUTED,
     );
     let thumb = header.thumb_x(chrome.board.game_zoom);
     paint.fill(Bounds::new(thumb - 3.0, track.y - 3.0, 6.0, 9.0), GREEN);
-    paint.fill(Bounds::new(track.x - 10.0, track.y + 1.0, 6.0, 1.0), MUTED);
-    paint.fill(
+    paint.horizontal_rule(Bounds::new(track.x - 10.0, track.y + 1.0, 6.0, 1.0), MUTED);
+    paint.horizontal_rule(
         Bounds::new(track.right() + 5.0, track.y + 1.0, 6.0, 1.0),
         MUTED,
     );
-    paint.fill(
+    paint.vertical_rule(
         Bounds::new(track.right() + 7.5, track.y - 1.5, 1.0, 6.0),
         MUTED,
     );
     if let Some(size) = chrome.frame_size {
         paint.centered_text(
             header.resolution,
-            &format!("{} X {}", size.width, size.height),
+            &format!("{} × {}", size.width, size.height),
             MUTED,
+            Style::Number,
         );
     }
-    paint.fill(body, BLACK);
+    paint.pixel_fill(body_pixels, BLACK);
     if chrome.frame_size.is_none() {
-        let message = phase.map_or("WAITING FOR GAME", |(label, _)| label);
-        paint.text(Point::new(body.x + 20.0, body.y + 20.0), message, WHITE);
+        let message = phase.map_or("Waiting for game", |(label, _)| label);
+        paint.text(
+            Point::new(body.x + 20.0, body.y + 20.0),
+            message,
+            WHITE,
+            Style::Label,
+        );
     }
 }
 
@@ -404,7 +642,12 @@ fn draw_timeline(paint: &mut Painter<'_>, chrome: Chrome) {
         .or(timeline.cursor.map(|frame| frame.at_ms))
         .unwrap_or(0);
     let tip = timeline.tip.map_or(0, |frame| frame.at_ms);
-    paint.text(Point::new(panel.x + 12.0, panel.y + 10.0), "TIMELINE", INK);
+    paint.text(
+        Point::new(panel.x + 12.0, panel.y + 6.0),
+        "Timeline",
+        INK,
+        Style::Title,
+    );
     paint.centered_text(
         Bounds::new(
             panel.right() - 161.0,
@@ -414,6 +657,7 @@ fn draw_timeline(paint: &mut Painter<'_>, chrome: Chrome) {
         ),
         &format!("{} / {}", timestamp(cursor), timestamp(tip)),
         MUTED,
+        Style::Number,
     );
     let track = layout.track;
     paint.fill(track, HEADER);
@@ -426,7 +670,7 @@ fn draw_timeline(paint: &mut Painter<'_>, chrome: Chrome) {
     paint.fill(Bounds::new(track.x, track.y + 2.0, progress, 4.0), GREEN);
     for i in 0..=10 {
         let x = track.x + track.w * f64::from(i) / 10.0;
-        paint.fill(Bounds::new(x, track.bottom(), 1.0, 5.0), BORDER);
+        paint.vertical_rule(Bounds::new(x, track.bottom(), 1.0, 5.0), BORDER);
     }
     paint.fill(
         Bounds::new(track.x + progress - 3.0, track.y - 4.0, 6.0, track.h + 8.0),
@@ -469,8 +713,9 @@ fn draw_timeline(paint: &mut Painter<'_>, chrome: Chrome) {
         } else {
             paint.centered_text(
                 button,
-                "TAKE OVER",
+                "Take over",
                 if active { GREEN } else { MUTED },
+                Style::Label,
             );
         }
     }
@@ -691,9 +936,9 @@ impl GameBlit {
         PreviewTexture { texture, bindings }
     }
 
-    fn place(&self, queue: &wgpu::Queue, rect: Bounds, logical: SurfaceSize) {
-        let sx = 2.0 / f64::from(logical.width);
-        let sy = 2.0 / f64::from(logical.height);
+    fn place(&self, queue: &wgpu::Queue, rect: Bounds, surface: SurfaceSize) {
+        let sx = 2.0 / f64::from(surface.width);
+        let sy = 2.0 / f64::from(surface.height);
         let position = [
             (rect.x * sx - 1.0) as f32,
             (1.0 - rect.y * sy) as f32,
@@ -708,8 +953,6 @@ impl GameBlit {
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
         visible: &[Bounds],
-        logical: SurfaceSize,
-        surface: SurfaceSize,
     ) {
         let Some(image) = &self.image else { return };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -726,21 +969,91 @@ impl GameBlit {
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &image.texture.bindings, &[]);
-        let sx = f64::from(surface.width) / f64::from(logical.width);
-        let sy = f64::from(surface.height) / f64::from(logical.height);
         for rect in visible {
-            let x = (rect.x * sx).round() as u32;
-            let y = (rect.y * sy).round() as u32;
-            let w = ((rect.right() * sx).round() as u32)
-                .min(surface.width)
-                .saturating_sub(x);
-            let h = ((rect.bottom() * sy).round() as u32)
-                .min(surface.height)
-                .saturating_sub(y);
-            if w > 0 && h > 0 {
-                pass.set_scissor_rect(x, y, w, h);
-                pass.draw(0..4, 0..1);
+            pass.set_scissor_rect(rect.x as u32, rect.y as u32, rect.w as u32, rect.h as u32);
+            pass.draw(0..4, 0..1);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rules_keep_their_physical_thickness_during_fractional_panning() {
+        let logical = SurfaceSize::new(800, 600);
+        for surface in [
+            logical,
+            SurfaceSize::new(1201, 901),
+            SurfaceSize::new(1600, 1200),
+        ] {
+            let grid = PixelGrid::new(logical, surface);
+            for pan in [0.1, 0.35, 0.6, 0.85] {
+                let mut board = Board {
+                    pan: Point::new(pan, pan),
+                    zoom: 0.4,
+                    ..Board::default()
+                };
+                let horizontal = Bounds::new(40.0, 40.0, 20.0, 1.0);
+                let vertical = Bounds::new(40.0, 40.0, 1.0, 20.0);
+                assert_eq!(grid.horizontal_rule(board.project(horizontal)).h, 1.0);
+                assert_eq!(grid.vertical_rule(board.project(vertical)).w, 1.0);
+                board.zoom = 2.0;
+                assert_eq!(
+                    grid.horizontal_rule(board.project(horizontal)).h,
+                    (2.0 * grid.scale.y).round()
+                );
+                assert_eq!(
+                    grid.vertical_rule(board.project(vertical)).w,
+                    (2.0 * grid.scale.x).round()
+                );
             }
         }
+    }
+
+    #[test]
+    fn preview_clip_meets_the_snapped_panel_edges_and_covers() {
+        let logical = SurfaceSize::new(800, 600);
+        let grid = PixelGrid::new(logical, SurfaceSize::new(1201, 901));
+        let mut board = Board {
+            game: Bounds::new(40.5, 36.0, 960.0, 640.0),
+            profiler: Bounds::new(520.5, 76.0, 530.0, 400.0),
+            pan: Point::new(0.6, 0.3),
+            zoom: 0.44,
+            show_profiler: true,
+            ..Board::default()
+        };
+        board.raise(Panel::Profiler);
+        let chrome = Chrome {
+            board,
+            size: logical,
+            phase: Phase::Running,
+            connected: true,
+            frame_size: None,
+            master_volume: None,
+            timeline: TimelineStatus::default(),
+            preview_focus: false,
+            hovered: None,
+            drag_ms: None,
+            dock_target: false,
+            menu_open: false,
+        };
+        let panel = grid.panel(board, Panel::Game);
+        let cover = grid.panel(board, Panel::Profiler).outer;
+        let grip = board.project(board.game_grip().unwrap());
+        let visible = grid.visible_regions(chrome, Panel::Game, panel.body, Some(grip));
+        let draws_at = |x, y| visible.iter().any(|rect| rect.contains(Point::new(x, y)));
+        assert_eq!(panel.body.y, panel.header.bottom());
+        assert_eq!(panel.body.x, panel.outer.x + 1.0);
+        assert_eq!(panel.body.bottom() + 1.0, panel.outer.bottom());
+        assert!(draws_at(panel.body.x, panel.body.y));
+        assert!(!draws_at(panel.body.x - 1.0, panel.body.y));
+        assert!(!draws_at(panel.body.x, panel.body.y - 1.0));
+        assert!(draws_at(cover.x - 1.0, cover.y));
+        assert!(!draws_at(cover.x, cover.y));
+        let grip = grid.snap(grip);
+        assert!(draws_at(grip.x - 1.0, grip.y));
+        assert!(!draws_at(grip.x, grip.y));
     }
 }

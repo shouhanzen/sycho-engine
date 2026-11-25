@@ -1,11 +1,13 @@
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 const DISABLE_DIG_CAMERA_ENV: &str = "ROLLOUT_DISABLE_DIG_CAMERA";
 const STEP_PX_PER_ROW_ENV: &str = "ROLLOUT_DIG_CAMERA_STEP_PX_PER_ROW";
 const MAX_OFFSET_PX_ENV: &str = "ROLLOUT_DIG_CAMERA_MAX_OFFSET_PX";
 const RETURN_PX_PER_S_ENV: &str = "ROLLOUT_DIG_CAMERA_RETURN_PX_PER_S";
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct DigCameraConfig {
     pub step_px_per_row: f32,
     pub max_offset_px: f32,
@@ -38,7 +40,7 @@ impl DigCameraConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct DigCameraController {
     enabled: bool,
     last_depth_rows: u32,
@@ -124,6 +126,7 @@ fn env_f32(name: &str) -> Option<f32> {
     std::env::var(name)
         .ok()
         .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|value| value.is_finite())
 }
 
 #[cfg(test)]

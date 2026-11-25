@@ -23,12 +23,11 @@ pub enum GameUiAction {
     ToggleHighContrast,
     ToggleReduceMotion,
     Quit,
+    Back,
     PauseToggle,
     HoldPiece,
     SkillTreeTool(SkillTreeEditorTool),
-    Resume,
     EndRun,
-    Restart,
 }
 
 pub(crate) enum Menu {
@@ -45,7 +44,7 @@ pub struct GameUiLayout {
 }
 
 impl GameUiLayout {
-    pub fn compute(state: &GameState, size: SurfaceSize, settings_open: bool) -> Self {
+    pub fn compute(state: &GameState, size: SurfaceSize) -> Self {
         let (width, height) = (size.width, size.height);
         let menu = match state.view {
             GameView::MainMenu => Some(Menu::Main(MainMenuLayout::compute(width, height))),
@@ -63,7 +62,10 @@ impl GameUiLayout {
             } else {
                 SkillTreeLayout::default()
             },
-            settings: settings_open.then(|| SettingsMenuLayout::compute(width, height)),
+            settings: state
+                .settings_overlay
+                .as_ref()
+                .map(|_| SettingsMenuLayout::compute(width, height)),
             menu,
         }
     }
@@ -97,12 +99,12 @@ impl GameUiLayout {
                 (layout.quit_button, Quit),
             ]),
             Some(Menu::Pause(layout)) => hit(&[
-                (layout.resume_button, Resume),
+                (layout.resume_button, PauseToggle),
                 (layout.settings_button, OpenSettings),
                 (layout.end_run_button, EndRun),
             ]),
             Some(Menu::GameOver(layout)) => hit(&[
-                (layout.restart_button, Restart),
+                (layout.restart_button, StartGame),
                 (layout.skilltree_button, OpenSkillTree),
                 (layout.quit_button, Quit),
             ]),
