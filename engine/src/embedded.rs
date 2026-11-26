@@ -14,11 +14,14 @@ use winit::event::{ElementState, MouseButton, VirtualKeyCode};
 use crate::profiling::PreviewProfile;
 #[cfg(target_os = "macos")]
 use crate::shared_surface::{Surface, SurfaceInbox, SurfaceLeases, SurfaceSender};
-use crate::surface::SurfaceSize;
-use crate::timeline::{Frame, TimelineCommand};
+use crate::surface::{DisplayMetrics, SurfaceSize};
+use crate::timeline::{BookmarkEdit, Frame, TimelineCommand};
+
+use crate::tiles::TilePreview;
 
 pub const SURFACE_ENV: &str = "SYCHO_PREVIEW_SURFACE";
 pub const ADDRESS_ENV: &str = "SYCHO_EMBEDDED_ADDRESS";
+pub const DISPLAY_ENV: &str = "SYCHO_EMBEDDED_DISPLAY";
 pub const GPU_PREVIEW_EXIT_CODE: i32 = 76;
 pub const DEFAULT_PREVIEW_SIZE: SurfaceSize = SurfaceSize::new(960, 640);
 pub const MAX_PREVIEW_DIMENSION: u32 = 4096;
@@ -28,7 +31,19 @@ pub fn valid_preview_size(size: SurfaceSize) -> bool {
     !size.is_empty() && size.width <= MAX_PREVIEW_DIMENSION && size.height <= MAX_PREVIEW_DIMENSION
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub fn valid_logical_size(size: SurfaceSize) -> bool {
+    const MAX_LOGICAL_DIMENSION: u32 = MAX_PREVIEW_DIMENSION * 4;
+    !size.is_empty() && size.width <= MAX_LOGICAL_DIMENSION && size.height <= MAX_LOGICAL_DIMENSION
+}
+
+pub(crate) fn valid_display_metrics(display: DisplayMetrics) -> bool {
+    valid_preview_size(display.render_size)
+        && valid_logical_size(display.logical_size)
+        && display.scale_factor.is_finite()
+        && display.scale_factor > 0.0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EditorEvent {
     Key(VirtualKeyCode, ElementState),
     Button(MouseButton, ElementState),
@@ -36,7 +51,7 @@ pub enum EditorEvent {
     Scroll(f32, f32),
     Focus(bool),
     ReleaseInput,
-    Resize(SurfaceSize),
+    Resize(DisplayMetrics),
     Profile(bool),
     MasterVolume {
         percent: u8,
@@ -46,6 +61,13 @@ pub enum EditorEvent {
     ReleaseSurface(u32),
     UseRgba,
     Timeline(TimelineCommand),
+    ResetTimeline,
+    Bookmark(BookmarkEdit),
+    ReloadTiles,
+    ForkPreview {
+        stamp: u64,
+        reply: std::path::PathBuf,
+    },
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +76,20 @@ pub struct TimelineStatus {
     pub tip: Option<Frame>,
     pub paused: bool,
     pub playing: bool,
+    #[serde(default)]
+    pub bookmark_revision: u64,
+    #[serde(default)]
+    pub detached_bookmark: Option<u64>,
+}
+
+impl TimelineStatus {
+    pub fn play_resumes_live(self) -> bool {
+        self.paused
+            && !self.playing
+            && self.tip.is_some()
+            && self.cursor == self.tip
+            && self.detached_bookmark.is_none()
+    }
 }
 
 /// The live mixer level and the last editor change applied to it.
@@ -67,13 +103,22 @@ pub struct MasterVolume {
 pub(crate) struct PreviewMetadata {
     pub status: TimelineStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stamp: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<DisplayMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub master_volume: Option<MasterVolume>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tile_level: Option<TilePreview>,
 }
 
 pub struct PreviewFrame {
     pub size: SurfaceSize,
     pub status: TimelineStatus,
+    pub stamp: Option<u64>,
+    pub display: Option<DisplayMetrics>,
     pub master_volume: Option<MasterVolume>,
+    pub tile_level: Option<TilePreview>,
     pub profile: Option<PreviewProfile>,
     pub pixels: Vec<u8>,
     #[cfg(target_os = "macos")]
@@ -126,6 +171,29 @@ impl FrameHeader {
 }
 
 impl PreviewFrame {
+    /// Retain a preview independently of the game process and its shared surfaces.
+    pub fn freeze(self: &Arc<Self>) -> io::Result<Arc<Self>> {
+        #[cfg(target_os = "macos")]
+        if let Some(preview) = &self.surface {
+            let pixels = preview
+                .surface
+                .copy_rgba(self.size)
+                .inspect_err(|_| preview.use_rgba())?;
+            return Ok(Arc::new(Self {
+                size: self.size,
+                status: self.status,
+                stamp: self.stamp,
+                display: self.display,
+                master_volume: self.master_volume,
+                tile_level: self.tile_level,
+                profile: None,
+                pixels,
+                surface: None,
+            }));
+        }
+        Ok(Arc::clone(self))
+    }
+
     pub fn read(stream: &mut impl Read) -> io::Result<Self> {
         let header = FrameHeader::read(stream)?;
         Self::read_pixels(header, stream)
@@ -156,7 +224,10 @@ impl PreviewFrame {
         Ok(Some(Self {
             size: header.size,
             status: header.metadata.status,
+            stamp: header.metadata.stamp,
+            display: header.metadata.display,
             master_volume: header.metadata.master_volume,
+            tile_level: header.metadata.tile_level,
             profile: header.profile,
             pixels: Vec::new(),
             surface: Some(PreviewSurface {
@@ -179,7 +250,10 @@ impl PreviewFrame {
         Ok(Self {
             size: header.size,
             status: header.metadata.status,
+            stamp: header.metadata.stamp,
+            display: header.metadata.display,
             master_volume: header.metadata.master_volume,
+            tile_level: header.metadata.tile_level,
             profile: header.profile,
             pixels,
             #[cfg(target_os = "macos")]
@@ -194,7 +268,10 @@ impl PreviewFrame {
                 size: self.size,
                 metadata: PreviewMetadata {
                     status: self.status,
+                    stamp: self.stamp,
+                    display: self.display,
                     master_volume: self.master_volume,
+                    tile_level: self.tile_level,
                 },
                 profile: self.profile,
                 shared: None,
@@ -436,7 +513,10 @@ impl FramePublisher {
         let frame = PreviewFrame {
             size,
             status: metadata.status,
+            stamp: metadata.stamp,
+            display: metadata.display,
             master_volume: metadata.master_volume,
+            tile_level: metadata.tile_level,
             profile,
             pixels: std::mem::take(&mut self.pixels),
             #[cfg(target_os = "macos")]
@@ -500,6 +580,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resize_metrics_interoperate_with_pixel_only_peers() {
+        #[derive(Deserialize)]
+        enum Legacy {
+            Resize(SurfaceSize),
+        }
+        let physical = SurfaceSize::new(1600, 1000);
+        let display = DisplayMetrics::for_surface(physical, 2.0);
+        let wire = serde_json::to_vec(&EditorEvent::Resize(display)).unwrap();
+        let Legacy::Resize(size) = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(size, physical);
+        let EditorEvent::Resize(old) =
+            serde_json::from_str(r#"{"Resize":{"width":1600,"height":1000}}"#).unwrap()
+        else {
+            panic!("expected a resize");
+        };
+        assert_eq!(old, DisplayMetrics::at_1x(physical));
+    }
+
+    #[test]
     fn framed_preview_keeps_pixels_separate_from_timeline_metadata() {
         let mut bytes = Vec::new();
         let status = TimelineStatus {
@@ -507,6 +606,8 @@ mod tests {
             tip: Some(Frame { id: 5, at_ms: 1000 }),
             paused: true,
             playing: false,
+            bookmark_revision: 8,
+            detached_bookmark: Some(3),
         };
         let size = SurfaceSize::new(257, 185);
         let rgba = vec![0xA7; size.rgba_len()];
@@ -520,9 +621,12 @@ mod tests {
             request: Some(9),
         });
         PreviewFrame {
+            stamp: Some(123),
             size,
             status,
+            display: Some(DisplayMetrics::for_surface(size, 2.0)),
             master_volume,
+            tile_level: None,
             profile,
             pixels: rgba.clone(),
             #[cfg(target_os = "macos")]
@@ -537,6 +641,7 @@ mod tests {
         .unwrap();
         let mut stream = bytes.as_slice();
         let frame = PreviewFrame::read(&mut stream).unwrap();
+        assert_eq!(frame.display, Some(DisplayMetrics::for_surface(size, 2.0)));
         assert_eq!(frame.size, size);
         assert_eq!(frame.status, status);
         assert_eq!(frame.master_volume, master_volume);

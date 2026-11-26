@@ -15,7 +15,7 @@ use crate::{
     timeline::TimelineReader,
 };
 
-fn ffmpeg_bin() -> OsString {
+pub(crate) fn ffmpeg_bin() -> OsString {
     std::env::var_os("ROLLOUT_FFMPEG_BIN").unwrap_or_else(|| OsString::from("ffmpeg"))
 }
 

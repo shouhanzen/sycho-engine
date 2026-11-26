@@ -8,7 +8,7 @@ use engine::embedded::PreviewFrame;
 use engine::profiling::{PreviewProfile, micros};
 use engine::surface::SurfaceSize;
 
-use super::board::{Bounds, Point, TITLE_HEIGHT};
+use super::board::{Bounds, Point, TITLE_HEIGHT, WindowId};
 
 const SAMPLE_LIMIT: usize = 600;
 pub const GRAPH_SPAN: Duration = Duration::from_secs(8);
@@ -16,6 +16,7 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FrameKey {
+    pub game: super::board::WindowId,
     pub generation: u64,
     pub frame: u64,
 }
@@ -43,6 +44,8 @@ pub struct Sample {
     pub editor_gpu_us: Option<u64>,
 }
 
+pub(super) type Histories = std::collections::BTreeMap<WindowId, (WindowId, History)>;
+
 #[derive(Default)]
 pub struct History {
     pub samples: VecDeque<Sample>,
@@ -52,13 +55,6 @@ pub struct History {
 }
 
 impl History {
-    pub fn clear(&mut self) {
-        *self = Self {
-            revision: self.revision.wrapping_add(1),
-            ..Self::default()
-        };
-    }
-
     pub fn wants_frame(&self, arrival: Arrival) -> bool {
         self.samples
             .back()
@@ -187,9 +183,9 @@ impl ProfileLayout {
                 panel.x + 16.0,
                 panel.y + TITLE_HEIGHT + 38.0,
                 panel.w - 32.0,
-                panel.h - 286.0,
+                panel.h - 294.0,
             ),
-            live: Bounds::new(panel.right() - 60.0, panel.y + 5.0, 47.0, 20.0),
+            live: Bounds::new(panel.right() - 83.0, panel.y + 5.0, 47.0, 20.0),
         }
     }
 }
@@ -198,14 +194,8 @@ const PROFILE_CPU: Color = [33, 106, 70, 255];
 const PROFILE_GPU: Color = [104, 72, 162, 255];
 const PROFILE_EDITOR: Color = [159, 92, 21, 255];
 
-pub(super) fn draw(paint: &mut Painter<'_>, panel: Bounds, history: &History) {
+pub(super) fn draw(paint: &mut Painter<'_>, panel: Bounds, history: &History, attached: bool) {
     let layout = ProfileLayout::new(panel);
-    paint.text(
-        Point::new(panel.x + 12.0, panel.y + 6.0),
-        "Profiler",
-        INK,
-        Style::Title,
-    );
     paint.fill(
         layout.live,
         if history.selected.is_none() {
@@ -216,25 +206,30 @@ pub(super) fn draw(paint: &mut Painter<'_>, panel: Bounds, history: &History) {
     );
     paint.centered_text(layout.live, "Live", GREEN, Style::Label);
     let graph = layout.graph;
-    for (offset, label, color) in [
-        (0.0, "Game draw CPU", PROFILE_CPU),
-        (112.0, "Game GPU", PROFILE_GPU),
-        (200.0, "Editor interval", PROFILE_EDITOR),
+    let mut legend_x = graph.x;
+    for (label, color) in [
+        ("Game draw CPU", PROFILE_CPU),
+        ("Game GPU", PROFILE_GPU),
+        ("Editor interval", PROFILE_EDITOR),
     ] {
-        paint.fill(
-            Bounds::new(graph.x + offset, graph.y - 18.0, 5.0, 5.0),
-            color,
-        );
+        paint.fill(Bounds::new(legend_x, graph.y - 18.0, 5.0, 5.0), color);
+        let label_x = legend_x + 9.0;
         paint.text(
-            Point::new(graph.x + offset + 9.0, graph.y - 23.0),
+            Point::new(label_x, graph.y - 23.0),
             label,
             INK,
             Style::Caption,
         );
+        legend_x = label_x + paint.text_width(label, Style::Caption) + 12.0;
     }
     paint.fill(graph, HEADER);
     let Some(latest) = history.samples.back() else {
-        paint.centered_text(graph, "Waiting for frame timings", MUTED, Style::Label);
+        let message = if attached {
+            "Waiting for frame timings"
+        } else {
+            "Choose a Game window"
+        };
+        paint.centered_text(graph, message, MUTED, Style::Label);
         return;
     };
     let visible: Vec<_> = history
@@ -264,12 +259,6 @@ pub(super) fn draw(paint: &mut Painter<'_>, panel: Bounds, history: &History) {
     let y_of = |us: u64| graph.bottom() - 2.0 - (graph.h - 4.0) * (us as f64 / ceiling).min(1.0);
     let budget = y_of(16_667);
     paint.horizontal_rule(Bounds::new(graph.x, budget, graph.w, 1.0), BORDER);
-    paint.text(
-        Point::new(graph.x + 3.0, budget - 15.0),
-        "16.7 ms",
-        MUTED,
-        Style::Number,
-    );
 
     let mut previous: Option<&Sample> = None;
     for sample in visible.into_iter().rev() {
@@ -318,15 +307,36 @@ pub(super) fn draw(paint: &mut Painter<'_>, panel: Bounds, history: &History) {
         }
         previous = Some(sample);
     }
+    let budget_label = "16.7 ms";
+    let budget_label_y = (budget - 17.0).max(graph.y);
+    paint.fill(
+        Bounds::new(
+            graph.x,
+            budget_label_y,
+            paint.text_width(budget_label, Style::Number) + 6.0,
+            16.0,
+        ),
+        HEADER,
+    );
+    paint.text(
+        Point::new(graph.x + 3.0, budget_label_y),
+        budget_label,
+        MUTED,
+        Style::Number,
+    );
     paint.text(
         Point::new(graph.x, graph.bottom() + 3.0),
         "8 s ago",
         MUTED,
         Style::Caption,
     );
+    let now_label = "Now";
     paint.text(
-        Point::new(graph.right() - 27.0, graph.bottom() + 3.0),
-        "Now",
+        Point::new(
+            graph.right() - paint.text_width(now_label, Style::Caption),
+            graph.bottom() + 3.0,
+        ),
+        now_label,
         MUTED,
         Style::Caption,
     );
@@ -374,11 +384,22 @@ fn draw_frame_details(paint: &mut Painter<'_>, graph: Bounds, sample: &Sample) {
             total.saturating_add(*duration)
         })
         .max(1) as f64;
-    let start_x = graph.x + 105.0;
-    let width = graph.w - 170.0;
+    let label_width = stages
+        .iter()
+        .map(|(label, _, _)| paint.text_width(label, Style::Caption))
+        .fold(0.0, f64::max);
+    let max_duration = stages
+        .iter()
+        .map(|(_, duration, _)| *duration)
+        .max()
+        .unwrap_or(0);
+    let duration_width = paint.text_width(&milliseconds(max_duration), Style::Number);
+    let start_x = graph.x + label_width + 10.0;
+    let width = graph.right() - duration_width - 8.0 - start_x;
+    let row_height = 16.0;
     let mut elapsed = 0.0;
     for (row, (label, duration, color)) in stages.into_iter().enumerate() {
-        let row_y = y + 19.0 + row as f64 * 15.0;
+        let row_y = y + 19.0 + row as f64 * row_height;
         paint.text(Point::new(graph.x, row_y), label, INK, Style::Caption);
         paint.fill(Bounds::new(start_x, row_y + 5.0, width, 4.0), HEADER);
         if duration > 0 {
@@ -390,19 +411,18 @@ fn draw_frame_details(paint: &mut Painter<'_>, graph: Bounds, sample: &Sample) {
             );
         }
         elapsed += duration as f64;
+        let value = milliseconds(duration);
         paint.text(
-            Point::new(start_x + width + 7.0, row_y),
-            &format!("{:.2} ms", duration as f64 / 1_000.0),
+            Point::new(
+                graph.right() - paint.text_width(&value, Style::Number),
+                row_y,
+            ),
+            &value,
             INK,
             Style::Number,
         );
     }
-    let gpu = |time: Option<u64>| {
-        time.map_or_else(
-            || "N/A".to_string(),
-            |us| format!("{:.2} ms", us as f64 / 1_000.0),
-        )
-    };
+    let gpu = |time: Option<u64>| time.map_or_else(|| "N/A".to_string(), milliseconds);
     let footer = format!(
         "GPU game {} · editor {} · skipped {}",
         gpu(sample.game.gpu_draw_us),
@@ -410,9 +430,13 @@ fn draw_frame_details(paint: &mut Painter<'_>, graph: Bounds, sample: &Sample) {
         sample.skipped
     );
     paint.text(
-        Point::new(graph.x, y + 174.0),
+        Point::new(graph.x, y + 24.0 + stages.len() as f64 * row_height),
         &footer,
         MUTED,
         Style::Number,
     );
+}
+
+fn milliseconds(us: u64) -> String {
+    format!("{:.2} ms", us as f64 / 1_000.0)
 }

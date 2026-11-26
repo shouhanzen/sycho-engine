@@ -27,7 +27,7 @@ Live timeline (windowed game):
   --watch         Rebuild on source edits and relaunch at the last live checkpoint.
   --editor        Launch the game's timeline editor with live reload and recording.
   --no-recording  Run standalone without opening a timeline.
-  --timeline DIR  Open or create a timeline (default: target/timelines/headful).
+  --timeline DIR  Open or create a timeline (default: games/tetree/.sycho/timelines/headful).
   --fresh         Start a separate timeline. If DIR is given, it must be new.
   --playback      Play a saved timeline from its first snapshot.
   Timeline shortcuts work while the editor Game panel has focus.
@@ -64,7 +64,7 @@ Testing:
                 Env knobs:
                   ROLLOUT_TEST_LIGHT_BUILD_JOBS=4
                   ROLLOUT_TEST_LIGHT_THREADS=1
-  --e2e          cargo test -p game --test e2e_playtest_tests
+  --e2e          cargo test -p tetree --test e2e_playtest_tests
   --video        (e2e) record an mp4 per test via ffmpeg (requires `ffmpeg` on PATH)
   --ffmpeg PATH  (e2e or export) path to ffmpeg binary (sets ROLLOUT_FFMPEG_BIN)
   --profile      run the standalone game and write a trace to target/perf_traces/
@@ -260,13 +260,10 @@ setup_build_cache() {
 FOREGROUND="true"
 ACTION=""
 VIDEO="false"
-PLAYBACK="false"
 EXPORT_PATH=""
 WATCH="false"
 EDITOR="false"
-TIMELINE_PATH=""
-NO_RECORDING="false"
-FRESH="false"
+TIMELINE_ARGS=()
 FFMPEG_BIN=""
 RELEASE="false"
 while [[ $# -gt 0 ]]; do
@@ -287,8 +284,8 @@ while [[ $# -gt 0 ]]; do
       VIDEO="true"
       shift
       ;;
-    --playback)
-      PLAYBACK="true"
+    --no-recording|--fresh|--playback)
+      TIMELINE_ARGS+=("$1")
       shift
       ;;
     --export-video)
@@ -308,21 +305,13 @@ while [[ $# -gt 0 ]]; do
       EDITOR="true"
       shift
       ;;
-    --no-recording)
-      NO_RECORDING="true"
-      shift
-      ;;
     --timeline)
       if [[ $# -lt 2 || "$2" == --* ]]; then
         echo "--timeline requires a directory" >&2
         exit 2
       fi
-      TIMELINE_PATH="$2"
+      TIMELINE_ARGS+=("$1" "$2")
       shift 2
-      ;;
-    --fresh)
-      FRESH="true"
-      shift
       ;;
     --ffmpeg)
       if [[ $# -lt 2 ]]; then
@@ -368,44 +357,22 @@ fi
 cd "$ROOT_DIR"
 setup_build_cache
 
-if [[ "$WATCH" == "true" || "$FRESH" == "true" || "$PLAYBACK" == "true" ]]; then
+if [[ "$WATCH" == "true" ]]; then
   if [[ "$ACTION" != "--start" && "$ACTION" != "--restart" ]]; then
-    echo "--watch, --fresh, and --playback require a windowed --start or --restart" >&2
-    exit 2
-  fi
-  if [[ "$PLAYBACK" == "true" && ( "$WATCH" == "true" || "$FRESH" == "true" ) ]]; then
-    echo "--playback cannot be combined with --watch or --fresh" >&2
+    echo "--watch requires --start or --restart" >&2
     exit 2
   fi
 fi
 
-if [[ -n "$TIMELINE_PATH" && "$ACTION" != "--export-video" ]]; then
-  if [[ "$ACTION" != "--start" && "$ACTION" != "--restart" ]]; then
-    echo "--timeline requires a windowed launch or --export-video" >&2
-    exit 2
-  fi
-fi
-
-if [[ "$NO_RECORDING" == "true" ]]; then
-  if [[ "$EDITOR" == "true" || -n "$TIMELINE_PATH" || "$FRESH" == "true" || "$PLAYBACK" == "true" ]]; then
-    echo "--no-recording requires standalone play without timeline options" >&2
-    exit 2
-  fi
-  if [[ "$ACTION" != "--start" && "$ACTION" != "--restart" ]]; then
-    echo "--no-recording requires --start or --restart" >&2
-    exit 2
-  fi
+if [[ ${#TIMELINE_ARGS[@]} -gt 0 && "$ACTION" != "--start" && "$ACTION" != "--restart" && "$ACTION" != "--export-video" ]]; then
+  echo "timeline options require --start, --restart, or --export-video" >&2
+  exit 2
 fi
 
 # Guard expansions of this array because Bash 3.2 treats an empty array as unset.
 CARGO_PROFILE_ARGS=()
 if [[ "$RELEASE" == "true" ]]; then
   CARGO_PROFILE_ARGS+=(--release)
-fi
-
-if [[ "$ACTION" == "--restart" ]]; then
-  stop_pidfile "$GAME_PID_FILE"
-  ACTION="--start"
 fi
 
 case "$ACTION" in
@@ -422,46 +389,34 @@ case "$ACTION" in
     stop_pidfile "$GAME_PID_FILE"
     ;;
 
-  --start)
-    if is_running_pidfile "$GAME_PID_FILE"; then
-      echo "already running (pid $(cat "$GAME_PID_FILE"))"
-      exit 0
-    fi
-
-    HEADFUL_ARGS=()
+  --start|--restart)
     if [[ "$WATCH" == "true" ]]; then
       LAUNCH=(cargo run -p engine --bin overseer ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} --)
-      HEADFUL_ARGS+=(--package game --bin headful
-        --watch Cargo.toml --watch Cargo.lock
-        --watch engine/Cargo.toml --watch engine/src
-        --watch game/Cargo.toml --watch game/src)
       if [[ "$EDITOR" == "true" ]]; then
-        HEADFUL_ARGS+=(--editor)
+        LAUNCH+=(--editor)
+      else
+        LAUNCH+=(--manifest-path games/tetree/Cargo.toml --package tetree --bin headful)
       fi
       if [[ "$RELEASE" == "true" ]]; then
-        HEADFUL_ARGS+=(--release)
+        LAUNCH+=(--release)
       fi
     else
-      LAUNCH=(cargo run -p game --bin headful ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"})
+      LAUNCH=(cargo run -p tetree --bin headful ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} --)
     fi
 
-    if [[ "$NO_RECORDING" == "true" ]]; then
-      HEADFUL_ARGS+=(--no-recording)
-    elif [[ -n "$TIMELINE_PATH" ]]; then
-      HEADFUL_ARGS+=(--timeline "$TIMELINE_PATH")
-    fi
-    if [[ "$FRESH" == "true" ]]; then
-      HEADFUL_ARGS+=(--fresh)
-    fi
-    if [[ "$PLAYBACK" == "true" ]]; then
-      HEADFUL_ARGS+=(--playback)
-    fi
-
-    if [[ ${#HEADFUL_ARGS[@]} -gt 0 ]]; then
-      if [[ "$WATCH" != "true" ]]; then
-        LAUNCH+=(--)
+    if [[ ${#TIMELINE_ARGS[@]} -gt 0 ]]; then
+      LAUNCH+=("${TIMELINE_ARGS[@]}")
+      # Validate arguments before a restart can stop the current process.
+      if [[ "$ACTION" == "--restart" ]] || is_running_pidfile "$GAME_PID_FILE"; then
+        "${LAUNCH[@]}" --check-launch
       fi
-      LAUNCH+=("${HEADFUL_ARGS[@]}")
+    fi
+
+    if [[ "$ACTION" == "--restart" ]]; then
+      stop_pidfile "$GAME_PID_FILE"
+    elif is_running_pidfile "$GAME_PID_FILE"; then
+      echo "already running (pid $(cat "$GAME_PID_FILE"))"
+      exit 0
     fi
 
     if [[ "$FOREGROUND" == "true" ]]; then
@@ -503,21 +458,21 @@ case "$ACTION" in
         export ROLLOUT_FFMPEG_BIN="$FFMPEG_BIN"
       fi
     fi
-    exec cargo test -p game --test e2e_playtest_tests ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- --nocapture
+    exec cargo test -p tetree --test e2e_playtest_tests ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- --nocapture
     ;;
 
   --export-video)
     EXPORT_ARGS=(--export-video "$EXPORT_PATH")
-    if [[ -n "$TIMELINE_PATH" ]]; then
-      EXPORT_ARGS+=(--timeline "$TIMELINE_PATH")
+    if [[ ${#TIMELINE_ARGS[@]} -gt 0 ]]; then
+      EXPORT_ARGS+=("${TIMELINE_ARGS[@]}")
     fi
     if [[ -n "$FFMPEG_BIN" ]]; then
       export ROLLOUT_FFMPEG_BIN="$FFMPEG_BIN"
     fi
-    exec cargo run -p game --bin headful ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- "${EXPORT_ARGS[@]}"
+    exec cargo run -p tetree --bin headful ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- "${EXPORT_ARGS[@]}"
     ;;
 
   --profile)
-    exec cargo run -p game --bin headful ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- --profile
+    exec cargo run -p tetree --bin headful ${CARGO_PROFILE_ARGS[@]+"${CARGO_PROFILE_ARGS[@]}"} -- --profile
     ;;
 esac

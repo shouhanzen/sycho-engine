@@ -1,0 +1,114 @@
+use std::{error::Error, path::Path, sync::Arc, time::Duration};
+
+use engine::{
+    app::{AppConfig, AppContext, GameApp, TimelineGame, run_game},
+    graphics::Renderer2d,
+    input::InputFrame,
+    launch::{parse_timeline_cli, project_timeline},
+    surface::SurfaceSize,
+    timeline::StateSchema,
+    ui::Rect,
+};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Serialize, Deserialize)]
+struct State {
+    position: (u32, u32),
+    alternate_color: bool,
+}
+
+struct Game;
+
+fn draw(state: &State, renderer: &mut dyn Renderer2d) {
+    renderer.clear([24, 32, 44, 255]);
+    let color = if state.alternate_color {
+        [247, 168, 86, 255]
+    } else {
+        [123, 207, 177, 255]
+    };
+    let (x, y) = state.position;
+    renderer.fill_rect(
+        Rect::new(x.saturating_sub(12), y.saturating_sub(12), 24, 24),
+        color,
+    );
+}
+
+impl GameApp for Game {
+    type State = State;
+
+    fn init_state(&mut self, ctx: &mut AppContext) -> State {
+        State {
+            position: (ctx.surface_size.width / 2, ctx.surface_size.height / 2),
+            alternate_color: false,
+        }
+    }
+
+    fn update_state(
+        &mut self,
+        state: &mut State,
+        input: &InputFrame,
+        _: Duration,
+        ctx: &mut AppContext,
+    ) {
+        if let Some((x, y)) = input.mouse_pos
+            && x < ctx.surface_size.width
+            && y < ctx.surface_size.height
+        {
+            state.position = (x, y);
+        }
+        if !input.mouse_buttons_pressed.is_empty() {
+            state.alternate_color = !state.alternate_color;
+        }
+    }
+
+    fn render(&mut self, state: &State, _: bool, renderer: &mut dyn Renderer2d) {
+        draw(state, renderer);
+    }
+}
+
+impl TimelineGame for Game {
+    type Snapshot = State;
+    type PreviewSnapshot = Arc<State>;
+    const SCHEMA: StateSchema = StateSchema {
+        game: env!("CARGO_PKG_NAME"),
+        version: 1,
+    };
+
+    fn snapshot(state: &State) -> &State {
+        state
+    }
+    fn restore_state(&mut self, snapshot: State) -> State {
+        snapshot
+    }
+    fn preview_snapshot(&self, state: Arc<State>, _: bool) -> Arc<State> {
+        state
+    }
+    fn draw_preview(state: Arc<State>, renderer: &mut dyn Renderer2d) {
+        draw(&state, renderer);
+    }
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let name = env!("CARGO_PKG_NAME");
+    let cli = parse_timeline_cli()?;
+    if cli.help {
+        println!("Move the pointer to move the square. Click to change its color.");
+        return Ok(());
+    }
+    if cli.check_launch {
+        return Ok(());
+    }
+    let config = AppConfig {
+        title: name.into(),
+        desired_size: SurfaceSize::new(640, 400),
+        clamp_to_monitor: true,
+    };
+    run_game(
+        config,
+        Game,
+        cli.run_config(project_timeline(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            name,
+        ))?,
+    )
+}

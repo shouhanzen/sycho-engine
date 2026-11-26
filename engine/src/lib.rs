@@ -3,7 +3,10 @@ pub mod audio;
 pub mod embedded;
 pub mod gpu_timer;
 pub mod graphics;
+pub mod input;
+pub mod launch;
 mod offscreen;
+pub mod persistence;
 pub mod pixels_renderer;
 pub mod profiling;
 pub mod recording;
@@ -13,6 +16,8 @@ pub mod reload;
 pub mod shared_surface;
 pub mod slider;
 pub mod surface;
+pub mod tiles;
+pub mod tilesets;
 pub mod timeline;
 pub mod ui;
 
@@ -55,6 +60,12 @@ impl<G: GameLogic> HeadlessRunner<G> {
 
     pub fn state_mut(&mut self) -> &mut G::State {
         &mut self.state
+    }
+
+    pub fn restart(&mut self, game: G, reset_state: impl FnOnce(&G, &mut G::State)) {
+        reset_state(&game, &mut self.state);
+        self.game = game;
+        self.frame = 0;
     }
 
     pub fn step(&mut self, input: G::Input) -> usize {

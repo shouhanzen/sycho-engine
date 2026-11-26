@@ -6,10 +6,8 @@ use std::{
 
 use engine::{
     GameLogic,
-    graphics::{CpuRenderer, Renderer2d},
     recording::{Mp4Config, Mp4Recorder},
-    regression::{VideoCaptureConfig, record_state_and_video_then_replay_and_compare},
-    surface::SurfaceSize,
+    regression::{VideoCaptureConfig, record_state_and_export_video, video_framemd5s},
 };
 
 fn unique_temp_dir() -> PathBuf {
@@ -52,28 +50,29 @@ fn engine_regression_harness_record_replay_video_roundtrips() {
         mp4: Mp4Config {
             width,
             height,
-            fps: 30,
+            fps: 25,
         },
-        hold_frames: 1,
+        hold_frames: 2,
     };
 
     let out_dir = unique_temp_dir();
-    let artifacts = record_state_and_video_then_replay_and_compare(
+    let artifacts = record_state_and_export_video(
         "engine_regression_harness_record_replay_video_roundtrips",
         &out_dir,
         Counter,
         [20, 30, 40, 50],
         video,
-        |state: &u8, buf: &mut [u8], width: u32, height: u32| {
-            let mut gfx = CpuRenderer::new(buf, SurfaceSize::new(width, height));
-            gfx.clear([*state, 0, 0, 255]);
-        },
+        |state, gfx| gfx.clear([*state, 0, 0, 255]),
     )
     .expect("regression harness should complete");
 
-    // Clean up on success (keep artifacts if the test fails, for debugging).
-    let _ = fs::remove_dir_all(artifacts.timeline);
-    let _ = fs::remove_file(artifacts.live_mp4);
-    let _ = fs::remove_file(artifacts.replay_mp4);
+    let hashes = video_framemd5s(&artifacts.video).expect("decode exported MP4");
+    assert_eq!(hashes.len(), 9);
+    for frames in hashes.windows(3).step_by(2) {
+        assert_eq!(frames[0], frames[1]);
+        assert_ne!(frames[1], frames[2]);
+    }
+
+    // Keep artifacts if the test fails, for debugging.
     let _ = fs::remove_dir_all(out_dir);
 }

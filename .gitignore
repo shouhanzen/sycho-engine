@@ -7,6 +7,8 @@
 .go*.log
 .go*.pid
 /.sycho-board.json
+/.sycho-games.json
+**/.sycho/
 
 # === Editor / OS cruft ===
 .DS_Store

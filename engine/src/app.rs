@@ -1,151 +1,78 @@
 use crate::profiling::{
     FrameOutput, FrameTimings, PreviewProfile, ProfileConfig, Span, TraceCapture, micros,
 };
-use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::env;
 use std::error::Error;
-use std::ffi::OsString;
-use std::hash::Hash;
 use std::io;
-use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::TryRecvError;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Serialize, de::DeserializeOwned};
 
-use pixels::{Pixels, PixelsBuilder, SurfaceTexture};
-use winit::dpi::PhysicalSize;
-use winit::event::{
-    ElementState, Event, KeyboardInput, MouseButton, MouseScrollDelta, VirtualKeyCode, WindowEvent,
-};
+use pixels::{Pixels, PixelsBuilder, SurfaceTexture, wgpu::PresentMode};
+use winit::dpi::{LogicalSize, PhysicalSize, Size};
+use winit::event::{Event, WindowEvent};
 use winit::event_loop::{ControlFlow, EventLoop};
 use winit::window::{Window, WindowBuilder};
 
 use crate::embedded::{
-    ADDRESS_ENV, DEFAULT_PREVIEW_SIZE, EditorEvent, GPU_PREVIEW_EXIT_CODE, GameLink, MasterVolume,
-    PreviewMetadata, TimelineStatus, valid_preview_size,
+    ADDRESS_ENV, DEFAULT_PREVIEW_SIZE, DISPLAY_ENV, EditorEvent, GPU_PREVIEW_EXIT_CODE, GameLink,
+    MasterVolume, PreviewMetadata, TimelineStatus, valid_display_metrics,
 };
 use crate::graphics::Renderer2d;
-use crate::offscreen::{GpuPreview, PreviewWorker};
-use crate::pixels_renderer::PixelsRenderer2d;
-use crate::reload::{self, ProcessCommand, RELOAD_EXIT_CODE};
-use crate::surface::SurfaceSize;
-use crate::timeline::{
-    Frame, StateSchema, Timeline, TimelineCommand, TimelineWorker, session_directory,
+pub use crate::input::InputFrame;
+pub use crate::launch::{
+    RecordingOptions, RunConfig, TimelineCli, TimelineConfig, parse_timeline_cli,
 };
+use crate::offscreen::{GpuPreview, PreviewWorker};
+use crate::pixels_renderer::{PixelsRenderer2d, env_bool};
+use crate::reload::{self, ProcessCommand, RELOAD_EXIT_CODE};
+use crate::surface::{DisplayMetrics, SurfaceSize};
+use crate::tiles::{LoadedLevel, TileGrid, TileLevel};
+use crate::tilesets::Tilesets;
+use crate::timeline::{
+    BookmarkEdit, ForkState, Frame, StateSchema, Timeline, TimelineCommand, TimelineWorker,
+};
+
+const FRAME_INTERVAL: Duration = Duration::from_nanos(16_666_667);
 
 pub struct AppConfig {
     pub title: String,
-    pub desired_size: PhysicalSize<u32>,
+    pub desired_size: SurfaceSize,
     pub clamp_to_monitor: bool,
-    pub vsync: Option<bool>,
-    pub present_mode: Option<pixels::wgpu::PresentMode>,
-}
-
-#[derive(Debug, Clone)]
-pub struct TimelineConfig {
-    pub directory: PathBuf,
-    pub playback: bool,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct TimelineCli {
-    pub help: bool,
-    pub profile: bool,
-    pub no_recording: bool,
-    pub timeline_path: Option<PathBuf>,
-    pub fresh: bool,
-    pub playback: bool,
-    pub export_video: Option<PathBuf>,
-}
-
-/// Options supplied by the host when launching a game.
-pub enum RunConfig {
-    Live { timeline: Option<TimelineConfig> },
-    Profile(ProfileConfig),
-}
-
-impl TimelineCli {
-    pub fn recording(&self, default_directory: PathBuf) -> io::Result<Option<TimelineConfig>> {
-        if self.no_recording {
-            return Ok(None);
-        }
-        Ok(Some(TimelineConfig {
-            directory: session_directory(
-                default_directory,
-                self.timeline_path.clone(),
-                self.fresh,
-            )?,
-            playback: self.playback,
-        }))
-    }
-}
-
-pub fn parse_timeline_cli() -> io::Result<TimelineCli> {
-    parse_timeline_args(env::args_os().skip(1))
-}
-
-fn parse_timeline_args(mut args: impl Iterator<Item = OsString>) -> io::Result<TimelineCli> {
-    let mut cli = TimelineCli::default();
-    while let Some(arg) = args.next() {
-        let arg = arg.to_string_lossy();
-        match arg.as_ref() {
-            "-h" | "--help" => cli.help = true,
-            "--profile" => cli.profile = true,
-            "--fresh" => cli.fresh = true,
-            "--no-recording" => cli.no_recording = true,
-            "--playback" => cli.playback = true,
-            "--timeline" | "--export-video" => {
-                let path = args
-                    .next()
-                    .filter(|path| !path.to_string_lossy().starts_with('-'))
-                    .map(PathBuf::from)
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("{arg} requires a path"),
-                        )
-                    })?;
-                if arg == "--timeline" {
-                    cli.timeline_path = Some(path);
-                } else {
-                    cli.export_video = Some(path);
-                }
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unknown argument: {arg} (try --help)"),
-                ));
-            }
-        }
-    }
-    if (cli.fresh && cli.playback) || (cli.export_video.is_some() && (cli.fresh || cli.playback)) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "--fresh, --playback, and --export-video are mutually exclusive",
-        ));
-    }
-    let timeline_options =
-        cli.fresh || cli.playback || cli.timeline_path.is_some() || cli.export_video.is_some();
-    if cli.profile && timeline_options {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "--profile cannot be combined with timeline options",
-        ));
-    }
-    if cli.no_recording && (timeline_options || cli.profile) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "--no-recording cannot be combined with timeline options or --profile",
-        ));
-    }
-    Ok(cli)
 }
 
 /// The game-facing context shared by windowed and embedded rendering.
 pub struct AppContext {
+    /// The size in render pixels, kept for games that use pixel coordinates.
     pub surface_size: SurfaceSize,
+    display: DisplayMetrics,
+}
+
+impl AppContext {
+    pub fn new(display: DisplayMetrics) -> Self {
+        Self {
+            surface_size: display.render_size,
+            display,
+        }
+    }
+
+    pub fn for_pixels(size: SurfaceSize) -> Self {
+        Self::new(DisplayMetrics::at_1x(size))
+    }
+
+    pub fn display(&self) -> DisplayMetrics {
+        self.display
+    }
+
+    fn set_display(&mut self, display: DisplayMetrics, input: &mut InputFrame) {
+        if self.display != display {
+            input.mouse_pos = None;
+        }
+        *self = Self::new(display);
+    }
 }
 
 /// Native window and presentation state for host-level applications.
@@ -156,193 +83,27 @@ struct WindowContext {
 }
 
 impl WindowContext {
-    fn resize(&mut self, size: PhysicalSize<u32>) {
+    fn resize(&mut self, size: PhysicalSize<u32>, scale_factor: f64, input: &mut InputFrame) {
         if size.width == 0 || size.height == 0 {
             return;
         }
         let size = SurfaceSize::new(size.width, size.height);
-        self.app.surface_size = size;
-        if let Err(err) = self.renderer.resize(size) {
+        self.app
+            .set_display(DisplayMetrics::for_surface(size, scale_factor), input);
+        if size != self.renderer.size()
+            && let Err(err) = self.renderer.resize(size)
+        {
             eprintln!("resize failed: {err}");
         }
         self.window.request_redraw();
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct InputFrame {
-    pub mouse_pos: Option<(u32, u32)>,
-    pub mouse_buttons_down: HashSet<MouseButton>,
-    pub mouse_buttons_pressed: HashSet<MouseButton>,
-    pub mouse_buttons_released: HashSet<MouseButton>,
-    pub keys_down: HashSet<VirtualKeyCode>,
-    pub keys_pressed: HashSet<VirtualKeyCode>,
-    pub keys_released: HashSet<VirtualKeyCode>,
-    pub scroll_x: f32,
-    pub scroll_y: f32,
-    pub window_focused: bool,
-}
-
-impl Default for InputFrame {
-    fn default() -> Self {
-        Self {
-            mouse_pos: None,
-            mouse_buttons_down: HashSet::new(),
-            mouse_buttons_pressed: HashSet::new(),
-            mouse_buttons_released: HashSet::new(),
-            keys_down: HashSet::new(),
-            keys_pressed: HashSet::new(),
-            keys_released: HashSet::new(),
-            scroll_x: 0.0,
-            scroll_y: 0.0,
-            // Avoid gating controls before the OS sends an initial focus event.
-            window_focused: true,
-        }
-    }
-}
-
-impl InputFrame {
-    fn apply_key_state(&mut self, key: VirtualKeyCode, state: ElementState) {
-        apply_button_transition(
-            &mut self.keys_down,
-            &mut self.keys_pressed,
-            &mut self.keys_released,
-            key,
-            state,
-        );
-    }
-
-    fn apply_mouse_button_state(&mut self, button: MouseButton, state: ElementState) {
-        apply_button_transition(
-            &mut self.mouse_buttons_down,
-            &mut self.mouse_buttons_pressed,
-            &mut self.mouse_buttons_released,
-            button,
-            state,
-        );
-    }
-
-    fn apply_scroll_delta(&mut self, delta: &MouseScrollDelta) {
-        match delta {
-            MouseScrollDelta::LineDelta(x, y) => {
-                self.scroll_x += *x;
-                self.scroll_y += *y;
-            }
-            MouseScrollDelta::PixelDelta(pos) => {
-                self.scroll_x += (pos.x as f32) / 120.0;
-                self.scroll_y += (pos.y as f32) / 120.0;
-            }
-        }
-    }
-
-    fn set_window_focus(&mut self, focused: bool) {
-        self.window_focused = focused;
-        if !focused {
-            self.keys_down.clear();
-            self.keys_pressed.clear();
-            self.keys_released.clear();
-            self.mouse_buttons_down.clear();
-            self.mouse_buttons_pressed.clear();
-            self.mouse_buttons_released.clear();
-        }
-    }
-
-    fn apply_editor_event(&mut self, event: EditorEvent) {
-        match event {
-            EditorEvent::Key(key, state) => self.apply_key_state(key, state),
-            EditorEvent::Button(button, state) => self.apply_mouse_button_state(button, state),
-            EditorEvent::Pointer(position) => self.mouse_pos = position,
-            EditorEvent::Scroll(x, y) => {
-                self.scroll_x += x;
-                self.scroll_y += y;
-            }
-            EditorEvent::Focus(focused) => self.set_window_focus(focused),
-            EditorEvent::ReleaseInput => {
-                let focused = self.window_focused;
-                self.set_window_focus(false);
-                self.window_focused = focused;
-                self.mouse_pos = None;
-            }
-            EditorEvent::Resize(_)
-            | EditorEvent::Profile(_)
-            | EditorEvent::MasterVolume { .. }
-            | EditorEvent::Timeline(_)
-            | EditorEvent::ReleaseSurface(_)
-            | EditorEvent::UseRgba => {}
-        }
-    }
-
-    fn clear_frame_transients(&mut self) {
-        self.mouse_buttons_pressed.clear();
-        self.mouse_buttons_released.clear();
-        self.keys_pressed.clear();
-        self.keys_released.clear();
-        self.scroll_x = 0.0;
-        self.scroll_y = 0.0;
-    }
-}
-
-fn apply_button_transition<T>(
-    down: &mut HashSet<T>,
-    pressed: &mut HashSet<T>,
-    released: &mut HashSet<T>,
-    button: T,
-    state: ElementState,
-) where
-    T: Copy + Eq + Hash,
-{
-    match state {
-        ElementState::Pressed => {
-            if down.insert(button) {
-                pressed.insert(button);
-            }
-        }
-        ElementState::Released => {
-            if down.remove(&button) {
-                released.insert(button);
-            }
-        }
-    }
-}
-
-fn apply_window_event_to_input(input: &mut InputFrame, event: &WindowEvent) {
-    match event {
-        WindowEvent::CursorMoved { position, .. } => {
-            let new_x = position.x.max(0.0) as u32;
-            let new_y = position.y.max(0.0) as u32;
-            input.mouse_pos = Some((new_x, new_y));
-        }
-        WindowEvent::CursorLeft { .. } => input.mouse_pos = None,
-        WindowEvent::MouseInput {
-            state: mouse_state,
-            button,
-            ..
-        } => {
-            input.apply_mouse_button_state(*button, *mouse_state);
-        }
-        WindowEvent::KeyboardInput {
-            input:
-                KeyboardInput {
-                    state: key_state,
-                    virtual_keycode: Some(key),
-                    ..
-                },
-            ..
-        } => {
-            input.apply_key_state(*key, *key_state);
-        }
-        WindowEvent::MouseWheel { delta, .. } => {
-            input.apply_scroll_delta(delta);
-        }
-        WindowEvent::Focused(focused) => {
-            input.set_window_focus(*focused);
-        }
-        _ => {}
-    }
-}
-
 pub trait GameApp {
     type State;
+
+    /// Use logical points for pointer input and the requested standalone window size.
+    const LOGICAL_DISPLAY: bool = false;
 
     fn init_state(&mut self, _ctx: &mut AppContext) -> Self::State;
 
@@ -354,7 +115,7 @@ pub trait GameApp {
         _ctx: &mut AppContext,
     );
 
-    fn render(&mut self, state: &Self::State, renderer: &mut dyn Renderer2d);
+    fn render(&mut self, state: &Self::State, timeline_paused: bool, renderer: &mut dyn Renderer2d);
 
     /// Receives the engine's timings once the frame's CPU render work has completed.
     fn on_frame_timings(&mut self, _timings: FrameTimings) {}
@@ -372,37 +133,57 @@ pub trait GameApp {
     }
 
     fn shutdown(&mut self, _state: &Self::State) {}
+}
 
-    fn handle_event(
-        &mut self,
-        _event: &Event<()>,
-        _state: &mut Self::State,
-        _input: &mut InputFrame,
-        _ctx: &mut AppContext,
-        _control_flow: &mut ControlFlow,
-    ) -> bool {
-        // Lifecycle-only hook: use this for close/exit flow, redraw cadence, and loop teardown.
-        // Gameplay/UI keyboard+mouse decisions should read from `InputFrame` in `update_state`.
-        false
+fn update_game<G: GameApp>(
+    game: &mut G,
+    state: &mut G::State,
+    input: &mut InputFrame,
+    dt: Duration,
+    ctx: &mut AppContext,
+) {
+    let pointer = input.mouse_pos;
+    if G::LOGICAL_DISPLAY {
+        input.mouse_pos = pointer.and_then(|point| ctx.display().logical_pointer(point));
+    }
+    game.update_state(state, input, dt, ctx);
+    input.mouse_pos = pointer;
+}
+
+fn parse_present_mode(value: &str) -> Option<PresentMode> {
+    match value.to_ascii_lowercase().as_str() {
+        "auto" | "auto_vsync" | "vsync" => Some(PresentMode::AutoVsync),
+        "auto_no_vsync" | "auto_novsync" | "no_vsync" | "novsync" => Some(PresentMode::AutoNoVsync),
+        "fifo" => Some(PresentMode::Fifo),
+        "mailbox" => Some(PresentMode::Mailbox),
+        "immediate" => Some(PresentMode::Immediate),
+        _ => None,
     }
 }
 
 fn create_app_context(
     config: &AppConfig,
     event_loop: &EventLoop<()>,
+    logical_window: bool,
 ) -> Result<WindowContext, Box<dyn Error>> {
-    let monitor_size = if config.clamp_to_monitor {
-        event_loop.primary_monitor().map(|m| m.size())
+    let mut initial_size = config.desired_size;
+    if config.clamp_to_monitor
+        && let Some(monitor) = event_loop.primary_monitor()
+    {
+        let mut limit = SurfaceSize::new(monitor.size().width, monitor.size().height);
+        if logical_window {
+            limit = limit.to_logical(monitor.scale_factor());
+        }
+        initial_size.width = initial_size.width.min(limit.width);
+        initial_size.height = initial_size.height.min(limit.height);
+    }
+    let initial_size = if logical_window {
+        Size::Logical(LogicalSize::new(
+            f64::from(initial_size.width),
+            f64::from(initial_size.height),
+        ))
     } else {
-        None
-    };
-    let initial_size = if let Some(monitor) = monitor_size {
-        PhysicalSize::new(
-            config.desired_size.width.min(monitor.width),
-            config.desired_size.height.min(monitor.height),
-        )
-    } else {
-        config.desired_size
+        Size::Physical(PhysicalSize::new(initial_size.width, initial_size.height))
     };
     let window = WindowBuilder::new()
         .with_title(config.title.clone())
@@ -412,22 +193,25 @@ fn create_app_context(
     let window_size = window.inner_size();
     let surface_size = SurfaceSize::new(window_size.width, window_size.height);
 
-    let build_pixels =
-        |present_mode: Option<pixels::wgpu::PresentMode>| -> Result<Pixels, pixels::Error> {
-            let surface_texture =
-                SurfaceTexture::new(surface_size.width, surface_size.height, &window);
-            let mut pixels_builder =
-                PixelsBuilder::new(surface_size.width, surface_size.height, surface_texture);
-            if let Some(vsync) = config.vsync {
-                pixels_builder = pixels_builder.enable_vsync(vsync);
-            }
-            if let Some(mode) = present_mode {
-                pixels_builder = pixels_builder.present_mode(mode);
-            }
-            pixels_builder.build()
-        };
+    let vsync = env_bool("ROLLOUT_HEADFUL_VSYNC");
+    let present_mode = env::var("ROLLOUT_HEADFUL_PRESENT_MODE")
+        .ok()
+        .as_deref()
+        .and_then(parse_present_mode);
+    let build_pixels = |present_mode: Option<PresentMode>| -> Result<Pixels, pixels::Error> {
+        let surface_texture = SurfaceTexture::new(surface_size.width, surface_size.height, &window);
+        let mut pixels_builder =
+            PixelsBuilder::new(surface_size.width, surface_size.height, surface_texture);
+        if let Some(vsync) = vsync {
+            pixels_builder = pixels_builder.enable_vsync(vsync);
+        }
+        if let Some(mode) = present_mode {
+            pixels_builder = pixels_builder.present_mode(mode);
+        }
+        pixels_builder.build()
+    };
 
-    let pixels = if let Some(mode) = config.present_mode {
+    let pixels = if let Some(mode) = present_mode {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_pixels(Some(mode)))) {
             Ok(res) => res?,
             Err(_) => {
@@ -443,38 +227,53 @@ fn create_app_context(
     };
 
     let renderer = PixelsRenderer2d::new_auto(pixels, surface_size)?;
+    let display = DisplayMetrics::for_surface(surface_size, window.scale_factor());
     Ok(WindowContext {
         window,
         renderer,
-        app: AppContext { surface_size },
+        app: AppContext::new(display),
     })
 }
 
 /// Hooks for a game whose simulation can continue from a recorded snapshot.
 pub trait TimelineGame: GameApp {
-    type Snapshot: Clone + Send + Serialize + DeserializeOwned + 'static;
+    type Snapshot: Clone + Send + Sync + Serialize + DeserializeOwned + 'static;
     type PreviewSnapshot: Send + 'static;
     const SCHEMA: StateSchema;
 
     fn snapshot(state: &Self::State) -> &Self::Snapshot;
     fn restore_state(&mut self, snapshot: Self::Snapshot) -> Self::State;
 
-    /// Capture the data that the editor preview can draw independently of gameplay.
-    fn preview_snapshot(&self, state: &Self::State) -> Self::PreviewSnapshot;
+    fn tile_level(_state: &Self::State) -> Option<TileLevel> {
+        None
+    }
+
+    fn set_tile_grid(&mut self, _grid: Option<Arc<TileGrid>>) {}
+
+    fn set_tilesets(&mut self, _tilesets: Arc<Tilesets>) {}
+
+    /// Attach any presentation data to the shared game snapshot for the editor renderer.
+    fn preview_snapshot(
+        &self,
+        state: Arc<Self::Snapshot>,
+        timeline_paused: bool,
+    ) -> Self::PreviewSnapshot;
 
     fn draw_preview(snapshot: Self::PreviewSnapshot, renderer: &mut dyn Renderer2d);
-
-    fn set_timeline_paused(&mut self, _paused: bool) {}
 }
 
-pub fn run_game<G>(config: AppConfig, game: G, run: RunConfig) -> Result<(), Box<dyn Error>>
+pub fn run_game<G>(mut config: AppConfig, game: G, run: RunConfig) -> Result<(), Box<dyn Error>>
 where
     G: TimelineGame + 'static,
 {
     let embedded = env::var_os(ADDRESS_ENV).is_some();
     let (timeline, trace) = match run {
         RunConfig::Live { timeline } => (timeline, None),
-        RunConfig::Profile(profile) => (None, Some(TraceCapture::new(profile))),
+        RunConfig::Profile => {
+            let profile = ProfileConfig::from_env(config.desired_size);
+            config.desired_size = profile.window_size;
+            (None, Some(TraceCapture::new(profile)))
+        }
     };
     let Some(options) = timeline else {
         if embedded {
@@ -487,6 +286,9 @@ where
         return run_windowed(config, game, None, trace);
     };
     let (mut timeline, mut snapshot) = Timeline::open(&options.directory, G::SCHEMA)?;
+    if !options.playback {
+        timeline.warm_seek_index();
+    }
     let playback = if options.playback {
         snapshot = Some(timeline.pause_at_start()?);
         let from_ms = timeline
@@ -520,6 +322,9 @@ where
         }
         None => None,
     };
+    if !options.playback {
+        timeline.enable_retention()?;
+    }
     let session = TimelineSession {
         paused: timeline.is_paused(),
         cursor: timeline.position(),
@@ -527,6 +332,8 @@ where
         clock_position: timeline.position().map_or(0, |frame| frame.at_ms),
         clock_start: Instant::now(),
         playback,
+        bookmark_revision: timeline.bookmark_revision(),
+        detached_bookmark: timeline.detached_bookmark(),
         writer: TimelineWorker::start(timeline)?,
         snapshot,
         capture_failed: false,
@@ -559,6 +366,12 @@ enum TimelineAction {
     PlayUntil(u64),
 }
 
+enum TimelineInput {
+    Control(TimelineCommand),
+    Bookmark(BookmarkEdit),
+    Reset,
+}
+
 struct TimelineSession<G: TimelineGame> {
     writer: TimelineWorker<G::Snapshot>,
     capture_failed: bool,
@@ -568,6 +381,8 @@ struct TimelineSession<G: TimelineGame> {
     clock_position: u64,
     clock_start: Instant,
     playback: Option<Playback>,
+    bookmark_revision: u64,
+    detached_bookmark: Option<u64>,
     snapshot: Option<G::Snapshot>,
 }
 
@@ -624,7 +439,6 @@ impl<G: TimelineGame> TimelineSession<G> {
             self.tip = position;
             state
         };
-        game.set_timeline_paused(self.paused);
         self.clock_start = Instant::now();
         if let Some(playback) = &mut self.playback {
             playback.started = self.clock_start;
@@ -632,43 +446,69 @@ impl<G: TimelineGame> TimelineSession<G> {
         Ok(state)
     }
 
-    fn should_update(
-        &mut self,
-        game: &mut G,
-        state: &mut G::State,
-        command: Option<TimelineCommand>,
-    ) -> bool {
-        self.poll_capture();
-        let action = if let Some(command) = command {
-            let command = match command {
-                TimelineCommand::TogglePlayPause
-                    if self.paused
-                        && self.playback.is_none()
-                        && self.tip.is_some()
-                        && self.cursor == self.tip =>
-                {
-                    TimelineCommand::ResumeLive
-                }
-                TimelineCommand::TogglePlayPause => TimelineCommand::TogglePlayback,
-                command => command,
-            };
-            let was_playing = self.playback.take().is_some();
-            if command == TimelineCommand::TogglePlayback && was_playing {
-                return false;
+    fn reset(&mut self, game: &mut G, state: &mut G::State, ctx: &mut AppContext) -> bool {
+        let initial = game.init_state(ctx);
+        match self.writer.reset(G::snapshot(&initial).clone()) {
+            Ok(position) => {
+                self.poll_capture();
+                *state = initial;
+                self.capture_failed = false;
+                self.paused = false;
+                self.cursor = Some(position);
+                self.tip = Some(position);
+                self.clock_position = position.at_ms;
+                self.clock_start = Instant::now();
+                self.playback = None;
+                self.detached_bookmark = None;
+                true
             }
-            TimelineAction::Control(command)
-        } else if let Some(playback) = &self.playback {
-            let target = playback
-                .from_ms
-                .saturating_add(elapsed_ms(playback.started));
-            if target < playback.next_ms {
-                return false;
+            Err(err) => {
+                *state = game.restore_state(G::snapshot(state).clone());
+                eprintln!("could not reset timeline: {err}");
+                false
             }
-            TimelineAction::PlayUntil(target)
-        } else {
-            return !self.paused;
-        };
+        }
+    }
 
+    fn apply_command(&mut self, game: &mut G, state: &mut G::State, command: TimelineCommand) {
+        self.poll_capture();
+        let command = match command {
+            TimelineCommand::TogglePause | TimelineCommand::TogglePlayPause
+                if self.detached_bookmark.is_some() =>
+            {
+                TimelineCommand::ReturnFromBookmark
+            }
+            TimelineCommand::TogglePlayPause if self.status().play_resumes_live() => {
+                TimelineCommand::ResumeLive
+            }
+            TimelineCommand::TogglePlayPause => TimelineCommand::TogglePlayback,
+            command => command,
+        };
+        let was_playing = self.playback.take().is_some();
+        if command == TimelineCommand::TogglePlayback && was_playing {
+            return;
+        }
+        self.apply_action(game, state, TimelineAction::Control(command));
+    }
+
+    fn advance_playback(&mut self, game: &mut G, state: &mut G::State) {
+        self.poll_capture();
+        let Some(playback) = &self.playback else {
+            return;
+        };
+        let target = playback
+            .from_ms
+            .saturating_add(elapsed_ms(playback.started));
+        if target >= playback.next_ms {
+            self.apply_action(game, state, TimelineAction::PlayUntil(target));
+        }
+    }
+
+    fn is_live(&self) -> bool {
+        !self.paused
+    }
+
+    fn apply_action(&mut self, game: &mut G, state: &mut G::State, action: TimelineAction) {
         let was_paused = self.paused;
         let live_state = (!was_paused).then(|| G::snapshot(state).clone());
         let at_ms = self.live_time_ms();
@@ -688,6 +528,8 @@ impl<G: TimelineGame> TimelineSession<G> {
                         TimelineCommand::Rewind => timeline.rewind(),
                         TimelineCommand::Forward => timeline.forward(),
                         TimelineCommand::Seek(time) => timeline.seek(time),
+                        TimelineCommand::OpenBookmark(id) => timeline.open_bookmark(id).map(Some),
+                        TimelineCommand::ReturnFromBookmark => timeline.return_from_bookmark(),
                         _ => Ok(None),
                     })
                 }
@@ -709,14 +551,15 @@ impl<G: TimelineGame> TimelineSession<G> {
                 timeline.tip_position(),
                 changed,
                 next,
+                timeline.detached_bookmark(),
             ))
         });
         match result {
-            Ok((paused, cursor, tip, changed, next)) => {
+            Ok((paused, cursor, tip, changed, next, detached_bookmark)) => {
                 self.poll_capture();
                 self.paused = paused;
-                game.set_timeline_paused(paused);
                 self.cursor = cursor;
+                self.detached_bookmark = detached_bookmark;
                 match tip {
                     Ok(tip) => self.tip = tip,
                     Err(err) => eprintln!("timeline tip unavailable: {err}"),
@@ -750,7 +593,6 @@ impl<G: TimelineGame> TimelineSession<G> {
                 eprintln!("timeline control failed: {err}");
             }
         }
-        false
     }
 
     fn status(&self) -> TimelineStatus {
@@ -759,15 +601,49 @@ impl<G: TimelineGame> TimelineSession<G> {
             tip: self.tip,
             paused: self.paused,
             playing: self.playback.is_some(),
+            bookmark_revision: self.bookmark_revision,
+            detached_bookmark: self.detached_bookmark,
         }
     }
 
-    fn after_update(&mut self, state: &G::State) {
+    fn edit_bookmark(&mut self, state: &G::State, edit: BookmarkEdit) {
+        let snapshot = (!self.paused && matches!(edit, BookmarkEdit::Save(_)))
+            .then(|| G::snapshot(state).clone());
+        let at_ms = self.live_time_ms();
+        let result = self.writer.request(move |timeline| {
+            let edit = match edit {
+                BookmarkEdit::Save(name) => (|| {
+                    if let Some(state) = snapshot {
+                        timeline.checkpoint_at(&state, at_ms)?;
+                    }
+                    timeline.save_bookmark(&name).map(|_| ())
+                })(),
+                BookmarkEdit::Remove(id) => timeline.remove_bookmark(id),
+            };
+            Ok((edit, timeline.bookmark_revision(), timeline.position()))
+        });
+        match result {
+            Ok((edit, revision, position)) => {
+                self.poll_capture();
+                self.bookmark_revision = revision;
+                if !self.paused {
+                    self.cursor = position;
+                    self.tip = position;
+                }
+                if let Err(err) = edit {
+                    eprintln!("could not edit bookmark: {err}");
+                }
+            }
+            Err(err) => eprintln!("could not edit bookmark: {err}"),
+        }
+    }
+
+    fn capture_frame(&mut self, snapshot: impl FnOnce() -> Arc<G::Snapshot>) {
         if self.capture_failed {
             return;
         }
         let at_ms = self.live_time_ms();
-        if let Err(err) = self.writer.capture(G::snapshot(state).clone(), at_ms) {
+        if let Err(err) = self.writer.capture(snapshot(), at_ms) {
             self.poll_capture();
             if !self.capture_failed {
                 eprintln!("could not queue timeline checkpoint: {err}");
@@ -807,23 +683,64 @@ fn exit_for_command<G: TimelineGame>(
     }
 }
 
+fn sync_tiles<G: TimelineGame>(
+    game: &mut G,
+    state: &G::State,
+    loaded: &mut Option<LoadedLevel>,
+    reload: bool,
+    embedded: bool,
+) -> io::Result<()> {
+    if let Some(spec) = G::tile_level(state) {
+        if let Some(level) = loaded.as_mut().filter(|level| level.matches(spec)) {
+            if reload {
+                level.refresh()?;
+                game.set_tile_grid(Some(level.grid()));
+            }
+            if level.poll_assets() {
+                game.set_tilesets(Arc::clone(&level.tilesets));
+            }
+        } else {
+            let level = LoadedLevel::load(spec, embedded)?;
+            game.set_tilesets(Arc::clone(&level.tilesets));
+            game.set_tile_grid(Some(level.grid()));
+            *loaded = Some(level);
+        }
+    } else if loaded.take().is_some() {
+        game.set_tile_grid(None);
+        game.set_tilesets(Arc::default());
+    }
+    Ok(())
+}
+
 fn run_embedded<G: TimelineGame>(
     mut game: G,
     mut session: TimelineSession<G>,
     editor: GameLink,
     preview: PreviewWorker<G::PreviewSnapshot>,
 ) -> Result<(), Box<dyn Error>> {
-    let mut ctx = AppContext {
-        surface_size: DEFAULT_PREVIEW_SIZE,
-    };
+    let display = env::var(DISPLAY_ENV)
+        .ok()
+        .and_then(|encoded| serde_json::from_str(&encoded).ok())
+        .filter(|display| valid_display_metrics(*display))
+        .unwrap_or_else(|| DisplayMetrics::at_1x(DEFAULT_PREVIEW_SIZE));
+    let mut ctx = AppContext::new(display);
     let mut state = session.start(&mut game, &mut ctx)?;
+    let mut tiles = None;
+    sync_tiles(&mut game, &state, &mut tiles, false, true)?;
     let overseer = reload::listen_for_overseer();
     let mut input = InputFrame::default();
     let mut last_frame = Instant::now();
     let mut deadline = last_frame;
-    let interval = Duration::from_secs_f64(1.0 / 60.0);
     let mut profile_enabled = false;
     let mut last_volume_request = None;
+    // Keep the same snapshots the preview renders, including live states
+    // that have not reached the timeline writer yet.
+    const FORK_FRAMES: usize = 180;
+    let first_stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let mut fork_frames = VecDeque::<(u64, bool, Arc<G::Snapshot>)>::with_capacity(FORK_FRAMES);
     let mut frame = 0;
     let mut tick = 0;
     let exit_code = 'game: loop {
@@ -846,6 +763,7 @@ fn run_embedded<G: TimelineGame>(
         let mut commands = Vec::new();
         let mut volume_change = None;
         let mut commit_volume = false;
+        let mut reload_tiles = false;
         loop {
             let event = match editor.events.try_recv() {
                 Ok(event) => event,
@@ -862,13 +780,20 @@ fn run_embedded<G: TimelineGame>(
             match event {
                 EditorEvent::Timeline(command) => {
                     if matches!(command, TimelineCommand::Seek(_))
-                        && matches!(commands.last(), Some(TimelineCommand::Seek(_)))
+                        && matches!(
+                            commands.last(),
+                            Some(TimelineInput::Control(TimelineCommand::Seek(_)))
+                        )
                     {
                         commands.pop();
                     }
-                    commands.push(command);
+                    commands.push(TimelineInput::Control(command));
                 }
-                EditorEvent::Resize(size) if valid_preview_size(size) => ctx.surface_size = size,
+                EditorEvent::Bookmark(edit) => commands.push(TimelineInput::Bookmark(edit)),
+                EditorEvent::ResetTimeline => commands.push(TimelineInput::Reset),
+                EditorEvent::Resize(display) if valid_display_metrics(display) => {
+                    ctx.set_display(display, &mut input);
+                }
                 EditorEvent::Profile(enabled) => profile_enabled = enabled,
                 EditorEvent::MasterVolume {
                     percent,
@@ -877,6 +802,15 @@ fn run_embedded<G: TimelineGame>(
                 } => {
                     volume_change = Some((percent.min(100), request));
                     commit_volume |= commit;
+                }
+                EditorEvent::ReloadTiles => reload_tiles = true,
+                EditorEvent::ForkPreview { stamp, reply } => {
+                    let snapshot = fork_frames.iter().find(|(id, _, _)| *id == stamp).cloned();
+                    std::thread::spawn(move || {
+                        let result = snapshot.ok_or_else(|| "That preview is no longer available. Try duplicating the current frame.".into())
+                            .and_then(|(_, paused, state)| ForkState::capture(G::SCHEMA, paused, state.as_ref()).map_err(|err| err.to_string()));
+                        ForkState::reply(&reply, result);
+                    });
                 }
                 _ => input.apply_editor_event(event),
             }
@@ -895,10 +829,22 @@ fn run_embedded<G: TimelineGame>(
         let mut profile = profile_enabled.then(PreviewProfile::default);
         let mut update = Duration::ZERO;
         let should_update = if commands.is_empty() {
-            session.should_update(&mut game, &mut state, None)
+            session.advance_playback(&mut game, &mut state);
+            session.is_live()
         } else {
             for command in commands {
-                session.should_update(&mut game, &mut state, Some(command));
+                match command {
+                    TimelineInput::Control(command) => {
+                        session.apply_command(&mut game, &mut state, command)
+                    }
+                    TimelineInput::Bookmark(edit) => session.edit_bookmark(&state, edit),
+                    TimelineInput::Reset => {
+                        if session.reset(&mut game, &mut state, &mut ctx) {
+                            input.apply_editor_event(EditorEvent::ReleaseInput);
+                            tick = 0;
+                        }
+                    }
+                }
             }
             false
         };
@@ -906,19 +852,42 @@ fn run_embedded<G: TimelineGame>(
             game.set_master_volume(&mut state, percent, commit_volume);
             last_volume_request = Some(request);
         }
+        if let Err(err) = sync_tiles(&mut game, &state, &mut tiles, reload_tiles, true) {
+            eprintln!("could not refresh tile level: {err}");
+        }
         if should_update {
-            let (_, span) = Span::measure(|| game.update_state(&mut state, &input, dt, &mut ctx));
+            let (_, span) =
+                Span::measure(|| update_game(&mut game, &mut state, &mut input, dt, &mut ctx));
             update = span.elapsed;
             tick += 1;
-            let start = profile_enabled.then(Instant::now);
-            session.after_update(&state);
-            if let (Some(profile), Some(start)) = (&mut profile, start) {
-                profile.timeline_us = micros(start.elapsed());
+            if let Err(err) = sync_tiles(&mut game, &state, &mut tiles, false, true) {
+                eprintln!("could not load active tile level: {err}");
             }
         } else {
             last_frame = Instant::now();
         }
+
+        let start = profile_enabled.then(Instant::now);
+        let snapshot = Arc::new(G::snapshot(&state).clone());
+        if let (Some(profile), Some(start)) = (&mut profile, start) {
+            profile.snapshot_us = micros(start.elapsed());
+        }
+        if should_update {
+            let start = profile_enabled.then(Instant::now);
+            session.capture_frame(|| Arc::clone(&snapshot));
+            if let (Some(profile), Some(start)) = (&mut profile, start) {
+                profile.timeline_us = micros(start.elapsed());
+            }
+        }
+        let stamp = first_stamp.wrapping_add(frame);
+        if fork_frames.len() == FORK_FRAMES {
+            fork_frames.pop_front();
+        }
+        fork_frames.push_back((stamp, session.paused, Arc::clone(&snapshot)));
         let metadata = PreviewMetadata {
+            stamp: Some(stamp),
+            tile_level: tiles.as_ref().and_then(|level| level.preview),
+            display: Some(ctx.display()),
             status: session.status(),
             master_volume: game.master_volume(&state).map(|percent| MasterVolume {
                 percent: percent.min(100),
@@ -927,17 +896,17 @@ fn run_embedded<G: TimelineGame>(
         };
         frame += 1;
         let start = profile_enabled.then(Instant::now);
-        let snapshot = game.preview_snapshot(&state);
+        let snapshot = game.preview_snapshot(snapshot, metadata.status.paused);
         if let (Some(profile), Some(start)) = (&mut profile, start) {
             profile.frame = frame;
             profile.tick = tick;
-            profile.snapshot_us = micros(start.elapsed());
+            profile.snapshot_us += micros(start.elapsed());
         }
         preview.publish(ctx.surface_size, metadata, snapshot, update, profile);
         input.clear_frame_transients();
         // Keep oversleep from accumulating across frames, and skip missed deadlines.
         let finished = Instant::now();
-        deadline = (deadline + interval).max(finished);
+        deadline = (deadline + FRAME_INTERVAL).max(finished);
         std::thread::sleep(deadline.saturating_duration_since(finished));
     };
     game.shutdown(&state);
@@ -954,30 +923,42 @@ fn run_windowed<G: TimelineGame + 'static>(
     mut trace: Option<TraceCapture>,
 ) -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new();
-    let mut ctx = create_app_context(&config, &event_loop)?;
+    let mut ctx = create_app_context(&config, &event_loop, G::LOGICAL_DISPLAY && trace.is_none())?;
     let mut state = match &mut session {
         Some(session) => session.start(&mut game, &mut ctx.app)?,
         None => game.init_state(&mut ctx.app),
     };
+    let mut tiles = None;
+    sync_tiles(&mut game, &state, &mut tiles, false, false)?;
     let overseer = reload::listen_for_overseer();
     let mut input = InputFrame::default();
     let mut last_frame = Instant::now();
+    let mut next_redraw = last_frame;
     let mut exiting = false;
     let mut previous_status = None;
 
     event_loop.run(move |event, _, control_flow| {
         if matches!(event, Event::LoopDestroyed) {
+            if !exiting {
+                exit_for_command(session.as_mut(), &state, ProcessCommand::Stop);
+            }
             game.shutdown(&state);
-        }
-        if exiting {
-            if matches!(event, Event::LoopDestroyed) {
-                game.handle_event(&event, &mut state, &mut input, &mut ctx.app, control_flow);
+            if let Some(trace) = trace.take() {
+                trace.finish(ctx.renderer.size());
             }
             return;
         }
-        *control_flow = ControlFlow::Poll;
+        if exiting {
+            return;
+        }
+        *control_flow = ControlFlow::WaitUntil(next_redraw);
         if let Event::WindowEvent { event, .. } = &event {
-            apply_window_event_to_input(&mut input, event);
+            let scroll_scale = if G::LOGICAL_DISPLAY {
+                ctx.app.display().scale_factor
+            } else {
+                1.0
+            };
+            input.apply_window_event(event, scroll_scale);
         }
 
         if let Some(command) = overseer
@@ -991,33 +972,18 @@ fn run_windowed<G: TimelineGame + 'static>(
             return;
         }
 
-        let handled = game.handle_event(&event, &mut state, &mut input, &mut ctx.app, control_flow);
-        if matches!(control_flow, ControlFlow::ExitWithCode(_))
-            || matches!(event, Event::LoopDestroyed)
-            || (!handled
-                && matches!(
-                    event,
-                    Event::WindowEvent {
-                        event: WindowEvent::CloseRequested,
-                        ..
-                    }
-                ))
+        if game.exit_requested()
+            || matches!(
+                event,
+                Event::WindowEvent {
+                    event: WindowEvent::CloseRequested,
+                    ..
+                }
+            )
         {
-            if let Some(session) = &mut session
-                && let Err(err) = session.save(&state)
-            {
-                eprintln!("could not save final state: {err}");
-            }
-            if let Some(trace) = trace.take() {
-                trace.finish(ctx.renderer.size());
-            }
+            exit_for_command(session.as_mut(), &state, ProcessCommand::Stop);
             exiting = true;
-            if !matches!(control_flow, ControlFlow::ExitWithCode(_)) {
-                *control_flow = ControlFlow::Exit;
-            }
-            return;
-        }
-        if handled {
+            *control_flow = ControlFlow::Exit;
             return;
         }
 
@@ -1026,28 +992,52 @@ fn run_windowed<G: TimelineGame + 'static>(
                 event: WindowEvent::Resized(size),
                 ..
             } => {
-                ctx.resize(*size);
+                ctx.resize(*size, ctx.window.scale_factor(), &mut input);
+            }
+            Event::WindowEvent {
+                event:
+                    WindowEvent::ScaleFactorChanged {
+                        scale_factor,
+                        new_inner_size,
+                    },
+                ..
+            } => {
+                ctx.resize(**new_inner_size, *scale_factor, &mut input);
             }
             Event::RedrawRequested(_) => {
                 let now = Instant::now();
+                if now < next_redraw {
+                    return;
+                }
+                next_redraw = now + FRAME_INTERVAL;
+                *control_flow = ControlFlow::WaitUntil(next_redraw);
                 let dt = now.saturating_duration_since(last_frame);
                 last_frame = now;
-                let update = if session
-                    .as_mut()
-                    .is_none_or(|session| session.should_update(&mut game, &mut state, None))
-                {
-                    let (_, update) =
-                        Span::measure(|| game.update_state(&mut state, &input, dt, &mut ctx.app));
+                if let Some(session) = &mut session {
+                    session.advance_playback(&mut game, &mut state);
+                }
+                if let Err(err) = sync_tiles(&mut game, &state, &mut tiles, false, false) {
+                    eprintln!("could not load active tile level: {err}");
+                }
+                let update = if session.as_ref().is_none_or(TimelineSession::is_live) {
+                    let (_, update) = Span::measure(|| {
+                        update_game(&mut game, &mut state, &mut input, dt, &mut ctx.app)
+                    });
                     if let Some(session) = &mut session {
-                        session.after_update(&state);
+                        session.capture_frame(|| Arc::new(G::snapshot(&state).clone()));
                     }
                     Some(update)
                 } else {
                     last_frame = Instant::now();
                     None
                 };
-                if let Some(session) = &session {
-                    let status = session.status();
+                if update.is_some()
+                    && let Err(err) = sync_tiles(&mut game, &state, &mut tiles, false, false)
+                {
+                    eprintln!("could not load active tile level: {err}");
+                }
+                let status = session.as_ref().map(TimelineSession::status);
+                if let Some(status) = status {
                     if previous_status != Some(status) {
                         if status.paused || previous_status.is_none_or(|previous| previous.paused) {
                             update_timeline_title(&ctx.window, &config.title, status);
@@ -1055,9 +1045,10 @@ fn run_windowed<G: TimelineGame + 'static>(
                         previous_status = Some(status);
                     }
                 }
+                let timeline_paused = status.is_some_and(|status| status.paused);
                 let draw = match ctx
                     .renderer
-                    .draw_frame(|gfx| Span::measure(|| game.render(&state, gfx)).1)
+                    .draw_frame(|gfx| Span::measure(|| game.render(&state, timeline_paused, gfx)).1)
                 {
                     Ok(draw) => Some(draw),
                     Err(err) => {
@@ -1088,107 +1079,10 @@ fn run_windowed<G: TimelineGame + 'static>(
                 game.on_frame_timings(timings);
                 input.clear_frame_transients();
             }
-            Event::MainEventsCleared => ctx.window.request_redraw(),
+            Event::MainEventsCleared if Instant::now() >= next_redraw => {
+                ctx.window.request_redraw()
+            }
             _ => {}
         }
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn recording_defaults_on_and_can_be_disabled_for_standalone_play() {
-        let default = PathBuf::from("target/timelines/example");
-        let cli = parse_timeline_args(std::iter::empty()).unwrap();
-        assert_eq!(
-            cli.recording(default.clone()).unwrap().unwrap().directory,
-            default
-        );
-
-        let cli = parse_timeline_args(["--no-recording"].into_iter().map(OsString::from)).unwrap();
-        assert!(cli.recording(default).unwrap().is_none());
-
-        for conflict in [
-            "--fresh",
-            "--playback",
-            "--timeline",
-            "--export-video",
-            "--profile",
-        ] {
-            let args = ["--no-recording", conflict]
-                .into_iter()
-                .chain(matches!(conflict, "--timeline" | "--export-video").then_some("example"))
-                .map(OsString::from);
-            assert_eq!(
-                parse_timeline_args(args).unwrap_err().kind(),
-                io::ErrorKind::InvalidInput
-            );
-        }
-    }
-
-    #[test]
-    fn key_transitions_are_frame_based() {
-        let mut input = InputFrame::default();
-
-        input.apply_key_state(VirtualKeyCode::A, ElementState::Pressed);
-        assert!(input.keys_down.contains(&VirtualKeyCode::A));
-        assert!(input.keys_pressed.contains(&VirtualKeyCode::A));
-        assert!(!input.keys_released.contains(&VirtualKeyCode::A));
-
-        input.clear_frame_transients();
-        assert!(input.keys_down.contains(&VirtualKeyCode::A));
-        assert!(!input.keys_pressed.contains(&VirtualKeyCode::A));
-
-        input.apply_key_state(VirtualKeyCode::A, ElementState::Released);
-        assert!(!input.keys_down.contains(&VirtualKeyCode::A));
-        assert!(input.keys_released.contains(&VirtualKeyCode::A));
-    }
-
-    #[test]
-    fn mouse_button_edges_reset_between_ticks() {
-        let mut input = InputFrame::default();
-
-        input.apply_mouse_button_state(MouseButton::Left, ElementState::Pressed);
-        assert!(input.mouse_buttons_down.contains(&MouseButton::Left));
-        assert!(input.mouse_buttons_pressed.contains(&MouseButton::Left));
-
-        input.clear_frame_transients();
-        assert!(input.mouse_buttons_down.contains(&MouseButton::Left));
-        assert!(input.mouse_buttons_pressed.is_empty());
-
-        input.apply_mouse_button_state(MouseButton::Left, ElementState::Released);
-        assert!(!input.mouse_buttons_down.contains(&MouseButton::Left));
-        assert!(input.mouse_buttons_released.contains(&MouseButton::Left));
-    }
-
-    #[test]
-    fn scroll_accumulates_then_resets_between_frames() {
-        let mut input = InputFrame::default();
-
-        input.apply_scroll_delta(&MouseScrollDelta::LineDelta(1.0, -2.0));
-        input.apply_scroll_delta(&MouseScrollDelta::PixelDelta(
-            winit::dpi::PhysicalPosition::new(240.0, -120.0),
-        ));
-        assert!((input.scroll_x - 3.0).abs() < 0.0001);
-        assert!((input.scroll_y - -3.0).abs() < 0.0001);
-
-        input.clear_frame_transients();
-        assert!((input.scroll_x - 0.0).abs() < 0.0001);
-        assert!((input.scroll_y - 0.0).abs() < 0.0001);
-    }
-
-    #[test]
-    fn focus_loss_clears_held_inputs() {
-        let mut input = InputFrame::default();
-
-        input.apply_key_state(VirtualKeyCode::Space, ElementState::Pressed);
-        input.apply_mouse_button_state(MouseButton::Left, ElementState::Pressed);
-        input.set_window_focus(false);
-
-        assert!(!input.window_focused);
-        assert!(input.keys_down.is_empty());
-        assert!(input.mouse_buttons_down.is_empty());
-    }
 }

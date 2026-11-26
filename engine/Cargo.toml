@@ -11,8 +11,12 @@ sha2 = "0.10"
 hex = "0.4"
 pixels = "0.13"
 pollster = "0.3"
+png = "0.18"
 bytemuck = { version = "1", features = ["derive"] }
 winit = { version = "0.28", features = ["serde"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.9"
@@ -21,3 +25,7 @@ mach2 = "0.4"
 metal = "0.24"
 objc = "0.2"
 wgpu-hal = { version = "0.16", features = ["metal"] }
+
+[lints.rust]
+# The objc message macros test this cfg at their invocation sites.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }

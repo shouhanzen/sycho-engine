@@ -10,9 +10,36 @@ use serde::{Deserialize, Serialize};
 use crate::surface::SurfaceSize;
 
 #[derive(Debug, Clone)]
-pub struct ProfileConfig {
+pub(crate) struct ProfileConfig {
     pub target_frames: usize,
     pub warmup_frames: usize,
+    pub window_size: SurfaceSize,
+}
+
+impl ProfileConfig {
+    pub fn from_env(default_size: SurfaceSize) -> Self {
+        let dimension = |name, default| {
+            env::var(name)
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(default)
+                .max(1)
+        };
+        let frame_count = |name, default| {
+            env::var(name)
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(default)
+        };
+        Self {
+            target_frames: frame_count("ROLLOUT_PROFILE_FRAMES", 600),
+            warmup_frames: frame_count("ROLLOUT_PROFILE_WARMUP", 200),
+            window_size: SurfaceSize::new(
+                dimension("ROLLOUT_PROFILE_WIDTH", default_size.width),
+                dimension("ROLLOUT_PROFILE_HEIGHT", default_size.height),
+            ),
+        }
+    }
 }
 
 /// CPU time measured around the game hooks and renderer output for one frame.

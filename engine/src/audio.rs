@@ -133,7 +133,10 @@ pub struct StepPattern {
 impl StepPattern {
     pub fn from_notes(notes_hz: impl Into<Vec<Option<f32>>>, step_beats: f32) -> Self {
         let notes_hz = notes_hz.into();
-        assert!(!notes_hz.is_empty(), "step pattern must have at least one step");
+        assert!(
+            !notes_hz.is_empty(),
+            "step pattern must have at least one step"
+        );
         Self {
             notes_hz,
             step_beats: step_beats.max(0.0625),

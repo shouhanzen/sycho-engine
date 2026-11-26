@@ -1,0 +1,4 @@
+{
+  "masonry": { "definition": "tiles/masonry.atlas.json" },
+  "terrain": { "definition": "tiles/terrain.atlas.json" }
+}

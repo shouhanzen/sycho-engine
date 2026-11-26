@@ -56,10 +56,10 @@ pub enum Style {
 impl Style {
     pub fn size(self) -> f64 {
         match self {
-            Self::Title => 14.0,
-            Self::Label => 13.0,
-            Self::Caption => 11.0,
-            Self::Number => 12.0,
+            Self::Title => 16.0,
+            Self::Label => 15.0,
+            Self::Caption => 12.0,
+            Self::Number => 13.0,
         }
     }
 
@@ -125,8 +125,8 @@ impl Atlas {
         if let Some(&cached) = self.glyphs.get(&key) {
             return cached;
         }
-        let Some(outline) =
-            font.outline_glyph(id.with_scale_and_position(scale(font, px), point(0.0, 0.0)))
+        let Some(outline) = font
+            .outline_glyph(id.with_scale_and_position(scale(font, f32::from(px)), point(0.0, 0.0)))
         else {
             self.glyphs.insert(key, None);
             return None;
@@ -173,10 +173,10 @@ impl Atlas {
     }
 }
 
-fn scale(font: &FontRef<'_>, px: u16) -> PxScale {
+fn scale(font: &FontRef<'_>, size: f32) -> PxScale {
     // The UI size represents a font's em square. ab_glyph measures from
     // ascent to descent, so convert to its pixel-height convention.
-    (f32::from(px) * font.height_unscaled() / font.units_per_em().unwrap()).into()
+    (size * font.height_unscaled() / font.units_per_em().unwrap()).into()
 }
 
 #[repr(C)]
@@ -295,15 +295,9 @@ impl TextRenderer {
         self.dirty = true;
     }
 
-    fn raster_size(&self, size: f64) -> u16 {
-        (size * self.pixel_scale.y)
-            .round()
-            .clamp(1.0, f64::from(MAX_GLYPH_PX)) as u16
-    }
-
     pub fn measure(&self, text: &str, style: Style, size: f64) -> Point {
         let font = &self.fonts[style.face()];
-        let font = font.as_scaled(scale(font, self.raster_size(size)));
+        let font = font.as_scaled(scale(font, size as f32));
         let mut width = 0.0;
         let mut previous = None;
         for ch in text.chars() {
@@ -311,10 +305,7 @@ impl TextRenderer {
             width += previous.map_or(0.0, |last| font.kern(last, id)) + font.h_advance(id);
             previous = Some(id);
         }
-        Point::new(
-            f64::from(width) / self.pixel_scale.x,
-            f64::from(font.height()) / self.pixel_scale.y,
-        )
+        Point::new(f64::from(width), f64::from(font.height()))
     }
 
     pub fn draw(
@@ -326,36 +317,39 @@ impl TextRenderer {
         color: Color,
         clips: &[Bounds],
     ) {
-        if clips.is_empty() {
+        let pixel_size = size * self.pixel_scale.y;
+        if clips.is_empty() || pixel_size < 1.0 {
             return;
         }
-        let px = self.raster_size(size);
+        let px = pixel_size.round().min(f64::from(MAX_GLYPH_PX)) as u16;
+        // Round only the bitmap size for caching. Preserve the requested layout size.
+        let atlas_pixel = size / f64::from(px);
         let face = style.face();
         let font = &self.fonts[face];
-        let scaled = font.as_scaled(scale(font, px));
-        let baseline = (origin.y * self.pixel_scale.y + f64::from(scaled.ascent())).round();
-        let mut cursor = origin.x * self.pixel_scale.x;
+        let scaled = font.as_scaled(scale(font, size as f32));
+        let baseline = ((origin.y + f64::from(scaled.ascent())) * self.pixel_scale.y).round()
+            / self.pixel_scale.y;
+        let mut cursor = origin.x;
         let mut previous = None;
         let color = color.map(|channel| f32::from(channel) / 255.0);
         for ch in text.chars() {
             let id = scaled.glyph_id(ch);
             cursor += f64::from(previous.map_or(0.0, |last| scaled.kern(last, id)));
             if let Some(image) = self.atlas.glyph(face, font, px, id) {
+                let x = (cursor * self.pixel_scale.x).round() / self.pixel_scale.x;
                 let bounds = Bounds::new(
-                    (cursor.round() + f64::from(image.bounds.left)) / self.pixel_scale.x,
-                    (baseline + f64::from(image.bounds.top)) / self.pixel_scale.y,
-                    f64::from(image.bounds.width) / self.pixel_scale.x,
-                    f64::from(image.bounds.height) / self.pixel_scale.y,
+                    x + f64::from(image.bounds.left) * atlas_pixel,
+                    baseline + f64::from(image.bounds.top) * atlas_pixel,
+                    f64::from(image.bounds.width) * atlas_pixel,
+                    f64::from(image.bounds.height) * atlas_pixel,
                 );
                 for visible in clips.iter().filter_map(|clip| bounds.intersect(*clip)) {
                     let atlas_size = f64::from(ATLAS_SIZE);
                     let u = |x| {
-                        ((f64::from(image.x) + (x - bounds.x) * self.pixel_scale.x) / atlas_size)
-                            as f32
+                        ((f64::from(image.x) + (x - bounds.x) / atlas_pixel) / atlas_size) as f32
                     };
                     let v = |y| {
-                        ((f64::from(image.y) + (y - bounds.y) * self.pixel_scale.y) / atlas_size)
-                            as f32
+                        ((f64::from(image.y) + (y - bounds.y) / atlas_pixel) / atlas_size) as f32
                     };
                     let x = |x| (x / f64::from(self.logical.width) * 2.0 - 1.0) as f32;
                     let y = |y| (1.0 - y / f64::from(self.logical.height) * 2.0) as f32;
@@ -461,11 +455,11 @@ mod tests {
     fn bundled_fonts_have_the_expected_spacing_and_cache_antialiased_glyphs() {
         let inter = FontRef::try_from_slice(INTER).unwrap();
         let mono = FontRef::try_from_slice(JETBRAINS_MONO).unwrap();
-        let metrics = inter.as_scaled(scale(&inter, 26));
+        let metrics = inter.as_scaled(scale(&inter, 26.0));
         assert!(
             metrics.h_advance(metrics.glyph_id('i')) < metrics.h_advance(metrics.glyph_id('m'))
         );
-        let metrics = mono.as_scaled(scale(&mono, 24));
+        let metrics = mono.as_scaled(scale(&mono, 24.0));
         assert_eq!(
             metrics.h_advance(metrics.glyph_id('1')),
             metrics.h_advance(metrics.glyph_id('8'))

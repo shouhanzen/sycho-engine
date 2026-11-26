@@ -1,0 +1,807 @@
+use super::*;
+use game::tetris_core::{BOARD_HEIGHT, BOARD_WIDTH, CELL_GARBAGE, Piece, TetrisCore, Vec2i};
+
+fn make_test_headful(view: GameView) -> (HeadfulApp, HeadlessRunner<TetrisLogic>) {
+    let base_logic = TetrisLogic::new(0, Piece::all()).with_bottomwell(true);
+    let mut app = HeadfulApp::new(
+        base_logic.clone(),
+        DEFAULT_ROUND_LIMIT,
+        DEFAULT_GRAVITY_INTERVAL,
+    );
+    app.sfx = None;
+
+    let mut runner = HeadlessRunner::new(base_logic);
+    {
+        let state = runner.state_mut();
+        state.view = view;
+        state.skilltree = app.skilltree_editor.load();
+        state.round_timer = RoundTimer::new(DEFAULT_ROUND_LIMIT);
+        state.gravity_interval = DEFAULT_GRAVITY_INTERVAL;
+        state.gravity_elapsed = Duration::ZERO;
+    }
+
+    (app, runner)
+}
+
+fn assert_approx_eq(actual: f32, expected: f32) {
+    let delta = (actual - expected).abs();
+    assert!(
+        delta < 0.001,
+        "expected ~{expected}, got {actual} (delta={delta})"
+    );
+}
+
+fn force_depth_reveal(core: &mut TetrisCore) {
+    core.set_depth_wall_defs(Vec::new());
+    let target_y = 0;
+    let depth_before = core.background_depth_rows();
+    for x in 0..BOARD_WIDTH {
+        core.set_cell(x, target_y, CELL_GARBAGE);
+    }
+    let cleared = core.clear_lines();
+    assert!(cleared >= 1, "expected at least one cleared line");
+    assert!(
+        core.background_depth_rows() > depth_before,
+        "expected background depth to increase"
+    );
+}
+
+fn setup_grounded_lock_delay_case(runner: &mut HeadlessRunner<TetrisLogic>) {
+    let state = runner.state_mut();
+    state.view = GameView::Tetris { paused: false };
+    state.gravity_interval = Duration::from_millis(100);
+    state.gravity_elapsed = Duration::ZERO;
+    state.tetris.set_available_pieces(vec![Piece::O]);
+    for y in 0..BOARD_HEIGHT {
+        for x in 0..BOARD_WIDTH {
+            state.tetris.set_cell(x, y, 0);
+        }
+    }
+    state
+        .tetris
+        .set_current_piece_for_test(Piece::O, Vec2i::new(4, 1), 0);
+}
+
+fn input_frame_for_keys(
+    pressed: &[VirtualKeyCode],
+    down: &[VirtualKeyCode],
+    released: &[VirtualKeyCode],
+) -> InputFrame {
+    let mut input = InputFrame::default();
+    for &key in down {
+        input.keys_down.insert(key);
+    }
+    for &key in pressed {
+        input.keys_pressed.insert(key);
+    }
+    for &key in released {
+        input.keys_released.insert(key);
+    }
+    input
+}
+
+#[test]
+fn header_master_volume_is_restored_from_game_state() {
+    let (mut app, mut runner) = make_test_headful(GameView::MainMenu);
+    runner.state_mut().settings.values.audio.music_volume = 0.5;
+    runner.state_mut().settings.values.audio.sfx_volume = 0.75;
+
+    app.set_master_volume(&mut runner, 0, false);
+    assert_eq!(app.master_volume(&runner), Some(0));
+    assert_eq!(
+        runner.state().settings.values.audio.effective_music_gain(),
+        0.0
+    );
+    assert_eq!(
+        runner.state().settings.values.audio.effective_sfx_gain(),
+        0.0
+    );
+    let quiet = runner.state().clone();
+
+    app.set_master_volume(&mut runner, 40, false);
+    assert_eq!(app.master_volume(&runner), Some(40));
+    assert_approx_eq(
+        runner.state().settings.values.audio.effective_music_gain(),
+        0.2,
+    );
+    assert_approx_eq(
+        runner.state().settings.values.audio.effective_sfx_gain(),
+        0.3,
+    );
+    assert!(app.settings_dirty);
+
+    let restored = app.restore_state(quiet);
+    assert_eq!(app.master_volume(&restored), Some(0));
+    assert!(!app.settings_dirty);
+}
+
+#[test]
+fn key_a_maps_to_rotate_180() {
+    assert_eq!(
+        map_key_to_action(VirtualKeyCode::A),
+        Some(InputAction::Rotate180)
+    );
+}
+
+#[test]
+fn left_arrow_maps_to_move_left() {
+    assert_eq!(
+        map_key_to_action(VirtualKeyCode::Left),
+        Some(InputAction::MoveLeft)
+    );
+}
+
+#[test]
+fn only_hard_drop_plays_gameplay_action_sfx() {
+    for action in [
+        InputAction::Noop,
+        InputAction::MoveLeft,
+        InputAction::MoveRight,
+        InputAction::SoftDrop,
+        InputAction::RotateCw,
+        InputAction::RotateCcw,
+        InputAction::Rotate180,
+        InputAction::Hold,
+    ] {
+        assert!(
+            !should_play_action_sfx(action),
+            "expected no action sfx for {action:?}"
+        );
+    }
+
+    assert!(should_play_action_sfx(InputAction::HardDrop));
+}
+
+#[test]
+fn horizontal_repeat_ignores_os_repeat_pressed_events_and_repeats_on_timer() {
+    let mut repeat = HorizontalRepeat::default();
+    let t0 = Instant::now();
+
+    // Initial press should be accepted.
+    assert!(repeat.on_press(HorizontalDir::Left, t0));
+
+    // A repeated "Pressed" event (OS key-repeat) should be ignored and not reset the timer.
+    assert!(!repeat.on_press(HorizontalDir::Left, t0 + Duration::from_millis(10)));
+
+    // Before the repeat delay expires: no repeat.
+    assert_eq!(
+        repeat.next_repeat_action(t0 + HorizontalRepeat::REPEAT_DELAY - Duration::from_millis(1)),
+        None
+    );
+
+    // Once the delay expires: we should get a move action even without any further key events.
+    assert_eq!(
+        repeat.next_repeat_action(t0 + HorizontalRepeat::REPEAT_DELAY),
+        Some(InputAction::MoveLeft)
+    );
+
+    // And again at the interval.
+    assert_eq!(
+        repeat.next_repeat_action(
+            t0 + HorizontalRepeat::REPEAT_DELAY + HorizontalRepeat::REPEAT_INTERVAL
+        ),
+        Some(InputAction::MoveLeft)
+    );
+}
+
+#[test]
+fn keyboard_frame_flow_preserves_menu_pause_and_game_over_keys() {
+    let (mut app, mut runner) = make_test_headful(GameView::MainMenu);
+    let now = Instant::now();
+
+    app.process_keyboard_frame(
+        &mut runner,
+        &input_frame_for_keys(&[VirtualKeyCode::Return], &[VirtualKeyCode::Return], &[]),
+        now,
+        SkillTreeLayout::default(),
+    );
+    assert!(matches!(
+        runner.state().view,
+        GameView::Tetris { paused: false }
+    ));
+
+    app.process_keyboard_frame(
+        &mut runner,
+        &input_frame_for_keys(&[VirtualKeyCode::Escape], &[VirtualKeyCode::Escape], &[]),
+        now + Duration::from_millis(1),
+        SkillTreeLayout::default(),
+    );
+    assert!(matches!(
+        runner.state().view,
+        GameView::Tetris { paused: true }
+    ));
+
+    app.process_keyboard_frame(
+        &mut runner,
+        &input_frame_for_keys(&[VirtualKeyCode::Escape], &[VirtualKeyCode::Escape], &[]),
+        now + Duration::from_millis(2),
+        SkillTreeLayout::default(),
+    );
+    assert!(matches!(
+        runner.state().view,
+        GameView::Tetris { paused: false }
+    ));
+
+    runner.state_mut().view = GameView::GameOver;
+    app.process_keyboard_frame(
+        &mut runner,
+        &input_frame_for_keys(&[VirtualKeyCode::K], &[VirtualKeyCode::K], &[]),
+        now + Duration::from_millis(3),
+        SkillTreeLayout::default(),
+    );
+    assert!(matches!(runner.state().view, GameView::SkillTree));
+}
+
+#[test]
+fn horizontal_repeat_sync_uses_frame_down_and_release_sets() {
+    let (mut app, mut runner) = make_test_headful(GameView::Tetris { paused: false });
+    let now = Instant::now();
+
+    app.sync_horizontal_repeat_from_frame(
+        &mut runner,
+        &input_frame_for_keys(&[VirtualKeyCode::Left], &[VirtualKeyCode::Left], &[]),
+        now,
+    );
+    assert!(app.horizontal_repeat.left_down);
+    assert_eq!(app.horizontal_repeat.active, Some(HorizontalDir::Left));
+
+    app.sync_horizontal_repeat_from_frame(
+        &mut runner,
+        &input_frame_for_keys(&[], &[VirtualKeyCode::Left], &[]),
+        now + Duration::from_millis(5),
+    );
+    assert!(app.horizontal_repeat.left_down);
+
+    app.sync_horizontal_repeat_from_frame(
+        &mut runner,
+        &input_frame_for_keys(&[], &[], &[VirtualKeyCode::Left]),
+        now + Duration::from_millis(10),
+    );
+    assert!(!app.horizontal_repeat.left_down);
+    assert_eq!(app.horizontal_repeat.active, None);
+}
+
+#[test]
+fn skilltree_drag_frame_polling_respects_threshold_then_pans() {
+    let (mut app, mut runner) = make_test_headful(GameView::SkillTree);
+    runner.state_mut().skilltree.def.nodes.clear();
+
+    let layout = SkillTreeLayout {
+        grid_cell: 20,
+        grid_cols: 12,
+        grid_rows: 8,
+        grid_cam_min_x: -6,
+        grid_cam_min_y: 0,
+        ..SkillTreeLayout::default()
+    };
+    app.skilltree_cam_input = SkillTreeCameraInput {
+        left_down: true,
+        drag_started: false,
+        drag_started_in_view: true,
+        down_x: 100,
+        down_y: 100,
+        last_x: 100,
+        last_y: 100,
+    };
+
+    app.update_skilltree_drag_from_frame(&mut runner, layout, (102, 102));
+    assert!(!app.skilltree_cam_input.drag_started);
+
+    app.update_skilltree_drag_from_frame(&mut runner, layout, (140, 102));
+    assert!(app.skilltree_cam_input.drag_started);
+    assert!(runner.state().skilltree.camera.pan.x < 0.0);
+}
+
+#[test]
+fn round_reset_clears_round_state_and_keeps_session_state() {
+    let (mut app, mut runner) = make_test_headful(GameView::Tetris { paused: false });
+    let viewport = engine::surface::SurfaceSize::new(900, 600);
+    runner.step(InputAction::Noop);
+    let state = runner.state_mut();
+    state.settings.values.audio.master_volume = 0.4;
+    state.skilltree.progress.money = 25;
+    state.display.viewport = viewport;
+    state.round_timer_disabled = true;
+    state
+        .round_timer
+        .tick_if_running(Duration::from_secs(1), true);
+    state.gravity_elapsed = Duration::from_millis(50);
+    state.input = Some(InputFrame::default());
+
+    let initial_depth = runner.state().tetris.background_depth_rows();
+    runner.state_mut().display.dig_camera.reset(initial_depth);
+    force_depth_reveal(&mut runner.state_mut().tetris);
+    update_dig_camera(runner.state_mut(), Duration::from_millis(16));
+    assert!(
+        runner.state().display.dig_camera.offset_y_px() > 0.0,
+        "expected depth gain to create camera impulse before reset"
+    );
+
+    app.reset_active_run(&mut runner);
+
+    assert_eq!(runner.frame(), 0);
+    assert_eq!(runner.state().round_timer.elapsed(), Duration::ZERO);
+    assert_eq!(runner.state().gravity_elapsed, Duration::ZERO);
+    assert!(runner.state().input.is_none());
+    assert_eq!(runner.state().settings.values.audio.master_volume, 0.4);
+    assert_eq!(runner.state().skilltree.progress.money, 25);
+    assert_eq!(runner.state().display.viewport, viewport);
+    assert!(runner.state().round_timer_disabled);
+    assert_approx_eq(runner.state().display.dig_camera.offset_y_px(), 0.0);
+    assert_eq!(
+        runner.state().display.dig_camera.last_depth_rows(),
+        runner.state().tetris.background_depth_rows()
+    );
+}
+
+#[test]
+fn paused_state_holds_dig_camera_motion_and_depth_impulses() {
+    let (_, mut runner) = make_test_headful(GameView::Tetris { paused: false });
+
+    let initial_depth = runner.state().tetris.background_depth_rows();
+    runner.state_mut().display.dig_camera.reset(initial_depth);
+    force_depth_reveal(&mut runner.state_mut().tetris);
+    update_dig_camera(runner.state_mut(), Duration::from_millis(16));
+    let offset_before_pause = runner.state().display.dig_camera.offset_y_px();
+    assert!(offset_before_pause > 0.0);
+
+    runner.state_mut().view = GameView::Tetris { paused: true };
+    force_depth_reveal(&mut runner.state_mut().tetris);
+    update_dig_camera(runner.state_mut(), Duration::from_secs(1));
+    assert_approx_eq(
+        runner.state().display.dig_camera.offset_y_px(),
+        offset_before_pause,
+    );
+    assert_eq!(
+        runner.state().display.dig_camera.last_depth_rows(),
+        runner.state().tetris.background_depth_rows()
+    );
+
+    runner.state_mut().view = GameView::Tetris { paused: false };
+    update_dig_camera(runner.state_mut(), Duration::from_millis(300));
+    assert!(
+        runner.state().display.dig_camera.offset_y_px() < offset_before_pause,
+        "expected resume to settle camera toward zero"
+    );
+}
+
+#[test]
+fn gravity_dt_integration_locks_after_expected_timing() {
+    let (mut app, mut runner) = make_test_headful(GameView::Tetris { paused: false });
+    setup_grounded_lock_delay_case(&mut runner);
+
+    app.apply_gravity_steps(&mut runner, Duration::from_millis(400));
+    assert_eq!(runner.state().tetris.current_piece_pos(), Vec2i::new(4, 1));
+    assert_eq!(runner.state().tetris.grounded_lock_ms(), 300);
+
+    app.apply_gravity_steps(&mut runner, Duration::from_millis(100));
+    assert_eq!(runner.state().tetris.current_piece_pos(), Vec2i::new(4, 1));
+    assert_eq!(runner.state().tetris.grounded_lock_ms(), 400);
+
+    app.apply_gravity_steps(&mut runner, Duration::from_millis(100));
+    assert_eq!(
+        runner.state().tetris.current_piece_pos(),
+        Vec2i::new(4, runner.state().tetris.board().len() as i32)
+    );
+    assert_eq!(runner.state().tetris.grounded_lock_ms(), 0);
+}
+
+#[test]
+fn paused_state_does_not_advance_lock_delay() {
+    let (mut app, mut runner) = make_test_headful(GameView::Tetris { paused: false });
+    setup_grounded_lock_delay_case(&mut runner);
+
+    runner.state_mut().view = GameView::Tetris { paused: true };
+    app.apply_gravity_steps(&mut runner, Duration::from_millis(500));
+    assert_eq!(runner.state().tetris.current_piece_pos(), Vec2i::new(4, 1));
+    assert_eq!(runner.state().tetris.grounded_lock_ms(), 0);
+
+    runner.state_mut().view = GameView::Tetris { paused: false };
+    app.apply_gravity_steps(&mut runner, Duration::from_millis(400));
+    assert_eq!(runner.state().tetris.grounded_lock_ms(), 300);
+
+    runner.state_mut().view = GameView::Tetris { paused: true };
+    app.apply_gravity_steps(&mut runner, Duration::from_millis(1000));
+    assert_eq!(runner.state().tetris.current_piece_pos(), Vec2i::new(4, 1));
+    assert_eq!(runner.state().tetris.grounded_lock_ms(), 300);
+
+    runner.state_mut().view = GameView::Tetris { paused: false };
+    app.apply_gravity_steps(&mut runner, Duration::from_millis(200));
+    assert_eq!(
+        runner.state().tetris.current_piece_pos(),
+        Vec2i::new(4, runner.state().tetris.board().len() as i32)
+    );
+}
+
+#[test]
+fn grounded_move_stalls_even_when_gravity_tick_is_due_same_frame() {
+    let (mut app, mut runner) = make_test_headful(GameView::Tetris { paused: false });
+    setup_grounded_lock_delay_case(&mut runner);
+
+    {
+        let state = runner.state_mut();
+        state.gravity_interval = Duration::from_millis(500);
+        state.gravity_elapsed = Duration::from_millis(499);
+        for y in 0..=1 {
+            for x in 0..BOARD_WIDTH {
+                state.tetris.set_cell(x, y, 0);
+            }
+        }
+        state
+            .tetris
+            .set_current_piece_for_test(Piece::O, Vec2i::new(4, 1), 0);
+    }
+
+    runner.step(InputAction::MoveRight);
+    app.apply_gravity_steps(&mut runner, Duration::from_millis(1));
+
+    assert_eq!(runner.state().tetris.current_piece_pos(), Vec2i::new(5, 1));
+    assert!(
+        runner.state().tetris.current_piece().is_some(),
+        "grounded move should preserve active piece even if gravity tick becomes due immediately"
+    );
+    assert_eq!(
+        runner.state().tetris.board()[0][5],
+        0,
+        "stalling move should not lock piece into board on same frame"
+    );
+}
+
+#[test]
+fn debug_hud_timer_toggle_disables_timer_tick_and_timeout() {
+    let (mut app, mut runner) = make_test_headful(GameView::Tetris { paused: false });
+    runner.state_mut().round_timer = RoundTimer::new(Duration::from_millis(200));
+
+    use engine::surface::SurfaceSize;
+
+    let size = SurfaceSize::new(960, 640);
+    let mut ctx = AppContext::for_pixels(size);
+    let toggle = |hud: &DebugHud, disabled: bool| {
+        let rect = hud
+            .timer_toggle_rect(size.width, size.height, disabled)
+            .unwrap();
+        InputFrame {
+            mouse_pos: Some((rect.x + 1, rect.y + 1)),
+            mouse_buttons_pressed: [MouseButton::Left].into(),
+            ..InputFrame::default()
+        }
+    };
+
+    let input = toggle(&app.debug_hud, false);
+    app.update_state(
+        &mut runner,
+        &InputFrame {
+            mouse_pos: input.mouse_pos,
+            ..InputFrame::default()
+        },
+        Duration::ZERO,
+        &mut ctx,
+    );
+    app.update_state(
+        &mut runner,
+        &InputFrame {
+            mouse_pos: None,
+            ..input.clone()
+        },
+        Duration::ZERO,
+        &mut ctx,
+    );
+    assert!(!runner.state().round_timer_disabled);
+
+    app.update_state(&mut runner, &input, Duration::from_secs(1), &mut ctx);
+    assert!(runner.state().round_timer_disabled);
+    assert!(
+        matches!(runner.state().view, GameView::Tetris { paused: false }),
+        "timer-disabled mode should not trigger timeout game over"
+    );
+    assert_eq!(
+        runner.state().round_timer.elapsed(),
+        Duration::ZERO,
+        "timer-disabled mode should not advance timer elapsed"
+    );
+
+    let mut runner = app.restore_state(runner.state().clone());
+    assert!(
+        app.debug_hud
+            .overlay_lines(runner.state().round_timer_disabled)
+            .iter()
+            .any(|line| line == "TIMER OFF [CLICK]")
+    );
+    let input = toggle(&app.debug_hud, true);
+    app.update_state(&mut runner, &input, Duration::from_millis(250), &mut ctx);
+    assert!(!runner.state().round_timer_disabled);
+    assert!(
+        matches!(runner.state().view, GameView::GameOver),
+        "re-enabled timer should restore timeout game over behavior"
+    );
+}
+
+#[test]
+fn standalone_and_preview_draw_the_cursor_from_the_current_timeline_status() {
+    use engine::{graphics::CpuRenderer, surface::SurfaceSize};
+
+    let (mut app, mut runner) = make_test_headful(GameView::MainMenu);
+    let size = SurfaceSize::new(800, 600);
+    let (x, y) = (780, 580);
+    runner.state_mut().display.viewport = size;
+    runner.state_mut().input = Some(InputFrame {
+        mouse_pos: Some((x, y)),
+        ..InputFrame::default()
+    });
+    let mut standalone = vec![0; size.rgba_len()];
+    let mut preview = vec![0; size.rgba_len()];
+    let offset = ((y * size.width + x) * 4) as usize;
+    let cursor_outline = [18, 18, 24, 255];
+    let snapshot = Arc::new(runner.state().clone());
+    for paused in [true, false] {
+        app.render(
+            &runner,
+            paused,
+            &mut CpuRenderer::new(&mut standalone, size),
+        );
+        let preview_snapshot = app.preview_snapshot(Arc::clone(&snapshot), paused);
+        assert!(Arc::ptr_eq(&preview_snapshot.state, &snapshot));
+        HeadfulApp::draw_preview(preview_snapshot, &mut CpuRenderer::new(&mut preview, size));
+        assert_eq!(standalone, preview);
+        assert_eq!(standalone[offset..offset + 4] == cursor_outline, paused);
+    }
+}
+
+#[test]
+fn ending_a_round_awards_its_payout_once_and_clears_round_input() {
+    for paused in [false, true] {
+        let (mut app, mut runner) = make_test_headful(GameView::Tetris { paused });
+        let state = runner.state_mut();
+        state.tetris.add_score(100);
+        state.skilltree.progress.money = 25;
+        state.round_timer = RoundTimer::new(Duration::from_secs(1));
+        state.gravity_elapsed = Duration::from_millis(90);
+        app.horizontal_repeat
+            .on_press(HorizontalDir::Left, Instant::now());
+
+        if paused {
+            assert!(app.handle_ui_action(&mut runner, GameUiAction::EndRun));
+        } else {
+            app.update_round_timer_and_game_over(&mut runner, Duration::from_secs(1));
+        }
+
+        assert_eq!(runner.state().view, GameView::GameOver);
+        assert_eq!(runner.state().skilltree.progress.money, 35);
+        assert_eq!(runner.state().gravity_elapsed, Duration::ZERO);
+        assert!(app.horizontal_repeat.active.is_none());
+
+        assert!(!app.handle_ui_action(&mut runner, GameUiAction::EndRun));
+        app.update_round_timer_and_game_over(&mut runner, Duration::from_secs(1));
+        assert_eq!(runner.state().skilltree.progress.money, 35);
+    }
+}
+
+#[test]
+fn gravity_timeline_is_deterministic_for_same_inputs() {
+    fn run_timeline() -> (game::tetris_core::TetrisSnapshot, Duration, u32) {
+        let (mut app, mut runner) = make_test_headful(GameView::Tetris { paused: false });
+        setup_grounded_lock_delay_case(&mut runner);
+
+        app.apply_gravity_steps(&mut runner, Duration::from_millis(250));
+        runner.step(InputAction::MoveRight);
+        app.apply_gravity_steps(&mut runner, Duration::from_millis(250));
+        runner.state_mut().view = GameView::Tetris { paused: true };
+        app.apply_gravity_steps(&mut runner, Duration::from_millis(500));
+        runner.state_mut().view = GameView::Tetris { paused: false };
+        app.apply_gravity_steps(&mut runner, Duration::from_millis(200));
+
+        (
+            runner.state().tetris.snapshot(),
+            runner.state().gravity_elapsed,
+            runner.state().tetris.grounded_lock_ms(),
+        )
+    }
+
+    let first = run_timeline();
+    let second = run_timeline();
+    assert_eq!(first, second);
+}
+
+#[test]
+fn timeline_restore_keeps_the_board_score_and_timers_then_advances_live() {
+    let (mut app, mut runner) = make_test_headful(GameView::Tetris { paused: false });
+    runner.step(InputAction::HardDrop);
+    let fraction = Duration::from_nanos(200_123_456);
+    app.update_round_timer_and_game_over(&mut runner, fraction);
+    app.apply_gravity_steps(&mut runner, fraction);
+    runner
+        .state_mut()
+        .display
+        .dig_camera
+        .update(2, Duration::ZERO, false);
+    let display = runner.state().display;
+    let saved = serde_json::to_vec(runner.state()).unwrap();
+
+    let mut restored = app.restore_state(serde_json::from_slice(&saved).unwrap());
+    let expected: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+    assert_eq!(serde_json::to_value(restored.state()).unwrap(), expected);
+    assert_eq!(restored.state().round_timer.elapsed(), fraction);
+    assert_eq!(restored.state().gravity_elapsed, fraction);
+    assert_eq!(restored.state().display, display);
+
+    let board_before = restored.state().tetris.snapshot();
+    restored.step(InputAction::HardDrop);
+    app.update_round_timer_and_game_over(&mut restored, Duration::from_millis(100));
+    assert!(restored.state().tetris.score() > board_before.score);
+    assert_ne!(serde_json::to_value(restored.state()).unwrap(), expected);
+}
+
+#[test]
+fn line_clear_delay_progresses_with_frame_dt_instead_of_waiting_for_gravity_interval() {
+    let (mut app, mut runner) = make_test_headful(GameView::Tetris { paused: false });
+    {
+        let state = runner.state_mut();
+        state.view = GameView::Tetris { paused: false };
+        state.gravity_interval = Duration::from_millis(500);
+        state.gravity_elapsed = Duration::ZERO;
+        state.tetris.set_available_pieces(vec![Piece::O]);
+        state.tetris.set_line_clear_delay_ms(180);
+        for y in 0..BOARD_HEIGHT {
+            for x in 0..BOARD_WIDTH {
+                state.tetris.set_cell(x, y, 0);
+            }
+        }
+        for x in 0..BOARD_WIDTH {
+            if x == 4 || x == 5 {
+                continue;
+            }
+            state.tetris.set_cell(x, 0, 1);
+        }
+        state
+            .tetris
+            .set_current_piece_for_test(Piece::O, Vec2i::new(4, 1), 0);
+    }
+
+    runner.step(InputAction::HardDrop);
+    assert!(runner.state().tetris.is_line_clear_active());
+    assert_eq!(runner.state().tetris.lines_cleared(), 0);
+
+    // Even though 100ms is below the 500ms gravity interval, clear progress should advance.
+    app.apply_gravity_steps(&mut runner, Duration::from_millis(100));
+    let progress = runner.state().tetris.line_clear_progress();
+    assert!(
+        progress > 0.0 && progress < 1.0,
+        "line clear progress should advance on frame dt; got {progress}"
+    );
+    assert!(runner.state().tetris.is_line_clear_active());
+    assert_eq!(runner.state().tetris.lines_cleared(), 0);
+
+    app.apply_gravity_steps(&mut runner, Duration::from_millis(80));
+    assert!(!runner.state().tetris.is_line_clear_active());
+    assert_eq!(runner.state().tetris.lines_cleared(), 1);
+}
+
+#[test]
+fn one_tick_menu_click_uses_the_current_layout_and_records_both_edges() {
+    use engine::surface::SurfaceSize;
+
+    let (mut app, mut game) = make_test_headful(GameView::MainMenu);
+    let size = SurfaceSize::new(1000, 680);
+    let mut ctx = AppContext::for_pixels(size);
+    let layout = GameUiLayout::compute(game.state(), size);
+    let point = (0..size.height)
+        .find_map(|y| {
+            let pointer = (size.width / 2, y);
+            (layout.action_at(game.state(), pointer) == Some(GameUiAction::StartGame))
+                .then_some(pointer)
+        })
+        .unwrap();
+    let input = InputFrame {
+        mouse_pos: Some(point),
+        mouse_buttons_pressed: [MouseButton::Left].into(),
+        mouse_buttons_released: [MouseButton::Left].into(),
+        ..InputFrame::default()
+    };
+    app.update_state(&mut game, &input, Duration::from_millis(16), &mut ctx);
+
+    let state = game.state();
+    assert!(state.view.is_tetris_playing());
+    let saved = serde_json::to_vec(state).unwrap();
+    let restored: GameState = serde_json::from_slice(&saved).unwrap();
+    assert_eq!(restored.display.viewport, size);
+    assert_eq!(restored.pointer(), Some(point));
+    let tap = restored.input.unwrap();
+    assert!(tap.mouse_buttons_down.is_empty());
+    assert_eq!(tap.mouse_buttons_pressed, [MouseButton::Left].into());
+    assert_eq!(tap.mouse_buttons_released, [MouseButton::Left].into());
+}
+
+#[test]
+fn retina_menu_matches_logical_hits_and_plays_back_at_either_resolution() {
+    use engine::graphics::CpuRenderer;
+    use engine::surface::{DisplayMetrics, SurfaceSize};
+
+    let (mut app, mut game) = make_test_headful(GameView::MainMenu);
+    let logical = SurfaceSize::new(640, 480);
+    let retina = SurfaceSize::new(1280, 960);
+    let display = DisplayMetrics::for_surface(retina, 2.0);
+    let mut ctx = AppContext::new(display);
+    app.update_state(&mut game, &InputFrame::default(), Duration::ZERO, &mut ctx);
+    let state = game.state();
+    assert_eq!(state.display.viewport, logical);
+    let layout = GameUiLayout::compute(state, logical);
+    let point = (0..logical.height)
+        .find_map(|y| {
+            let point = (logical.width / 2, y);
+            (layout.action_at(state, point) == Some(GameUiAction::StartGame)).then_some(point)
+        })
+        .unwrap();
+    let click = display.logical_pointer((point.0 * 2, point.1 * 2));
+    assert_eq!(click, Some(point));
+
+    let restored: GameState = serde_json::from_slice(&serde_json::to_vec(state).unwrap()).unwrap();
+    let raster = |size: SurfaceSize| {
+        let mut pixels = vec![0; size.rgba_len()];
+        render_headful_frame(
+            &mut CpuRenderer::new(&mut pixels, size),
+            &restored,
+            FrameOverlays::default(),
+        );
+        pixels
+    };
+    let normal = raster(logical);
+    let doubled = raster(retina);
+    for (i, pixel) in normal.chunks_exact(4).enumerate() {
+        let x = (i % logical.width as usize) * 2;
+        let y = (i / logical.width as usize) * 2;
+        let offset = (y * retina.width as usize + x) * 4;
+        assert_eq!(pixel, &doubled[offset..offset + 4]);
+    }
+    let input = InputFrame {
+        mouse_pos: click,
+        mouse_buttons_pressed: [MouseButton::Left].into(),
+        mouse_buttons_released: [MouseButton::Left].into(),
+        ..InputFrame::default()
+    };
+    app.update_state(&mut game, &input, Duration::from_millis(16), &mut ctx);
+    assert!(game.state().view.is_tetris_playing());
+    assert_eq!(game.state().pointer(), Some(point));
+}
+
+#[test]
+fn restored_settings_keeps_its_values_and_can_be_closed_with_the_mouse() {
+    let (mut app, mut runner) = make_test_headful(GameView::MainMenu);
+    let size = runner.state().display.viewport;
+    let mut ctx = AppContext::for_pixels(size);
+    app.process_keyboard_frame(
+        &mut runner,
+        &input_frame_for_keys(&[VirtualKeyCode::O], &[VirtualKeyCode::O], &[]),
+        Instant::now(),
+        SkillTreeLayout::default(),
+    );
+    assert!(runner.state().settings.open);
+    runner.state_mut().settings.values.gameplay.show_round_timer = false;
+    let saved = serde_json::to_vec(runner.state()).unwrap();
+    let mut restored = app.restore_state(serde_json::from_slice(&saved).unwrap());
+
+    app.update_state(
+        &mut restored,
+        &InputFrame::default(),
+        Duration::ZERO,
+        &mut ctx,
+    );
+    assert!(!restored.state().settings.values.gameplay.show_round_timer);
+    let layout = GameUiLayout::compute(restored.state(), size);
+    let back = layout.settings.unwrap().back_button;
+    let point = (back.x + back.w / 2, back.y + back.h / 2);
+    assert_eq!(
+        layout.action_at(restored.state(), point),
+        Some(GameUiAction::CloseSettings)
+    );
+
+    let click = InputFrame {
+        mouse_pos: Some(point),
+        mouse_buttons_pressed: [MouseButton::Left].into(),
+        mouse_buttons_released: [MouseButton::Left].into(),
+        ..InputFrame::default()
+    };
+    app.update_state(&mut restored, &click, Duration::ZERO, &mut ctx);
+    assert!(!restored.state().settings.open);
+    assert!(!restored.state().settings.values.gameplay.show_round_timer);
+    assert_eq!(restored.state().view, GameView::MainMenu);
+}

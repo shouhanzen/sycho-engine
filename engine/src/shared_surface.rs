@@ -48,6 +48,11 @@ unsafe extern "C" {
     fn IOSurfaceGetHeight(surface: *mut c_void) -> usize;
     fn IOSurfaceGetPixelFormat(surface: *mut c_void) -> u32;
     fn IOSurfaceGetBytesPerElement(surface: *mut c_void) -> usize;
+    fn IOSurfaceGetBytesPerRow(surface: *mut c_void) -> usize;
+    fn IOSurfaceGetAllocSize(surface: *mut c_void) -> usize;
+    fn IOSurfaceGetBaseAddress(surface: *mut c_void) -> *mut c_void;
+    fn IOSurfaceLock(surface: *mut c_void, options: u32, seed: *mut u32) -> i32;
+    fn IOSurfaceUnlock(surface: *mut c_void, options: u32, seed: *mut u32) -> i32;
 }
 
 unsafe extern "C" {
@@ -123,6 +128,43 @@ impl Surface {
         size: SurfaceSize,
     ) -> io::Result<wgpu::Texture> {
         self.texture(device, size, wgpu::TextureUsages::TEXTURE_BINDING)
+    }
+
+    // The caller holds the preview lease, and the producer has completed rendering.
+    pub(crate) fn copy_rgba(&self, size: SurfaceSize) -> io::Result<Vec<u8>> {
+        self.validate(size)?;
+        let surface = self.0.as_ptr();
+        const READ_ONLY: u32 = 1;
+        mach_result("lock preview surface", unsafe {
+            IOSurfaceLock(surface, READ_ONLY, std::ptr::null_mut())
+        })?;
+        let result = (|| {
+            let stride = unsafe { IOSurfaceGetBytesPerRow(surface) };
+            let len = unsafe { IOSurfaceGetAllocSize(surface) };
+            let base = unsafe { IOSurfaceGetBaseAddress(surface) }.cast::<u8>();
+            let row_bytes = size.width as usize * 4;
+            let rows = size.height as usize;
+            if base.is_null()
+                || stride < row_bytes
+                || stride
+                    .checked_mul(rows)
+                    .is_none_or(|used| used > len || used > isize::MAX as usize)
+            {
+                return Err(io::Error::other("invalid preview surface storage"));
+            }
+            let mut pixels = vec![0; size.rgba_len()];
+            for (y, row) in pixels.chunks_exact_mut(row_bytes).enumerate() {
+                let source = unsafe { std::slice::from_raw_parts(base.add(y * stride), row_bytes) };
+                for (destination, pixel) in row.chunks_exact_mut(4).zip(source.chunks_exact(4)) {
+                    destination.copy_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
+                }
+            }
+            Ok(pixels)
+        })();
+        let unlock = mach_result("unlock preview surface", unsafe {
+            IOSurfaceUnlock(surface, READ_ONLY, std::ptr::null_mut())
+        });
+        result.and_then(|pixels| unlock.map(|()| pixels))
     }
 
     pub(crate) fn render_texture(
@@ -389,7 +431,10 @@ fn mach_result(operation: &str, result: i32) -> io::Result<()> {
         } else {
             io::ErrorKind::Other
         };
-        Err(io::Error::new(kind, format!("{operation}: Mach error {result:#x}")))
+        Err(io::Error::new(
+            kind,
+            format!("{operation}: Mach error {result:#x}"),
+        ))
     }
 }
 

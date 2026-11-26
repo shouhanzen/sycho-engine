@@ -9,7 +9,7 @@ pub enum RenderBackend2d {
     Gpu,
 }
 
-fn env_bool(name: &str) -> Option<bool> {
+pub(crate) fn env_bool(name: &str) -> Option<bool> {
     std::env::var(name)
         .ok()
         .and_then(|v| match v.to_ascii_lowercase().as_str() {

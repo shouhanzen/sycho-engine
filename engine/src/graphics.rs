@@ -1,5 +1,14 @@
-use crate::{surface::SurfaceSize, ui::Rect};
+mod image;
+mod image_gpu;
+
+pub use image::{Image, ImageRect};
+
+use crate::{
+    surface::{SurfaceSize, fit_viewport},
+    ui::Rect,
+};
 use pixels::wgpu;
+use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
 pub type Color = [u8; 4];
@@ -31,6 +40,25 @@ pub trait Renderer2d {
     /// Alpha-blended rect over existing content (alpha is applied to `color`'s RGB).
     fn blend_rect(&mut self, rect: Rect, color: Color, alpha: u8);
 
+    /// Draw a nearest-neighbor sprite, clipped without changing its source framing.
+    fn draw_image(&mut self, image: &Arc<Image>, source: Rect, dest: ImageRect, clip: Rect) {
+        let Some(area) = dest
+            .visible(clip, self.size())
+            .filter(|_| image::valid_source(image, source))
+        else {
+            return;
+        };
+        for y in area.y..area.y + area.h {
+            let sy = source.y + image::scale_coordinate(y, dest.y, dest.h, source.h);
+            for x in area.x..area.x + area.w {
+                let sx = source.x + image::scale_coordinate(x, dest.x, dest.w, source.w);
+                let at = (sy as usize * image.size.width as usize + sx as usize) * 4;
+                let color: Color = image.pixels[at..at + 4].try_into().unwrap();
+                self.blend_rect(Rect::new(x, y, 1, 1), color, color[3]);
+            }
+        }
+    }
+
     fn rect_outline(&mut self, rect: Rect, color: Color);
     fn draw_text_scaled(&mut self, x: u32, y: u32, text: &str, color: Color, scale: u32);
 
@@ -53,28 +81,12 @@ pub struct FittedRenderer<'a> {
 
 impl<'a> FittedRenderer<'a> {
     pub fn new(target: &'a mut dyn Renderer2d, viewport: SurfaceSize) -> Self {
-        let fitted = Self::fit(viewport, target.size());
+        let fitted = fit_viewport(viewport, target.size());
         Self {
             target,
             viewport,
             fitted,
         }
-    }
-
-    fn fit(viewport: SurfaceSize, output: SurfaceSize) -> Rect {
-        if viewport.is_empty() || output.is_empty() {
-            return Rect::default();
-        }
-        let scale = (f64::from(output.width) / f64::from(viewport.width))
-            .min(f64::from(output.height) / f64::from(viewport.height));
-        let width = (f64::from(viewport.width) * scale).round().max(1.0) as u32;
-        let height = (f64::from(viewport.height) * scale).round().max(1.0) as u32;
-        Rect::new(
-            (output.width - width) / 2,
-            (output.height - height) / 2,
-            width,
-            height,
-        )
     }
 
     fn transform(&self, rect: Rect) -> Rect {
@@ -103,7 +115,7 @@ impl<'a> FittedRenderer<'a> {
 impl Renderer2d for FittedRenderer<'_> {
     fn begin_frame(&mut self, size: SurfaceSize) {
         self.viewport = size;
-        self.fitted = Self::fit(size, self.target.size());
+        self.fitted = fit_viewport(size, self.target.size());
     }
 
     fn size(&self) -> SurfaceSize {
@@ -118,8 +130,47 @@ impl Renderer2d for FittedRenderer<'_> {
         self.target.blend_rect(self.transform(rect), color, alpha);
     }
 
+    fn draw_image(&mut self, image: &Arc<Image>, source: Rect, dest: ImageRect, clip: Rect) {
+        if self.viewport.is_empty() {
+            return;
+        }
+        let fit = |at: i64, from: u32, to: u32| (at * i64::from(to)).div_euclid(i64::from(from));
+        let left = fit(i64::from(dest.x), self.viewport.width, self.fitted.w);
+        let top = fit(i64::from(dest.y), self.viewport.height, self.fitted.h);
+        let right = fit(
+            i64::from(dest.x) + i64::from(dest.w),
+            self.viewport.width,
+            self.fitted.w,
+        );
+        let bottom = fit(
+            i64::from(dest.y) + i64::from(dest.h),
+            self.viewport.height,
+            self.fitted.h,
+        );
+        let projected = ImageRect::new(
+            (i64::from(self.fitted.x) + left) as i32,
+            (i64::from(self.fitted.y) + top) as i32,
+            (right - left) as u32,
+            (bottom - top) as u32,
+        );
+        self.target
+            .draw_image(image, source, projected, self.transform(clip));
+    }
+
     fn rect_outline(&mut self, rect: Rect, color: Color) {
-        self.target.rect_outline(self.transform(rect), color);
+        if rect.w == 0 || rect.h == 0 {
+            return;
+        }
+        let right = rect.x.saturating_add(rect.w - 1);
+        let bottom = rect.y.saturating_add(rect.h - 1);
+        for edge in [
+            Rect::new(rect.x, rect.y, rect.w, 1),
+            Rect::new(rect.x, bottom, rect.w, 1),
+            Rect::new(rect.x, rect.y, 1, rect.h),
+            Rect::new(right, rect.y, 1, rect.h),
+        ] {
+            self.fill_rect(edge, color);
+        }
     }
 
     fn draw_text_scaled(&mut self, x: u32, y: u32, text: &str, color: Color, scale: u32) {
@@ -540,6 +591,7 @@ pub struct GpuRenderer2d {
     instance_buf: wgpu::Buffer,
     instance_capacity: usize,
     instances: Vec<Instance>,
+    images: image_gpu::Images,
 }
 
 impl GpuRenderer2d {
@@ -667,6 +719,7 @@ impl GpuRenderer2d {
             instance_buf,
             instance_capacity,
             instances: Vec::with_capacity(8192),
+            images: image_gpu::Images::new(device, surface_format, &globals_layout),
         }
     }
 
@@ -677,10 +730,46 @@ impl GpuRenderer2d {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) {
+        let clear = wgpu::Color {
+            r: f64::from(DEFAULT_CLEAR_COLOR[0]) / 255.0,
+            g: f64::from(DEFAULT_CLEAR_COLOR[1]) / 255.0,
+            b: f64::from(DEFAULT_CLEAR_COLOR[2]) / 255.0,
+            a: 1.0,
+        };
+        self.render_with_load(
+            encoder,
+            render_target,
+            device,
+            queue,
+            wgpu::LoadOp::Clear(clear),
+        );
+    }
+
+    pub fn render_overlay(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        render_target: &wgpu::TextureView,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+    ) {
+        if !self.instances.is_empty() || !self.images.batches.is_empty() {
+            self.render_with_load(encoder, render_target, device, queue, wgpu::LoadOp::Load);
+        }
+    }
+
+    fn render_with_load(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        render_target: &wgpu::TextureView,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        load: wgpu::LoadOp<wgpu::Color>,
+    ) {
         let width = self.size.width.max(1);
         let height = self.size.height.max(1);
 
         self.ensure_instance_capacity(device, self.instances.len());
+        self.images.prepare(device, queue);
 
         let globals = Globals {
             screen: [width as f32, height as f32],
@@ -692,35 +781,39 @@ impl GpuRenderer2d {
             queue.write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&self.instances));
         }
 
-        let clear = wgpu::Color {
-            r: (DEFAULT_CLEAR_COLOR[0] as f64) / 255.0,
-            g: (DEFAULT_CLEAR_COLOR[1] as f64) / 255.0,
-            b: (DEFAULT_CLEAR_COLOR[2] as f64) / 255.0,
-            a: 1.0,
-        };
-
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("gfx2d_pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: render_target,
                 resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(clear),
-                    store: true,
-                },
+                ops: wgpu::Operations { load, store: true },
             })],
             depth_stencil_attachment: None,
         });
 
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.globals_bind_group, &[]);
         pass.set_vertex_buffer(0, self.quad_vertices.slice(..));
-        pass.set_vertex_buffer(1, self.instance_buf.slice(..));
         pass.set_index_buffer(self.quad_indices.slice(..), wgpu::IndexFormat::Uint16);
 
-        let instance_count = self.instances.len() as u32;
-        if instance_count > 0 {
-            pass.draw_indexed(0..self.quad_index_count, 0, 0..instance_count);
+        let mut first = 0;
+        for batch in &self.images.batches {
+            self.draw_rects(&mut pass, first..batch.after_rects);
+            self.images.draw(
+                &mut pass,
+                &self.globals_bind_group,
+                self.quad_index_count,
+                batch,
+            );
+            first = batch.after_rects;
+        }
+        self.draw_rects(&mut pass, first..self.instances.len() as u32);
+    }
+
+    fn draw_rects<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, rects: std::ops::Range<u32>) {
+        if !rects.is_empty() {
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.globals_bind_group, &[]);
+            pass.set_vertex_buffer(1, self.instance_buf.slice(..));
+            pass.draw_indexed(0..self.quad_index_count, 0, rects);
         }
     }
 
@@ -774,6 +867,7 @@ impl Renderer2d for GpuRenderer2d {
     fn begin_frame(&mut self, size: SurfaceSize) {
         self.size = size;
         self.instances.clear();
+        self.images.clear();
     }
 
     fn size(&self) -> SurfaceSize {
@@ -795,6 +889,17 @@ impl Renderer2d for GpuRenderer2d {
         }
         let a = (alpha as f32) / 255.0;
         self.push_rect_alpha(rect, color, a);
+    }
+
+    fn draw_image(&mut self, image: &Arc<Image>, source: Rect, dest: ImageRect, clip: Rect) {
+        self.images.push(
+            image,
+            source,
+            dest,
+            clip,
+            self.size,
+            self.instances.len() as u32,
+        );
     }
 
     fn rect_outline(&mut self, rect: Rect, color: Color) {
